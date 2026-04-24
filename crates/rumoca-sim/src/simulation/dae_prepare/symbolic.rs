@@ -140,6 +140,31 @@ pub(super) fn build_der_value_map(dae: &Dae) -> HashMap<String, Expression> {
     map
 }
 
+/// Like `build_der_value_map` but only scans the first `n_x` rows — the
+/// rows selected as ODE equations for the current state set. Substitution
+/// passes that rewrite `der(state)` in *non-ODE* rows must use only ODE
+/// rows as source; pulling a replacement from the same non-ODE row that
+/// defined it collapses the row to `0 = 0`.
+pub(super) fn build_der_value_map_from_ode_rows(
+    dae: &Dae,
+    n_x: usize,
+) -> HashMap<String, Expression> {
+    let mut map = HashMap::new();
+    let ode_rows = dae.f_x.iter().take(n_x);
+    for state_name in dae.states.keys() {
+        for eq in ode_rows.clone() {
+            if !expr_contains_der_of(&eq.rhs, state_name) {
+                continue;
+            }
+            if let Some(value) = try_extract_der_value(&eq.rhs, state_name) {
+                map.insert(state_name.as_str().to_string(), value);
+                break;
+            }
+        }
+    }
+    map
+}
+
 struct SymbolicDerivativeContext<'a> {
     dae: &'a Dae,
     der_map: &'a HashMap<String, Expression>,

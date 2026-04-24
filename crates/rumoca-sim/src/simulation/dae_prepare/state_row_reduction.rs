@@ -332,7 +332,15 @@ pub fn substitute_standalone_state_derivatives_in_non_ode_rows(dae: &mut Dae) ->
         return 0;
     }
 
-    let der_map = build_der_value_map(dae);
+    // Only pull replacements from the selected ODE rows (first n_x). A non-ODE
+    // row like `w_rel - der(phi_rel) = 0` was itself the source of the
+    // `der(phi_rel) -> w_rel` relation; rewriting it with its own
+    // relation collapses it to `0 = 0`, leaving the variable it was pinning
+    // structurally homeless. Detected repro: KinematicPTP + sensor + gain
+    // feedback (see `rumoca_structural_bug_bisection.rs`), and several MSL
+    // examples (OvervoltageProtection, ResonanceCircuits, TestSensors)
+    // that stalled at t≈1e-4.
+    let der_map = build_der_value_map_from_ode_rows(dae, n_x);
     if der_map.is_empty() {
         return 0;
     }

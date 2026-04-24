@@ -16,7 +16,8 @@ type Variable = dae::Variable;
 
 mod symbolic;
 use symbolic::{
-    build_der_value_map, expand_der_in_expr_full, symbolic_time_derivative, truncate_debug,
+    build_der_value_map, build_der_value_map_from_ode_rows, expand_der_in_expr_full,
+    symbolic_time_derivative, truncate_debug,
 };
 mod state_row_reduction;
 pub use state_row_reduction::{
