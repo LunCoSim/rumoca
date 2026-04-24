@@ -1591,6 +1591,13 @@ pub(crate) fn build_stepper(
                 *state.h = h.signum() * 1e-6;
             }
         }
+
+        fn set_solver_state_y(&mut self, y: &[f64]) {
+            let state = self.solver.state_mut();
+            let dst = state.y.as_mut_slice();
+            let n = dst.len().min(y.len());
+            dst[..n].copy_from_slice(&y[..n]);
+        }
     }
 
     /// Minimal SimulationBackend adapter for the stepper (no output recording).
@@ -1685,6 +1692,7 @@ pub(crate) fn build_stepper(
         n_total,
         solver_names,
         max_wall_seconds_per_step: opts.max_wall_seconds_per_step,
+        atol: opts.atol,
         elim,
         inputs_dirty: false,
     })

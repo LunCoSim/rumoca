@@ -65,6 +65,13 @@ pub(crate) trait StepperInner {
     /// Must be called when inputs change discontinuously so that
     /// the polynomial extrapolation does not diverge.
     fn reset_solver_history(&mut self);
+    /// Overwrite the solver's current state vector. Used to seed the
+    /// BDF restart with an algebraically-consistent y after an input
+    /// discontinuity — without this, the solver restarts from a state
+    /// consistent with the *previous* input values and has to find
+    /// the new algebraic manifold on the fly inside its first
+    /// substep, which is fragile.
+    fn set_solver_state_y(&mut self, y: &[f64]);
 }
 
 /// A real-time simulation stepper that supports external input injection.
@@ -86,6 +93,11 @@ pub struct SimStepper {
     pub(crate) n_total: usize,
     pub(crate) solver_names: Vec<String>,
     pub(crate) max_wall_seconds_per_step: Option<f64>,
+    /// Absolute tolerance used as the convergence target for the
+    /// algebraic re-projection after an input change. Matches the
+    /// `atol` passed to the stepper at build time so the projection
+    /// operates at the same precision as the integrator.
+    pub(crate) atol: f64,
     /// Substitutions from algebraic elimination — used to reconstruct
     /// eliminated variables (e.g. outputs) in `get()` and `state()`.
     pub(crate) elim: EliminationResult,
@@ -135,6 +147,33 @@ impl SimStepper {
     /// Step the simulation forward by `dt` seconds.
     pub fn step(&mut self, dt: f64) -> Result<(), SimError> {
         if self.inputs_dirty {
+            // Re-project algebraics onto the manifold implied by the new
+            // input values BEFORE clearing BDF history. Without this, the
+            // BDF restart would start from a state consistent with the
+            // previous inputs and have to chase the algebraic jump inside
+            // its first substep — which is fragile and can stall after
+            // repeated input changes. Mirrors the t=0 startup projection.
+            let y_before = self.inner.solver_state_y();
+            let t_now = self.inner.time();
+            let budget = TimeoutBudget::new(self.max_wall_seconds_per_step);
+            if let Some(projected) = crate::with_diffsol::problem::project_algebraics_with_fixed_states_at_time(
+                &self.dae,
+                &y_before,
+                self.n_x,
+                t_now,
+                self.atol,
+                &budget,
+                Some(self.input_overrides.clone()),
+            )? {
+                if projected.len() == y_before.len()
+                    && projected
+                        .iter()
+                        .zip(y_before.iter())
+                        .any(|(lhs, rhs)| (lhs - rhs).abs() > 1.0e-12)
+                {
+                    self.inner.set_solver_state_y(&projected);
+                }
+            }
             self.inner.reset_solver_history();
             self.inputs_dirty = false;
         }
