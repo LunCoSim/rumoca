@@ -384,13 +384,23 @@ pub(crate) fn project_algebraics_with_fixed_states_at_time(
     t_eval: f64,
     tol: f64,
     timeout: &crate::TimeoutBudget,
+    input_overrides: Option<crate::with_diffsol::problem::SharedInputOverrides>,
 ) -> Result<Option<Vec<f64>>, crate::SimError> {
     let n_eq = dae.f_x.len();
     if n_eq == 0 || n_x >= n_eq || y_seed.len() < n_eq {
         return Ok(Some(y_seed.get(..n_eq).unwrap_or(y_seed).to_vec()));
     }
     let p = default_params(dae);
-    let compiled_runtime = build_runtime_newton_context_if_needed(dae, n_eq, false)?;
+    let mut compiled_runtime = build_runtime_newton_context_if_needed(dae, n_eq, false)?;
+    // Wire caller-supplied input overrides into the projection's Newton
+    // context so its residual evaluates at the intended operating point.
+    // Without this, the projection's compiled kernel reads the unbound-
+    // input default of 0 and reprojects algebraics onto the inputs=0
+    // manifold — invalidating a consistent-IC state solved with
+    // non-zero inputs.
+    if let (Some(overrides), Some(ctx)) = (input_overrides.as_ref(), compiled_runtime.as_mut()) {
+        ctx.set_input_overrides(overrides.clone());
+    }
     let masks = build_runtime_projection_masks(dae, n_x, n_eq);
     if sim_trace_enabled() {
         let branch_local_rows = masks

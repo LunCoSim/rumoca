@@ -16,6 +16,11 @@ pub(crate) struct StartupSyncInput<'a> {
     pub(crate) param_values: &'a [f64],
     pub(crate) n_x: usize,
     pub(crate) budget: &'a TimeoutBudget,
+    /// Caller-supplied input values (from `StepperOptions::initial_inputs`
+    /// or `SimOptions` equivalents). Threaded into the t=0 runtime
+    /// projection so its Newton solve evaluates the residual at the
+    /// intended operating point rather than the unbound-input default.
+    pub(crate) input_overrides: Option<problem::SharedInputOverrides>,
 }
 
 pub(super) struct ScheduledEventProjectionInput<'a> {
@@ -37,12 +42,19 @@ pub(super) fn maybe_project_scheduled_event_state(
     t_stop: f64,
     atol: f64,
     budget: &TimeoutBudget,
+    input_overrides: Option<problem::SharedInputOverrides>,
 ) -> Result<Vec<f64>, SimError> {
     if n_x == 0 || n_x >= y_at_stop.len() {
         return Ok(y_at_stop.to_vec());
     }
     match problem::project_algebraics_with_fixed_states_at_time(
-        dae, y_at_stop, n_x, t_stop, atol, budget,
+        dae,
+        y_at_stop,
+        n_x,
+        t_stop,
+        atol,
+        budget,
+        input_overrides,
     )? {
         Some(projected) => {
             if sim_trace_enabled() {
@@ -162,6 +174,7 @@ where
         input.opts.t_start,
         input.opts.atol,
         input.budget,
+        input.input_overrides.clone(),
     )?;
     let projection_changed = projected
         .iter()

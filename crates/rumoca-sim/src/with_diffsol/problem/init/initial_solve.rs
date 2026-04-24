@@ -10,6 +10,24 @@ pub(crate) struct PreparedInitialAlgebraic {
     seeded_updates: usize,
     seeded_y: Vec<f64>,
     initial_free_norm: f64,
+    /// Seed env built from caller-supplied input overrides (StepperOptions::initial_inputs).
+    /// Threaded into every IC residual/Jacobian eval so the Newton solve
+    /// converges at the intended operating point rather than inputs=0.
+    input_seed_env: Option<rumoca_eval_dae::runtime::VarEnv<f64>>,
+}
+
+/// Build a runtime seed env from user-supplied input overrides so the
+/// scalar-interpreter IC residual path can see non-zero input values.
+/// The compiled path consumes overrides via `CompiledEvalContext.input_overrides`;
+/// the interpreted path reads solely from `VarEnv`, so both need seeding.
+fn build_input_seed_env(
+    overrides: &std::collections::HashMap<String, f64>,
+) -> rumoca_eval_dae::runtime::VarEnv<f64> {
+    let mut env = rumoca_eval_dae::runtime::VarEnv::default();
+    for (name, &value) in overrides {
+        env.vars.insert(name.clone(), value);
+    }
+    env
 }
 
 const INITIAL_HOMOTOPY_PRECONDITION_LAMBDAS: [f64; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
@@ -19,6 +37,7 @@ pub(crate) fn prepare_initial_algebraic(
     n_x: usize,
     timeout: &crate::TimeoutBudget,
     param_values: &[f64],
+    input_overrides: Option<crate::with_diffsol::problem::SharedInputOverrides>,
 ) -> Result<PreparedInitialAlgebraic, crate::SimError> {
     let n_eq = dae.f_x.len();
     let use_initial = equations_use_initial(dae);
@@ -26,7 +45,13 @@ pub(crate) fn prepare_initial_algebraic(
     initialize_state_vector_with_params(dae, &mut y, param_values);
     let p = param_values.to_vec();
     let compiled_initial = build_initial_newton_context_if_needed(dae, n_eq, use_initial)?;
-    let compiled_runtime = build_runtime_newton_context_if_needed(dae, n_eq, use_initial)?;
+    let mut compiled_runtime = build_runtime_newton_context_if_needed(dae, n_eq, use_initial)?;
+    if let (Some(overrides), Some(ctx)) = (input_overrides.as_ref(), compiled_runtime.as_mut()) {
+        ctx.set_input_overrides(overrides.clone());
+    }
+    let input_seed_env = input_overrides
+        .as_ref()
+        .map(|shared| build_input_seed_env(&shared.borrow()));
     let initial_updates = apply_initial_section_assignments_strict(dae, &mut y, &p, 0.0)?;
     if sim_trace_enabled() {
         eprintln!(
@@ -63,7 +88,7 @@ pub(crate) fn prepare_initial_algebraic(
     let eval_mode = IcEvalMode {
         compiled_initial: compiled_initial.as_ref(),
         compiled_runtime: compiled_runtime.as_ref(),
-        runtime_seed_env: None,
+        runtime_seed_env: input_seed_env.clone(),
         use_initial,
         is_initial_phase: true,
         homotopy_lambda: 1.0,
@@ -101,6 +126,7 @@ pub(crate) fn prepare_initial_algebraic(
         seeded_updates,
         seeded_y,
         initial_free_norm,
+        input_seed_env,
     })
 }
 
@@ -304,7 +330,7 @@ pub(crate) fn solve_initial_algebraic(
     timeout: &crate::TimeoutBudget,
 ) -> Result<bool, crate::SimError> {
     let p = default_params(dae);
-    solve_initial_algebraic_with_params(dae, n_x, tol, timeout, &p)
+    solve_initial_algebraic_with_params(dae, n_x, tol, timeout, &p, None)
 }
 
 pub(crate) fn solve_initial_algebraic_with_params(
@@ -313,6 +339,7 @@ pub(crate) fn solve_initial_algebraic_with_params(
     tol: f64,
     timeout: &crate::TimeoutBudget,
     param_values: &[f64],
+    input_overrides: Option<crate::with_diffsol::problem::SharedInputOverrides>,
 ) -> Result<bool, crate::SimError> {
     let n_eq = dae.f_x.len();
     let n_z = n_eq - n_x;
@@ -330,7 +357,8 @@ pub(crate) fn solve_initial_algebraic_with_params(
         seeded_updates,
         seeded_y,
         mut initial_free_norm,
-    } = prepare_initial_algebraic(dae, n_x, timeout, param_values)?;
+        input_seed_env,
+    } = prepare_initial_algebraic(dae, n_x, timeout, param_values, input_overrides)?;
     let newton_config = build_initial_newton_config(
         n_x,
         use_initial,
@@ -338,6 +366,7 @@ pub(crate) fn solve_initial_algebraic_with_params(
         &fixed,
         compiled_initial.as_ref(),
         compiled_runtime.as_ref(),
+        input_seed_env.clone(),
     );
     trace_initial_newton_start(n_eq, n_x, n_z, &fixed, tol, use_initial);
     if initial_free_norm <= tol {
@@ -357,7 +386,7 @@ pub(crate) fn solve_initial_algebraic_with_params(
         eval_mode: IcEvalMode {
             compiled_initial: compiled_initial.as_ref(),
             compiled_runtime: compiled_runtime.as_ref(),
-            runtime_seed_env: None,
+            runtime_seed_env: input_seed_env.clone(),
             use_initial,
             is_initial_phase: true,
             homotopy_lambda: 1.0,
@@ -391,6 +420,7 @@ fn build_initial_newton_config<'a>(
     fixed: &'a [bool],
     compiled_initial: Option<&'a CompiledInitialNewtonContext>,
     compiled_runtime: Option<&'a CompiledRuntimeNewtonContext>,
+    runtime_seed_env: Option<rumoca_eval_dae::runtime::VarEnv<f64>>,
 ) -> NewtonInitConfig<'a> {
     NewtonInitConfig {
         n_x,
@@ -402,7 +432,7 @@ fn build_initial_newton_config<'a>(
         homotopy_lambda: 1.0,
         compiled_initial,
         compiled_runtime,
-        runtime_seed_env: None,
+        runtime_seed_env,
         t_eval: 0.0,
         timeout,
     }

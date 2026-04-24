@@ -1371,7 +1371,6 @@ pub(crate) fn build_stepper(
     opts: stepper::StepperOptions,
 ) -> Result<stepper::SimStepper, SimError> {
     use std::cell::RefCell;
-    use std::collections::HashMap;
     use std::rc::Rc;
 
     use crate::equation_scalarize::build_output_names;
@@ -1402,9 +1401,24 @@ pub(crate) fn build_stepper(
     let n_total = dae.f_x.len();
     let param_values = build_parameter_values(&dae, &budget)?;
 
-    solve_initial_conditions(&mut dae, &ic_blocks, n_x, &param_values, opts.atol, &budget)?;
+    // Build input_overrides BEFORE IC solve so rumoca's IC Newton and the
+    // startup projection both see the caller's intended operating point.
+    // Without this, IC converges for inputs=0 and the first step either
+    // stalls on the 0→user_value discontinuity or the projection re-pulls
+    // algebraics onto the inputs=0 manifold.
+    let input_overrides: problem::SharedInputOverrides = Rc::new(RefCell::new(
+        opts.initial_inputs.clone().into_iter().collect(),
+    ));
 
-    let input_overrides: problem::SharedInputOverrides = Rc::new(RefCell::new(HashMap::new()));
+    solve_initial_conditions(
+        &mut dae,
+        &ic_blocks,
+        n_x,
+        &param_values,
+        opts.atol,
+        &budget,
+        Some(input_overrides.clone()),
+    )?;
 
     let mut problem_obj = problem::build_problem_with_overrides_and_params(
         &dae,
@@ -1452,6 +1466,7 @@ pub(crate) fn build_stepper(
             param_values: &param_values,
             n_x,
             budget: &budget,
+            input_overrides: Some(input_overrides.clone()),
         },
     )?;
 

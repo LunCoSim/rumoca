@@ -49,6 +49,7 @@ fn test_project_runtime_seeds_direct_assignments_before_newton() {
         1.0,
         1e-9,
         &timeout,
+        None,
     )
     .expect("runtime projection should not error")
     .expect("runtime projection should converge with direct-assignment seeding");
@@ -103,6 +104,7 @@ fn test_runtime_projection_leaves_alias_connected_unknowns_free() {
         1.0,
         1e-9,
         &timeout,
+        None,
     )
     .expect("runtime projection should not error")
     .expect("runtime projection should converge when only alias-connected unknowns remain free");
@@ -182,6 +184,7 @@ fn test_runtime_projection_handles_hidden_step_source_intermediate_target() {
         1.0,
         1e-9,
         &timeout,
+        None,
     )
     .expect("runtime projection should not error")
     .expect("runtime projection should converge with hidden direct-assignment targets");
@@ -240,6 +243,7 @@ fn test_runtime_projection_ignores_fixed_differential_rows() {
         1.0,
         1e-9,
         &timeout,
+        None,
     )
     .expect("runtime projection should not error")
     .expect("runtime projection should converge when fixed differential rows are masked");

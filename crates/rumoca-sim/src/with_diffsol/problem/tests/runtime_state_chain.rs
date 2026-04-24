@@ -49,6 +49,7 @@ fn test_project_runtime_unfixes_state_dependency_chain() {
         2.0,
         1e-9,
         &timeout,
+        None,
     )
     .expect("runtime projection should not error")
     .expect("runtime projection should converge");

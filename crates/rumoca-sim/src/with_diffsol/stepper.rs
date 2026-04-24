@@ -23,6 +23,18 @@ pub struct StepperOptions {
     pub atol: f64,
     pub scalarize: bool,
     pub max_wall_seconds_per_step: Option<f64>,
+    /// Input values to seed the initial-condition solve with. Keys are
+    /// flattened scalar names (see [`SimStepper::input_names`]).
+    ///
+    /// Without this, unbound `input` variables resolve to the default
+    /// value 0 during IC solve; a subsequent `set_input()` then
+    /// introduces a step discontinuity at t=0 that the stepper cannot
+    /// recover from. Pre-populating via this field lets the IC
+    /// solver (and both the startup projection and diffsol's own
+    /// consistent-IC probe) evaluate the residual at the caller's
+    /// intended operating point, so the first `step()` starts from a
+    /// consistent state.
+    pub initial_inputs: HashMap<String, f64>,
 }
 
 impl Default for StepperOptions {
@@ -32,6 +44,7 @@ impl Default for StepperOptions {
             atol: 1e-6,
             scalarize: true,
             max_wall_seconds_per_step: None,
+            initial_inputs: HashMap::new(),
         }
     }
 }

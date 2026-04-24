@@ -237,7 +237,15 @@ fn test_project_runtime_keeps_direct_assigned_state_free() {
 
     let timeout = crate::TimeoutBudget::new(None);
     let projected =
-        project_algebraics_with_fixed_states_at_time(&dae, &[0.0, 0.0], 1, 2.0, 1e-9, &timeout)
+        project_algebraics_with_fixed_states_at_time(
+            &dae,
+            &[0.0, 0.0],
+            1,
+            2.0,
+            1e-9,
+            &timeout,
+            None,
+        )
             .expect("runtime projection should not error")
             .expect("runtime projection should converge");
 
@@ -696,6 +704,7 @@ fn test_project_runtime_converges_on_rank_deficient_consistent_system() {
         0.0,
         1e-9,
         &timeout,
+        None,
     )
     .expect("runtime projection should not error")
     .expect("rank-deficient but consistent runtime projection should converge");

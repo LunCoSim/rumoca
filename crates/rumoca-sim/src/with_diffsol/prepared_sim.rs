@@ -1130,6 +1130,7 @@ fn run_prepared_dynamic_simulation(
         &param_values,
         opts.atol,
         budget,
+        None,
     )?;
     if sim_trace_enabled() {
         eprintln!(

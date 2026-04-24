@@ -64,9 +64,16 @@ fn solve_ic_with_newton(
     param_values: &[f64],
     atol: f64,
     budget: &TimeoutBudget,
+    input_overrides: Option<problem::SharedInputOverrides>,
 ) -> Result<(), SimError> {
-    let newton_ok =
-        problem::solve_initial_algebraic_with_params(dae, n_x, atol, budget, param_values)?;
+    let newton_ok = problem::solve_initial_algebraic_with_params(
+        dae,
+        n_x,
+        atol,
+        budget,
+        param_values,
+        input_overrides,
+    )?;
     trace_ic_newton_result("startup", newton_ok);
     Ok(())
 }
@@ -78,6 +85,7 @@ pub(crate) fn solve_initial_conditions(
     param_values: &[f64],
     atol: f64,
     budget: &TimeoutBudget,
+    input_overrides: Option<problem::SharedInputOverrides>,
 ) -> Result<(), SimError> {
     run_timeout_result(budget, || {
         if sim_trace_enabled() {
@@ -88,7 +96,7 @@ pub(crate) fn solve_initial_conditions(
                 atol
             );
         }
-        solve_ic_with_newton(dae, n_x, param_values, atol, budget)?;
+        solve_ic_with_newton(dae, n_x, param_values, atol, budget, input_overrides)?;
         Ok(())
     })
 }
@@ -977,7 +985,7 @@ mod tests {
             solution_expr: dae::Expression::Literal(dae::Literal::Real(0.0)),
         }];
         let budget = TimeoutBudget::new(None);
-        solve_initial_conditions(&mut dae, &legacy_plan, 0, &[], 1e-10, &budget)
+        solve_initial_conditions(&mut dae, &legacy_plan, 0, &[], 1e-10, &budget, None)
             .expect("startup Newton should ignore legacy BLT plan");
 
         let value = dae

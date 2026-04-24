@@ -932,6 +932,7 @@ where
         stop_t,
         ctx.opts.atol,
         ctx.budget,
+        None,
     )?;
     overwrite_solver_state::<Eqn, S>(
         solver,
@@ -1609,6 +1610,7 @@ pub(super) fn try_integrate(
             param_values: input.param_values,
             n_x,
             budget: input.budget,
+            input_overrides: None,
         },
     )?;
     let mut solver_names = build_output_names(input.dae);
@@ -1758,6 +1760,7 @@ where
             param_values: input.param_values,
             n_x,
             budget: input.budget,
+            input_overrides: None,
         },
     )?;
     let solver_names = truncated_solver_names(input.dae, input.n_total);

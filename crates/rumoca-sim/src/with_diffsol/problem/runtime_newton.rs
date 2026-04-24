@@ -700,6 +700,19 @@ pub(crate) struct CompiledRuntimeNewtonContext {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+impl CompiledRuntimeNewtonContext {
+    /// Inject input overrides so residual/Jacobian evaluations during the
+    /// initial-condition Newton solve use caller-supplied input values rather
+    /// than the unbound-input default of 0. Without this, IC converges for
+    /// inputs=0 and the first post-IC step fails when the stepping kernel
+    /// sees the real input values.
+    pub(crate) fn set_input_overrides(&mut self, overrides: SharedInputOverrides) {
+        self.compiled_eval_ctx_rhs.input_overrides = Some(overrides.clone());
+        self.compiled_eval_ctx_jac.input_overrides = Some(overrides);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct CompiledInitialNewtonContext {
     compiled_eval_ctx_rhs: CompiledEvalContext,
     compiled_eval_ctx_jac: CompiledEvalContext,
@@ -713,6 +726,14 @@ pub(crate) struct CompiledRuntimeNewtonContext {
     compiled_eval_ctx_jac: CompiledEvalContext,
     compiled_residual: rumoca_eval_dae::compiled::CompiledResidualWasm,
     compiled_jacobian: rumoca_eval_dae::compiled::CompiledJacobianVWasm,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl CompiledRuntimeNewtonContext {
+    pub(crate) fn set_input_overrides(&mut self, overrides: SharedInputOverrides) {
+        self.compiled_eval_ctx_rhs.input_overrides = Some(overrides.clone());
+        self.compiled_eval_ctx_jac.input_overrides = Some(overrides);
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
