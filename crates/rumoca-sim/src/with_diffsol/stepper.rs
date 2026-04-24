@@ -127,6 +127,15 @@ pub struct SimStepper {
     /// Substitutions from algebraic elimination — used to reconstruct
     /// eliminated variables (e.g. outputs) in `get()` and `state()`.
     pub(crate) elim: EliminationResult,
+    /// `min`/`max` declared on each input via Modelica's MLS §4.8.4
+    /// attribute syntax (e.g. `RealInput opening(min=0, max=1)`),
+    /// extracted from `dae.inputs` at stepper-build time and resolved
+    /// against the parameter environment so dynamic bounds (e.g.
+    /// `min=u_min` referring to a parameter) are pinned to numbers.
+    /// `set_input` rejects out-of-range writes with an error rather
+    /// than silently clamping (silent clamping would mislead callers
+    /// who expect their value to round-trip through `get()`).
+    pub(crate) input_bounds: HashMap<String, (Option<f64>, Option<f64>)>,
     /// Set when `set_input` changes a value; cleared after solver history reset.
     pub(crate) inputs_dirty: bool,
 }
@@ -145,6 +154,14 @@ impl SimStepper {
     ///
     /// The name should match the flattened scalar name of an input variable
     /// (e.g., `"u"` for a scalar input, `"u[1]"` for an array element).
+    ///
+    /// Errors with `SimError::SolverError` if:
+    /// - `name` is not a declared input, or
+    /// - `value` is finite but lies outside the input's declared
+    ///   `min`/`max` (Modelica `RealInput x(min=…, max=…)` per
+    ///   MLS §4.8.4). NaN/inf are also rejected. The error message
+    ///   reports the declared range and the offending value so
+    ///   callers can clamp before retrying.
     pub fn set_input(&mut self, name: &str, value: f64) -> Result<(), SimError> {
         let valid_names = self.sim_context.input_scalar_names();
         if !valid_names.iter().any(|n| n == name) {
@@ -152,6 +169,27 @@ impl SimStepper {
                 "unknown input '{}', available inputs: {:?}",
                 name, valid_names
             )));
+        }
+        if !value.is_finite() {
+            return Err(SimError::SolverError(format!(
+                "input '{name}' must be finite; got {value}",
+            )));
+        }
+        if let Some((lo, hi)) = self.input_bounds.get(name) {
+            if let Some(lo_v) = lo
+                && value < *lo_v
+            {
+                return Err(SimError::SolverError(format!(
+                    "input '{name}' = {value} is below declared min = {lo_v}",
+                )));
+            }
+            if let Some(hi_v) = hi
+                && value > *hi_v
+            {
+                return Err(SimError::SolverError(format!(
+                    "input '{name}' = {value} exceeds declared max = {hi_v}",
+                )));
+            }
         }
         let mut overrides = self.input_overrides.borrow_mut();
         let old = overrides.get(name).copied();

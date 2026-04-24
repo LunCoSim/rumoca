@@ -1698,6 +1698,36 @@ pub(crate) fn build_stepper(
         _phantom: std::marker::PhantomData,
     };
 
+    // Resolve declared `min`/`max` on each input (MLS §4.8.4
+    // attribute syntax) to numeric bounds. Evaluated against an
+    // env populated only with the parameter values, so dynamic
+    // bounds like `min = u_min` (referring to a parameter) are
+    // pinned at build time. Bound expressions that reference time
+    // or state would resolve to 0 — at which point the bound
+    // would be wrong; flagged as a future enhancement to support
+    // time-varying bounds via per-step re-evaluation.
+    let input_bounds: HashMap<String, (Option<f64>, Option<f64>)> = {
+        let mut bounds = HashMap::new();
+        let mut param_env = eval::VarEnv::default();
+        for ((name, _var), &val) in dae.parameters.iter().zip(param_values.iter()) {
+            param_env.vars.insert(name.as_str().to_string(), val);
+        }
+        for (var_name, var) in dae.inputs.iter() {
+            let lo = var
+                .min
+                .as_ref()
+                .map(|expr| rumoca_eval_dae::runtime::eval_expr::<f64>(expr, &param_env));
+            let hi = var
+                .max
+                .as_ref()
+                .map(|expr| rumoca_eval_dae::runtime::eval_expr::<f64>(expr, &param_env));
+            if lo.is_some() || hi.is_some() {
+                bounds.insert(var_name.as_str().to_string(), (lo, hi));
+            }
+        }
+        bounds
+    };
+
     Ok(stepper::SimStepper {
         inner: Box::new(inner),
         dae,
@@ -1712,6 +1742,7 @@ pub(crate) fn build_stepper(
         projection_runtime_ctx,
         projection_masks,
         elim,
+        input_bounds,
         inputs_dirty: false,
     })
 }
