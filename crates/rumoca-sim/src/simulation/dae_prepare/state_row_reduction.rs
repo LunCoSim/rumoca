@@ -348,7 +348,8 @@ pub fn substitute_standalone_state_derivatives_in_non_ode_rows(dae: &mut Dae) ->
     let state_names: Vec<VarName> = dae.states.keys().cloned().collect();
     let mut rewritten_rows = 0usize;
 
-    for eq in dae.f_x.iter_mut().skip(n_x) {
+    let trace = std::env::var("RUMOCA_SIM_TRACE").is_ok();
+    for (i, eq) in dae.f_x.iter_mut().enumerate().skip(n_x) {
         let mut rewritten = false;
         for state_name in &state_names {
             let Some(replacement) = der_map.get(state_name.as_str()) else {
@@ -359,6 +360,14 @@ pub fn substitute_standalone_state_derivatives_in_non_ode_rows(dae: &mut Dae) ->
             }
             if !expr_contains_der_of(&eq.rhs, state_name) {
                 continue;
+            }
+            if trace {
+                eprintln!(
+                    "[sim-trace] der-sub non-ODE row f_x[{i}] origin='{}' state={} replacement={:?}",
+                    eq.origin,
+                    state_name.as_str(),
+                    replacement
+                );
             }
             eq.rhs = substitute_der_of_state(&eq.rhs, state_name, replacement);
             rewritten = true;
