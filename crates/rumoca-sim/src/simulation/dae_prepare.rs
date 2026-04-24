@@ -712,6 +712,76 @@ pub fn build_relaxed_derivative_map(dae: &Dae) -> HashMap<String, Expression> {
     map
 }
 
+/// Returns true if every VarRef in `expr` is a "primitive" quantity:
+/// state, parameter, constant, or the builtin `time`. Used to validate
+/// chain-rule derivative expansions before accepting a state demotion —
+/// see the comment at the call site for why.
+fn expr_vars_are_all_primitive(
+    expr: &Expression,
+    dae: &Dae,
+    state_name_set: &HashSet<String>,
+) -> bool {
+    let mut refs: HashSet<VarName> = HashSet::new();
+    expr.collect_var_refs(&mut refs);
+    refs.iter().all(|name| {
+        let s = name.as_str();
+        if s == "time" {
+            return true;
+        }
+        if state_name_set.contains(s) {
+            return true;
+        }
+        if dae.parameters.contains_key(name) {
+            return true;
+        }
+        if dae.constants.contains_key(name) {
+            return true;
+        }
+        false
+    })
+}
+
+/// If `expr` reduces (after ignoring literal-zero padding and
+/// unary-minus wrappers) to exactly one variable reference, return that
+/// variable's name. Used to detect alias-style defining expressions like
+/// `(x - 0) - (0 - 0)` that arise from `split_linear_target` output.
+fn single_alias_referenced_var(expr: &Expression) -> Option<VarName> {
+    let mut found: Option<VarName> = None;
+    collect_non_zero_var_ref(expr, &mut found)?;
+    found
+}
+
+/// Walk the expression and collect the single variable reference, if
+/// the expression is arithmetically equivalent to one VarRef. Returns
+/// `Some(())` on recognizable shape, `None` on structural disqualifier
+/// (non-zero literal, unrecognized node, or multiple VarRefs).
+fn collect_non_zero_var_ref(expr: &Expression, found: &mut Option<VarName>) -> Option<()> {
+    match expr {
+        Expression::VarRef { name, .. } => {
+            if found.is_some() {
+                return None; // second distinct VarRef — not a single alias
+            }
+            *found = Some(name.clone());
+            Some(())
+        }
+        Expression::Literal(rumoca_ir_dae::Literal::Real(v)) if *v == 0.0 => Some(()),
+        Expression::Literal(rumoca_ir_dae::Literal::Integer(0)) => Some(()),
+        Expression::Literal(_) => None,
+        Expression::Unary { rhs, .. } => collect_non_zero_var_ref(rhs, found),
+        Expression::Binary { op, lhs, rhs } => match op {
+            OpBinary::Add(_)
+            | OpBinary::AddElem(_)
+            | OpBinary::Sub(_)
+            | OpBinary::SubElem(_) => {
+                collect_non_zero_var_ref(lhs, found)?;
+                collect_non_zero_var_ref(rhs, found)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub fn expr_contains_var(expr: &Expression, var_name: &VarName) -> bool {
     match expr {
         Expression::VarRef { .. } | Expression::Index { .. } => expr_refers_to_var(expr, var_name),
@@ -1851,6 +1921,15 @@ fn apply_direct_demotion_plans(
 pub fn demote_direct_assigned_states(dae: &mut Dae) -> usize {
     let max_rounds = dae.states.len().clamp(1, 8);
     let mut total_demoted = 0usize;
+    // Each equation expresses a single degree of freedom. If round N already
+    // consumed f_x[k] as the defining equation for some state's demotion
+    // (e.g. `load.phi = inertia2.phi` demoted `load.phi`), round N+1 must
+    // not re-consume the same row to demote the opposite side
+    // (`inertia2.phi`). That creates fictitious extra DOFs and cascades into
+    // structurally-broken DAEs. Equation indices are stable across rounds
+    // because the applicator only mutates rhs via `substitute_der_of_state`;
+    // it never removes or reorders equations.
+    let mut consumed_eq_indices: HashSet<usize> = HashSet::new();
 
     for _ in 0..max_rounds {
         let trace = sim_trace_enabled();
@@ -1865,8 +1944,12 @@ pub fn demote_direct_assigned_states(dae: &mut Dae) -> usize {
         let mut alias_safety_cache = HashMap::new();
         let mut substitutions: HashMap<String, DirectStateDemotionPlan> = HashMap::new();
         let mut counters = DirectDemotionCounters::default();
+        let mut accepted_eq_indices: Vec<usize> = Vec::new();
 
-        for eq in &dae.f_x {
+        for (eq_idx, eq) in dae.f_x.iter().enumerate() {
+            if consumed_eq_indices.contains(&eq_idx) {
+                continue;
+            }
             let Some((state_name, defining_expr)) =
                 extract_state_direct_assignment_equation(eq, &state_names, &state_name_set)
             else {
@@ -1890,18 +1973,73 @@ pub fn demote_direct_assigned_states(dae: &mut Dae) -> usize {
                 counters.n_skip_self_der += 1;
                 continue;
             }
+            // Self-reference tautology guard (see above).
+            if expr_contains_var(&defining_expr, &state_name) {
+                counters.n_skip_self_der += 1;
+                continue;
+            }
+            // Reverse-alias guard: if the defining expression reduces
+            // (ignoring trivial zero padding) to a single variable
+            // reference AND that variable is already algebraic (not a
+            // state), the equation is a pinned alias whose direction is
+            // `algebraic = state`. Demoting the state side here reverses
+            // that alias. If the referenced variable is also a state,
+            // both are candidates and the earlier two-state rejection in
+            // `extract_state_direct_assignment_equation` already handled
+            // it — so reaching this point with a state-referencing single
+            // alias is a legitimate demotion like `load.phi = inertia2.phi`.
+            // Seen in T4d: `inertia2.w = load.w - 0` (load.w algebraic via
+            // flange connect) was used to demote inertia2.w.
+            if let Some(alias_var) = single_alias_referenced_var(&defining_expr)
+                && !state_name_set.contains(alias_var.as_str())
+            {
+                counters.n_skip_unsafe_non_state_alias += 1;
+                continue;
+            }
             if eq_contains_any_state_der(&defining_expr, &state_names) {
                 counters.n_skip_der_in_defining_expr += 1;
                 continue;
             }
-            if defining_expr_references_unsafe_non_state_alias_closure(
-                dae,
+            // Try chain-rule derivative expansion first. If it produces a
+            // fully-resolved replacement (no der() calls remaining), the
+            // defining expression is safe to demote regardless of how many
+            // states it references — by construction, each state's derivative
+            // resolved cleanly through `der_map`. Examples:
+            //   phi_rel = inertia2.phi - inertia1.phi
+            //     → der(phi_rel) = inertia2.w - inertia1.w   (state-free)
+            // The conservative `unsafe_non_state_alias` check rejects ANY
+            // state reference, which blocks this common alias form from being
+            // demoted and leaves the structural-singularity trap downstream.
+            let chain_rule_der_expr = choose_derivative_replacement(
                 &defining_expr,
                 &state_name_set,
-                &non_state_unknown_names,
-                eq,
-                &mut alias_safety_cache,
-            ) {
+                dae,
+                &der_map,
+                &mut DirectDemotionCounters::default(), // probe only; counters below
+            );
+            // "Clean" means: no `der(...)` calls remain AND every VarRef
+            // in the result is a primitive (state, parameter, constant,
+            // or `time`). The relaxed derivative map synthesizes symbolic
+            // VarRefs like `inertia.a` for `der(inertia.w)` when the ODE
+            // can't be solved for der-in-closed-form; those placeholders
+            // have no defining equation of their own. Accepting them as
+            // "clean" produces demotion replacements that reference
+            // dangling unknowns and break IC-plan matching downstream
+            // (T4d repro: `spring.w_rel -> inertia2.a - inertia1.a`).
+            let chain_rule_clean = chain_rule_der_expr.as_ref().is_some_and(|e| {
+                !expression_contains_any_der_call(e)
+                    && expr_vars_are_all_primitive(e, dae, &state_name_set)
+            });
+            if !chain_rule_clean
+                && defining_expr_references_unsafe_non_state_alias_closure(
+                    dae,
+                    &defining_expr,
+                    &state_name_set,
+                    &non_state_unknown_names,
+                    eq,
+                    &mut alias_safety_cache,
+                )
+            {
                 counters.n_skip_unsafe_non_state_alias += 1;
                 continue;
             }
@@ -1917,7 +2055,15 @@ pub fn demote_direct_assigned_states(dae: &mut Dae) -> usize {
                         && !expr_contains_der_of(&row.rhs, &state_name)
                 })
                 .count();
-            if state_non_der_ref_rows > 1 {
+            // The extra-refs check guards against multiple competing
+            // defining equations. With cross-round consumed-eq tracking
+            // preventing the same equation from being reused as a
+            // definition, additional non-der references are consumers of
+            // the alias — they will resolve through the kept defining
+            // equation at BLT matching time. Only enforce when chain-rule
+            // can't cleanly resolve `der(state)`, since otherwise we have
+            // no guarantee the chain of substitutions terminates.
+            if state_non_der_ref_rows > 1 && !chain_rule_clean {
                 counters.n_skip_extra_state_refs += 1;
                 continue;
             }
@@ -1940,18 +2086,23 @@ pub fn demote_direct_assigned_states(dae: &mut Dae) -> usize {
             }
             if trace && counters.n_trace_logged_candidates < 16 {
                 eprintln!(
-                    "[sim-trace] direct-assignment accepted state={} der_expr={}",
+                    "[sim-trace] direct-assignment accepted state={} origin='{}' eq_idx={} der_expr={}",
                     state_name.as_str(),
-                    truncate_debug(&format!("{:?}", der_expr), 1200)
+                    eq.origin,
+                    eq_idx,
+                    truncate_debug(&format!("{:?}", der_expr), 600)
                 );
                 counters.n_trace_logged_candidates += 1;
             }
-            substitutions
-                .entry(state_name.as_str().to_string())
-                .or_insert(DirectStateDemotionPlan {
-                    state_name,
-                    der_expr,
-                });
+            let key = state_name.as_str().to_string();
+            let newly_inserted = !substitutions.contains_key(&key);
+            substitutions.entry(key).or_insert(DirectStateDemotionPlan {
+                state_name,
+                der_expr,
+            });
+            if newly_inserted {
+                accepted_eq_indices.push(eq_idx);
+            }
         }
 
         log_direct_demotion_scan_summary(trace, state_name_set.len(), &substitutions, &counters);
@@ -1965,6 +2116,7 @@ pub fn demote_direct_assigned_states(dae: &mut Dae) -> usize {
         if demoted_this_round == 0 {
             break;
         }
+        consumed_eq_indices.extend(accepted_eq_indices);
         total_demoted += demoted_this_round;
     }
 
