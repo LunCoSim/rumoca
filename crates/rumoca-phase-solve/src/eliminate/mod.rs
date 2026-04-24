@@ -1326,12 +1326,42 @@ fn expr_references_any_discrete_name(dae: &Dae, expr: &Expression) -> bool {
 
 // ── Expression Helpers ──────────────────────────────────────────────────
 
-/// Apply substitutions in-order to an expression.
+/// Apply substitutions in-order to an expression, iterating until the
+/// expression reaches a fixed point.
+///
+/// A single in-order pass is insufficient when a later substitution's
+/// replacement reintroduces a variable that was already substituted.
+/// Concrete case (KinematicPTP): `Tv_sub` is pushed at index 35 with
+/// `Tv -> if noWphase then Ta1 else 1/sd_max`. A later `Te_sub` at index
+/// M>35 has `Te -> if noWphase then Ta1+Ta1 else Tv+Ta2`, which contains
+/// a raw `Tv`. When applied to a downstream equation in index order,
+/// `Tv_sub` runs first (sees no Tv, skips), then `Te_sub` expands Tv in
+/// — and we never revisit `Tv_sub`, leaving a dangling reference that
+/// breaks BLT matching. Iterating to a fixed point picks up those cross-
+/// substitution reintroductions.
+///
+/// Bounded to 32 iterations to guard against a pathological cycle (none
+/// expected — substitutions in a resolvable DAE are acyclic by
+/// construction); above that we stop and return the last form.
 fn apply_substitutions_in_order(expr: &Expression, substitutions: &[Substitution]) -> Expression {
     let mut out = expr.clone();
-    for sub in substitutions {
-        if expr_contains_var(&out, &sub.var_name) {
-            out = substitute_var(&out, &sub.var_name, &sub.expr);
+    let trace_fp = std::env::var("RUMOCA_SIM_FIXPT_TRACE").is_ok();
+    for iter_n in 0..32 {
+        let mut changed = false;
+        for sub in substitutions {
+            if expr_contains_var(&out, &sub.var_name) {
+                out = substitute_var(&out, &sub.var_name, &sub.expr);
+                changed = true;
+                if trace_fp {
+                    eprintln!(
+                        "[fixpt] iter={iter_n} subst {} applied",
+                        sub.var_name.as_str()
+                    );
+                }
+            }
+        }
+        if !changed {
+            break;
         }
     }
     out
@@ -1343,6 +1373,18 @@ fn apply_substitutions_to_remaining_once(
     eliminated_eq_flags: &[bool],
     substitutions: &[Substitution],
 ) {
+    if std::env::var("RUMOCA_SIM_FIXPT_TRACE").is_ok() {
+        eprintln!(
+            "[fixpt] apply_to_remaining: n_subs={} n_eqs={} subs=[{}]",
+            substitutions.len(),
+            dae.f_x.len(),
+            substitutions
+                .iter()
+                .map(|s| s.var_name.as_str().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     if substitutions.is_empty() {
         return;
     }

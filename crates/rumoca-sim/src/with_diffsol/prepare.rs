@@ -5,7 +5,7 @@ use crate::simulation::dae_prepare::{
     demote_orphan_states_without_equation_refs, demote_states_without_assignable_derivative_rows,
     demote_states_without_derivative_refs, eliminate_derivative_aliases,
     expand_compound_derivatives, index_reduce_missing_state_derivatives,
-    normalize_ode_equation_signs, promote_der_algebraics_to_states,
+    normalize_ode_equation_signs, promote_der_algebraics_to_states, substitute_var_in_expr,
     substitute_standalone_state_derivatives_in_non_ode_rows,
 };
 use crate::simulation::introspection::trace_flow_array_alias_watch;
@@ -1036,6 +1036,106 @@ fn substitute_non_ode_state_derivatives_with_trace(
     Ok(())
 }
 
+/// Apply every substitution recorded in `elim.substitutions` to every
+/// equation in `dae.f_x` (and sibling partitions), iterating per-row to
+/// a fixed point. Earlier passes can append entries to the substitution
+/// list without rewriting the DAE rows (e.g. runtime alias
+/// normalization, post-structure/post-scalarize eliminate phases whose
+/// per-phase applies don't see earlier phases' entries). This final
+/// sweep guarantees the DAE handed to IC-plan matching contains no
+/// stale references to already-substituted variables.
+fn apply_eliminated_substitutions_to_dae_f_x(
+    dae: &mut Dae,
+    elim: &eliminate::EliminationResult,
+) {
+    if elim.substitutions.is_empty() {
+        return;
+    }
+    let apply_fp = |expr: &dae::Expression| -> dae::Expression {
+        let mut out = expr.clone();
+        for _ in 0..32 {
+            let mut changed = false;
+            for sub in &elim.substitutions {
+                if expr_contains_var_ref(&out, &sub.var_name) {
+                    out = substitute_var_in_expr(&out, &sub.var_name, &sub.expr);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        out
+    };
+    for eq in &mut dae.f_x {
+        eq.rhs = apply_fp(&eq.rhs);
+    }
+    for eq in &mut dae.f_z {
+        eq.rhs = apply_fp(&eq.rhs);
+    }
+    for eq in &mut dae.f_m {
+        eq.rhs = apply_fp(&eq.rhs);
+    }
+    for eq in &mut dae.f_c {
+        eq.rhs = apply_fp(&eq.rhs);
+    }
+    for expr in &mut dae.synthetic_root_conditions {
+        *expr = apply_fp(expr);
+    }
+    // Each substitution is a logical deletion: the variable is expressed
+    // by `sub.expr` and has no remaining free-standing degree of freedom
+    // in the DAE. Earlier phases already dropped it from algebraics for
+    // subs they originated, but cross-phase appends (runtime alias
+    // normalization, post-scalarize eliminate) can leave it behind. Do
+    // the cleanup unconditionally here.
+    //
+    // The defining equation, if it survived to this point, has just been
+    // reduced to a tautology (`sub.expr - sub.expr = 0`) by the sweep
+    // above. Remove any such row before IC-plan matching so it doesn't
+    // register as `unmatched_eq f_x[...] unknowns=`.
+    let substituted_names: std::collections::HashSet<String> = elim
+        .substitutions
+        .iter()
+        .map(|s| s.var_name.as_str().to_string())
+        .collect();
+    for name in &substituted_names {
+        let vn = VarName::new(name);
+        dae.algebraics.shift_remove(&vn);
+        dae.outputs.shift_remove(&vn);
+    }
+    let mut tautological: Vec<usize> = dae
+        .f_x
+        .iter()
+        .enumerate()
+        .filter(|(_, eq)| is_expression_trivially_zero(&eq.rhs))
+        .map(|(i, _)| i)
+        .collect();
+    tautological.sort_unstable();
+    for &idx in tautological.iter().rev() {
+        dae.f_x.remove(idx);
+    }
+}
+
+/// Returns true if `expr`, after trivial arithmetic simplification,
+/// evaluates to the literal zero — i.e. the equation `0 = expr` is a
+/// tautology with no constraint content.
+fn is_expression_trivially_zero(expr: &dae::Expression) -> bool {
+    match expr {
+        dae::Expression::Literal(rumoca_ir_dae::Literal::Real(v)) => *v == 0.0,
+        dae::Expression::Literal(rumoca_ir_dae::Literal::Integer(0)) => true,
+        dae::Expression::Binary {
+            op: rumoca_ir_core::OpBinary::Sub(_),
+            lhs,
+            rhs,
+        } => expressions_are_structurally_equal(lhs, rhs),
+        _ => false,
+    }
+}
+
+fn expressions_are_structurally_equal(a: &dae::Expression, b: &dae::Expression) -> bool {
+    format!("{a:?}") == format!("{b:?}")
+}
+
 pub(super) fn log_prepare_substitutions_if_introspect(
     elim: &eliminate::EliminationResult,
     trace: bool,
@@ -1269,6 +1369,22 @@ fn prepare_dae_core(
         &mut elim,
     );
     budget.check()?;
+
+    // Final substitution sweep: earlier passes can append new entries to
+    // `elim.substitutions` (runtime alias normalization, post-* eliminate
+    // phases) without mutating `dae.f_x`, and phase-local applies iterate
+    // only that phase's own substitution list. By the time we reach IC
+    // plan building, `dae.f_x` can still contain variable references that
+    // have long since been scheduled for substitution — which manifests
+    // as `unmatched_unknown` entries pointing at variables whose own
+    // defining equations are already gone (KinematicPTP's Tv/Te in the
+    // T4d repro).
+    //
+    // A single all-substitutions-vs-all-rows apply here (fixed-point
+    // iterated per row, via `rumoca_phase_solve::eliminate`'s internal
+    // machinery exposed by `apply_eliminated_substitutions_to_dae_f_x`)
+    // closes the gap without disturbing earlier phase ordering.
+    apply_eliminated_substitutions_to_dae_f_x(&mut dae, &elim);
 
     log_prepare_substitutions_if_introspect(&elim, trace);
 
