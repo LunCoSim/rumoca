@@ -213,11 +213,36 @@ fn resolve_boundary_equations(dae: &mut Dae) -> EliminationResult {
             // Not directly solvable for any live scalar unknown.
             continue;
         };
-        substitutions.push(Substitution {
+        let proposed = Substitution {
             var_name: var_name.clone(),
             expr: solution.clone(),
             env_keys: vec![var_name.as_str().to_string()],
-        });
+        };
+        // Tautology guard: if substituting `var_name -> solution` collapses
+        // a surviving equation to `0 = 0` while that equation carried other
+        // unknowns, those unknowns become structurally homeless in later BLT
+        // matching. Skip this substitution so the equation survives for
+        // multi-unknown solving.
+        if let Some(victim_idx) = substitution_would_erase_equation_with_other_unknowns(
+            dae,
+            eq_idx,
+            &proposed,
+            &substitutions,
+            &eliminated_eq_flags,
+            &all_unknowns,
+            &resolved,
+        ) {
+            if eliminate_trace_enabled() {
+                eprintln!(
+                    "[sim-trace] boundary skip: {} -> ... would erase eq #{} (origin='{}')",
+                    var_name.as_str(),
+                    victim_idx,
+                    dae.f_x[victim_idx].origin
+                );
+            }
+            continue;
+        }
+        substitutions.push(proposed);
         eliminated_eq_indices.push(eq_idx);
         eliminated_eq_flags[eq_idx] = true;
         resolved.insert(var_name.clone());
@@ -457,6 +482,64 @@ fn maybe_push_non_unknown_alias_substitution(
         expr: solution,
         env_keys: vec![var_name.as_str().to_string()],
     });
+}
+
+/// Probe whether a proposed substitution would reduce any surviving
+/// equation to a tautology (`0 = 0`) while that equation originally
+/// carried *other* live unknowns.
+///
+/// The danger is collateral erasure: a substitution eats one equation
+/// (the consumed row) but, when applied symbolically, also collapses a
+/// second equation whose remaining unknowns then have no row left to
+/// pin them. BLT matching later reports those unknowns as structurally
+/// homeless. Detected repro: KinematicPTP + sensor in a ≥3-element
+/// connect-set with a purely algebraic feedback loop (see
+/// `rumoca_structural_bug_bisection.rs`).
+///
+/// A substitution whose victim carried *only* `var_name` is benign —
+/// that's a simple redundancy. We only fire when the victim loses
+/// other unknowns along with `var_name`.
+///
+/// Returns the victim equation index if the guard should fire.
+fn substitution_would_erase_equation_with_other_unknowns(
+    dae: &Dae,
+    consumed_eq_idx: usize,
+    proposed: &Substitution,
+    existing_substitutions: &[Substitution],
+    eliminated_eq_flags: &[bool],
+    all_unknowns: &[VarName],
+    resolved: &HashSet<VarName>,
+) -> Option<usize> {
+    let mut probe_subs: Vec<Substitution> = existing_substitutions.to_vec();
+    probe_subs.push(proposed.clone());
+    for (i, eq) in dae.f_x.iter().enumerate() {
+        if i == consumed_eq_idx {
+            continue;
+        }
+        if eliminated_eq_flags.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        // Pre-substitution: what unknowns does this equation carry right now,
+        // after prior substitutions but BEFORE the proposed one?
+        let pre_reduced = apply_substitutions_in_order(&eq.rhs, existing_substitutions);
+        let pre_live = find_live_scalar_unknowns(&pre_reduced, all_unknowns, resolved, dae);
+        if pre_live.is_empty() {
+            continue;
+        }
+        // Does this equation carry any unknown besides `var_name`? If it's
+        // only `var_name`, collapsing it is benign redundancy elimination.
+        let has_other_unknown = pre_live.iter().any(|v| v != &proposed.var_name);
+        if !has_other_unknown {
+            continue;
+        }
+        // Post-substitution: does it collapse to zero live unknowns?
+        let post_reduced = apply_substitutions_in_order(&eq.rhs, &probe_subs);
+        let post_live = find_live_scalar_unknowns(&post_reduced, all_unknowns, resolved, dae);
+        if post_live.is_empty() {
+            return Some(i);
+        }
+    }
+    None
 }
 
 fn unknown_is_fixed(dae: &Dae, name: &VarName) -> bool {
@@ -771,6 +854,12 @@ fn eliminate_via_blt(
     state_names: &[VarName],
 ) -> EliminationResult {
     let runtime_protected_unknowns = runtime_protected_unknown_names(dae);
+    let all_unknowns: Vec<VarName> = dae
+        .algebraics
+        .keys()
+        .chain(dae.outputs.keys())
+        .cloned()
+        .collect();
     let mut substitutions: Vec<Substitution> = Vec::new();
     let mut eliminated_eq_indices: Vec<usize> = Vec::new();
     let mut eliminated_eq_flags = vec![false; dae.f_x.len()];
@@ -851,12 +940,34 @@ fn eliminate_via_blt(
             continue;
         }
 
-        // Record substitution.
-        substitutions.push(Substitution {
+        let proposed = Substitution {
             var_name: var_name.clone(),
             expr: solution.clone(),
             env_keys: vec![var_name.as_str().to_string()],
-        });
+        };
+        // Tautology guard (see `substitution_would_erase_equation_with_other_unknowns`).
+        let eliminated_set: HashSet<VarName> =
+            eliminated_var_names.iter().cloned().collect();
+        if let Some(victim_idx) = substitution_would_erase_equation_with_other_unknowns(
+            dae,
+            eq_idx,
+            &proposed,
+            &substitutions,
+            &eliminated_eq_flags,
+            &all_unknowns,
+            &eliminated_set,
+        ) {
+            if eliminate_trace_enabled() {
+                eprintln!(
+                    "[sim-trace] blt skip: {} -> ... would erase eq #{} (origin='{}')",
+                    var_name.as_str(),
+                    victim_idx,
+                    dae.f_x[victim_idx].origin
+                );
+            }
+            continue;
+        }
+        substitutions.push(proposed);
         eliminated_eq_indices.push(eq_idx);
         eliminated_eq_flags[eq_idx] = true;
         eliminated_var_names.push(var_name.clone());
