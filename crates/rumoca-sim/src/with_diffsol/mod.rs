@@ -1470,6 +1470,18 @@ pub(crate) fn build_stepper(
         },
     )?;
 
+    // Pre-build the post-input-change projection resources. The compiled
+    // Newton context here is separate from the one owned by the solver
+    // loop (which lives inside `SolverLoopContext` below) — we need our
+    // own copy so `SimStepper::step()` can reuse a JITed kernel across
+    // every input change. Without this, projection would re-JIT the
+    // whole residual/Jacobian pair every time `set_input` flips the
+    // dirty flag, which is a serious perf hit under 60 Hz UI sliders.
+    let mut projection_runtime_ctx =
+        problem::build_compiled_runtime_newton_context(&dae, n_total)?;
+    projection_runtime_ctx.set_input_overrides(input_overrides.clone());
+    let projection_masks = problem::build_runtime_projection_masks(&dae, n_x, n_total);
+
     let mut solver_names = build_output_names(&dae);
     solver_names.truncate(n_total);
 
@@ -1693,6 +1705,8 @@ pub(crate) fn build_stepper(
         solver_names,
         max_wall_seconds_per_step: opts.max_wall_seconds_per_step,
         atol: opts.atol,
+        projection_runtime_ctx,
+        projection_masks,
         elim,
         inputs_dirty: false,
     })

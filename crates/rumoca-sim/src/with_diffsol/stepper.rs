@@ -13,6 +13,9 @@ use rumoca_ir_dae as dae;
 use rumoca_phase_solve::eliminate::EliminationResult;
 
 use super::{Dae, SimError};
+use super::problem::{
+    CompiledRuntimeNewtonContext, RuntimeProjectionContext, RuntimeProjectionMasks,
+};
 use crate::TimeoutBudget;
 use crate::runtime::layout::SimulationContext;
 
@@ -98,6 +101,20 @@ pub struct SimStepper {
     /// `atol` passed to the stepper at build time so the projection
     /// operates at the same precision as the integrator.
     pub(crate) atol: f64,
+    /// Pre-built compiled Newton context for the post-input-change
+    /// algebraic projection. Holding it here lets `step()` reuse the
+    /// JITed residual/Jacobian kernels across every input change
+    /// instead of re-compiling per change — a serious perf trap when
+    /// the caller drags a UI slider at display rate. `set_input_overrides`
+    /// was called on this context at build time with the shared
+    /// `input_overrides` RefCell, so it transparently sees the
+    /// current input values on every residual eval.
+    pub(crate) projection_runtime_ctx: CompiledRuntimeNewtonContext,
+    /// Precomputed structural masks for the projection (fixed columns,
+    /// ignored rows, branch-local analog cols). Pure structural data,
+    /// cheap to build but cached once for consistency with the
+    /// compiled context above.
+    pub(crate) projection_masks: RuntimeProjectionMasks,
     /// Substitutions from algebraic elimination — used to reconstruct
     /// eliminated variables (e.g. outputs) in `get()` and `state()`.
     pub(crate) elim: EliminationResult,
@@ -146,6 +163,7 @@ impl SimStepper {
 
     /// Step the simulation forward by `dt` seconds.
     pub fn step(&mut self, dt: f64) -> Result<(), SimError> {
+        let budget = TimeoutBudget::new(self.max_wall_seconds_per_step);
         if self.inputs_dirty {
             // Re-project algebraics onto the manifold implied by the new
             // input values BEFORE clearing BDF history. Without this, the
@@ -153,18 +171,31 @@ impl SimStepper {
             // previous inputs and have to chase the algebraic jump inside
             // its first substep — which is fragile and can stall after
             // repeated input changes. Mirrors the t=0 startup projection.
+            //
+            // Reuses the pre-built `projection_runtime_ctx` so the JIT
+            // happens once at stepper build, not on every input change.
             let y_before = self.inner.solver_state_y();
             let t_now = self.inner.time();
-            let budget = TimeoutBudget::new(self.max_wall_seconds_per_step);
-            if let Some(projected) = crate::with_diffsol::problem::project_algebraics_with_fixed_states_at_time(
-                &self.dae,
-                &y_before,
-                self.n_x,
-                t_now,
-                self.atol,
-                &budget,
-                Some(self.input_overrides.clone()),
-            )? {
+            let ctx = RuntimeProjectionContext {
+                p: &self.param_values,
+                compiled_runtime: Some(&self.projection_runtime_ctx),
+                fixed_cols: &self.projection_masks.fixed_cols,
+                ignored_rows: &self.projection_masks.ignored_rows,
+                branch_local_analog_cols: &self.projection_masks.branch_local_analog_cols,
+                direct_seed_ctx: None,
+                direct_seed_env_cache: None,
+            };
+            let projected =
+                crate::with_diffsol::problem::project_algebraics_with_fixed_states_at_time_with_context(
+                    &self.dae,
+                    &y_before,
+                    self.n_x,
+                    ctx,
+                    t_now,
+                    self.atol,
+                    &budget,
+                )?;
+            if let Some(projected) = projected {
                 if projected.len() == y_before.len()
                     && projected
                         .iter()
@@ -177,7 +208,6 @@ impl SimStepper {
             self.inner.reset_solver_history();
             self.inputs_dirty = false;
         }
-        let budget = TimeoutBudget::new(self.max_wall_seconds_per_step);
         self.inner.step(dt, &self.dae, &budget)
     }
 

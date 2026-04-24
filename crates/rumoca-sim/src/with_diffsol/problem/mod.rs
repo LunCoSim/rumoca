@@ -1511,6 +1511,7 @@ pub(crate) use init::{
     RuntimeProjectionStep, build_runtime_projection_masks, no_state_runtime_projection_required,
     project_algebraics_with_cached_runtime_jacobian_step_in_place,
     project_algebraics_with_fixed_states_at_time,
+    project_algebraics_with_fixed_states_at_time_with_context,
     project_algebraics_with_fixed_states_at_time_with_context_and_cache_in_place,
     solve_initial_algebraic_with_params,
 };
