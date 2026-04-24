@@ -64,6 +64,15 @@ pub(crate) trait StepperInner {
     fn step(&mut self, dt: f64, dae: &Dae, budget: &TimeoutBudget) -> Result<(), SimError>;
     fn time(&self) -> f64;
     fn solver_state_y(&self) -> Vec<f64>;
+    /// Read the solver's current `dy/dt` vector. For implicit DAE
+    /// solvers (BDF, ESDIRK) this is the solved derivative of the
+    /// state vector at the current time. Algebraic-row entries are
+    /// not meaningful (mass matrix has zero on those rows) but
+    /// state-row entries match `der(state)` exactly. Used by
+    /// `SimStepper::build_env` to populate `der(...)` env keys so
+    /// substitutions of the form `var = Der(state)` evaluate to the
+    /// integrator's actual derivative rather than to 0.
+    fn solver_state_dy(&self) -> Vec<f64>;
     /// Clear BDF history buffers and reset step size.
     /// Must be called when inputs change discontinuously so that
     /// the polynomial extrapolation does not diverge.
@@ -220,11 +229,23 @@ impl SimStepper {
     /// including reconstructed eliminated variables.
     fn build_env(&self) -> VarEnv<f64> {
         let y = self.inner.solver_state_y();
+        let dy = self.inner.solver_state_dy();
         let mut env = VarEnv::default();
         env.vars.insert("time".to_string(), self.inner.time());
         for (idx, name) in self.solver_names.iter().enumerate() {
             if let Some(&val) = y.get(idx) {
                 env.vars.insert(name.clone(), val);
+            }
+            // Surface state derivatives so substitutions of the form
+            // `var = Der(state)` (which the eliminator generates from
+            // ODE rows like `der(m) = port.m_flow`) evaluate to the
+            // integrator's actual dy/dt rather than to 0. Algebraic
+            // rows beyond `n_x` have meaningless dy entries (mass-matrix
+            // zeros), so we only expose the first `n_x`.
+            if idx < self.n_x
+                && let Some(&dv) = dy.get(idx)
+            {
+                env.vars.insert(format!("der({name})"), dv);
             }
         }
         for (name, &val) in self.input_overrides.borrow().iter() {

@@ -1585,6 +1585,10 @@ pub(crate) fn build_stepper(
             self.solver.state().y.as_slice().to_vec()
         }
 
+        fn solver_state_dy(&self) -> Vec<f64> {
+            self.solver.state().dy.as_slice().to_vec()
+        }
+
         fn reset_solver_history(&mut self) {
             let state = self.solver.state_mut();
             // Clear BDF polynomial history so stale extrapolation
