@@ -168,6 +168,60 @@ impl Session {
         }
     }
 
+    /// Load a source-root from already-loaded `(uri, source)` pairs.
+    ///
+    /// Web-target counterpart to [`Session::load_source_root_tolerant`]:
+    /// the disk walk + on-disk artifact cache are bypassed entirely. The
+    /// caller hands us the bytes (typically fetched from an HTTP server
+    /// and decompressed in memory) and we parse + insert in one pass.
+    ///
+    /// Each `(uri, source)` pair is parsed via `rumoca_phase_parse::parse_to_ast`.
+    /// Per-file parse failures land in the returned report's `diagnostics`
+    /// — same tolerant behaviour as `load_source_root_tolerant`. URIs that
+    /// already have a non-empty workspace document are deferred to the
+    /// detached cache, matching the disk-loader's policy.
+    ///
+    /// `source_root_label` shows up in the report's `source_root_path`
+    /// field for log/error messages — pass a stable identifier like
+    /// `"in-memory:msl"` rather than a real path.
+    ///
+    /// `cache_status` / `cache_key` / `cache_file` in the report are
+    /// always `None` — there's no on-disk artifact cache layer for this
+    /// path. Callers that need persistence can wrap this with their own
+    /// IndexedDB cache (or similar).
+    pub fn load_source_root_in_memory(
+        &mut self,
+        source_set_id: &str,
+        kind: SourceRootKind,
+        source_root_label: &str,
+        files: Vec<(String, String)>,
+        exclude_uri: Option<&str>,
+    ) -> SourceRootLoadReport {
+        let mut docs: Vec<(String, ast::StoredDefinition)> = Vec::with_capacity(files.len());
+        let mut diagnostics: Vec<String> = Vec::new();
+        for (uri, source) in files {
+            match rumoca_phase_parse::parse_to_ast(&source, &uri) {
+                Ok(definition) => docs.push((uri, definition)),
+                Err(err) => {
+                    diagnostics.push(format!("Failed to parse '{uri}': {err}"));
+                }
+            }
+        }
+        let parsed_file_count = docs.len();
+        let inserted_file_count =
+            self.replace_parsed_source_set(source_set_id, kind, docs, exclude_uri);
+        SourceRootLoadReport {
+            source_set_id: source_set_id.to_string(),
+            source_root_path: source_root_label.to_string(),
+            parsed_file_count,
+            inserted_file_count,
+            cache_status: None,
+            cache_key: None,
+            cache_file: None,
+            diagnostics,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn load_source_root_tolerant_with_cache_dir_for_tests(
         &mut self,
