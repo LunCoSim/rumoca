@@ -1222,8 +1222,7 @@ fn prepare_dae_core(
         "demote_states_without_assignable_derivative_rows(phase1k-final)",
         || {
             run_timeout_step(budget, || {
-                n_final_unassignable =
-                    demote_states_without_assignable_derivative_rows(&mut dae);
+                n_final_unassignable = demote_states_without_assignable_derivative_rows(&mut dae);
             })
         },
     )?;
