@@ -752,6 +752,22 @@ fn convert_type_class_specifier(
     let array_subscripts = extract_type_array_subscripts(&type_spec.type_class_specifier_opt);
     let modifications = extract_type_class_mods(&type_spec.type_class_specifier_opt0);
 
+    // Short-form classes (`connector RealInput = input Real
+    // annotation(Icon(...));`) carry their annotation in the trailing
+    // `description` clause's `annotation_clause`. Extract it onto
+    // `ClassDef.annotation` so downstream consumers (icon renderer,
+    // canvas projector) can read it the same way they read long-form
+    // class annotations. Without this every short-form connector lost
+    // its `Icon` — visible as RealInput/RealOutput rendering as
+    // empty boxes on signal port locations.
+    let annotation = type_spec
+        .description
+        .description_opt
+        .as_ref()
+        .and_then(|d| d.annotation_clause.class_modification.class_modification_opt.as_ref())
+        .map(|opt| opt.argument_list.args.clone())
+        .unwrap_or_default();
+
     let extend = rumoca_ir_ast::Extend {
         base_name: base_type_name,
         base_def_id: None,
@@ -790,7 +806,7 @@ fn convert_type_class_specifier(
         initial_algorithm_keyword: None,
         end_name_token: None,
         enum_literals: vec![],
-        annotation: vec![],
+        annotation,
         is_protected: false,
         is_final: false,
         is_replaceable: false,
