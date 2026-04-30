@@ -214,6 +214,22 @@ pub fn referenced_unloaded_source_root_paths(
     source_root_paths: &[String],
     loaded_source_root_path_keys: &HashSet<String>,
 ) -> Vec<String> {
+    // The `_source` argument used to drive an "is this root mentioned
+    // in the user's file?" check that skipped roots whose top-level
+    // identifier didn't appear in source. That broke transitive
+    // dependencies: e.g. compiling a model that uses Modelica.Fluid
+    // pulls in `ModelicaServices.Machine.inf` indirectly via
+    // Modelica.Constants → Constants's `final constant Real inf =
+    // ModelicaServices.Machine.inf;`. The user's own source file
+    // never mentions "ModelicaServices", so the optimisation skipped
+    // the root and the constant resolved as ED008 unresolved.
+    //
+    // Trust the caller: every source-root path passed in is
+    // user-explicit (CLI flag or programmatic). Load all of them
+    // (modulo dedup against already-loaded). Auto-discovery paths
+    // that want to skip "obviously unused" roots can call
+    // `should_load_source_root_for_source` themselves before this.
+    let _ = source;
     let mut seen_source_root_paths = HashSet::new();
     let mut referenced_paths = Vec::new();
     for source_root_path in source_root_paths {
@@ -224,11 +240,7 @@ pub fn referenced_unloaded_source_root_paths(
         if loaded_source_root_path_keys.contains(&path_key) {
             continue;
         }
-        let should_load =
-            should_load_source_root_for_source(source, Path::new(source_root_path)).unwrap_or(true);
-        if should_load {
-            referenced_paths.push(source_root_path.clone());
-        }
+        referenced_paths.push(source_root_path.clone());
     }
     referenced_paths
 }

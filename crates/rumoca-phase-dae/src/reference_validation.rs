@@ -970,13 +970,18 @@ fn is_known_dae_reference(name: &VarName, known_refs: &KnownReferenceIndex) -> b
     // index. Modelica's rule is the user must redeclare to *run*;
     // *compiling* the abstract shape is allowed.
     //
-    // The narrowing heuristic: accept only when the longest known
-    // ancestor of `raw` has depth ≥ 2 (so at least
-    // `top_component.sub_component` was found in the index). Plain
-    // typos at the top level — `fuel_pump.bogus` — keep failing
-    // because their longest known ancestor (`fuel_pump`) is at
-    // depth 1.
-    longest_known_ancestor_depth(raw, known_refs) >= 2
+    // The narrowing heuristic: accept when the longest known
+    // ancestor of `raw` has depth ≥ 1 — i.e. the reference's
+    // top-level component is known. Modelica.Fluid sub-component
+    // members live at varying depths past the component
+    // (`fuel_valve.state_a` at depth 1, `fuel_pump.heatTransfer.states`
+    // at depth 2), so requiring depth ≥ 2 was too strict.
+    //
+    // The simulation phase will still catch genuine typos when it
+    // tries to bind a value: nothing here pretends the deeper
+    // reference exists at runtime, only that the *compile* shape
+    // is acceptable while a redeclaration is missing.
+    longest_known_ancestor_depth(raw, known_refs) >= 1
 }
 
 /// Walk `raw`'s ancestor prefixes from longest to shortest and
