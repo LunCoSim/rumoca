@@ -112,6 +112,13 @@ pub(super) fn collect_resolve_failures_for_files(
     }
     diagnostics
         .iter()
+        // Strict-compile failures are *errors* only — warnings stay
+        // visible elsewhere but don't fail the compile. Otherwise an
+        // ER002 "unresolved function call" warning (e.g. on a
+        // tolerated `Medium.X(...)` lookup) gets promoted to a
+        // compile-blocking failure even though the resolver itself
+        // emitted it as advisory.
+        .filter(|diag| diag.is_error())
         .filter(|diag| {
             diag.labels.iter().any(|label| {
                 source_map
