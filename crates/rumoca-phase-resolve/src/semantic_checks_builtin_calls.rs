@@ -154,8 +154,22 @@ impl BuiltinCallVisitor<'_> {
 
             let cref_text = cref.to_string();
             let token = target.token.clone();
-            let is_array =
+            // The component is an array if its declared shape isn't empty
+            // — but the *reference* is to a single element when the last
+            // path part has subscripts (e.g. `ports[i]`). MLS §3.7.4.2
+            // forbids `cardinality()` on the whole connector array but
+            // permits it on a specific indexed element. Modelica.Fluid
+            // relies on this — `for i in 1:nPorts ... cardinality(ports[i])`
+            // is its standard pattern for detecting unconnected vector
+            // ports.
+            let component_is_array =
                 !target.component.shape.is_empty() || !target.component.shape_expr.is_empty();
+            let last_part_indexed = cref
+                .parts
+                .last()
+                .and_then(|p| p.subs.as_ref())
+                .is_some_and(|subs| !subs.is_empty());
+            let is_array = component_is_array && !last_part_indexed;
             let is_expandable = target.type_class.is_some_and(|type_class| {
                 type_class.class_type == ClassType::Connector && type_class.expandable
             });
