@@ -950,12 +950,62 @@ fn is_known_dae_reference(name: &VarName, known_refs: &KnownReferenceIndex) -> b
         return true;
     }
 
-    path_utils::subscript_fallback_chain(&dae_to_flat_var_name(name))
+    if path_utils::subscript_fallback_chain(&dae_to_flat_var_name(name))
         .into_iter()
         .any(|candidate| {
             known_refs.flat_queries.contains(candidate.as_str())
                 || known_refs.dae_queries.contains(candidate.as_str())
         })
+    {
+        return true;
+    }
+
+    // Compile-tolerance for references that walk *into* an
+    // unexpanded sub-component — typically a `replaceable` model
+    // declared with a `partial` default (Modelica.Fluid /
+    // Modelica.Media pattern). The instantiator can't expand the
+    // sub-component's members until the user redeclares to a
+    // concrete type, so deep references like
+    // `fuel_pump.heatTransfer.states` aren't in the flat-vars
+    // index. Modelica's rule is the user must redeclare to *run*;
+    // *compiling* the abstract shape is allowed.
+    //
+    // The narrowing heuristic: accept only when the longest known
+    // ancestor of `raw` has depth ≥ 2 (so at least
+    // `top_component.sub_component` was found in the index). Plain
+    // typos at the top level — `fuel_pump.bogus` — keep failing
+    // because their longest known ancestor (`fuel_pump`) is at
+    // depth 1.
+    longest_known_ancestor_depth(raw, known_refs) >= 2
+}
+
+/// Walk `raw`'s ancestor prefixes from longest to shortest and
+/// return the depth (segment count) of the longest one that's in
+/// the known index. Returns 0 when no ancestor matches.
+fn longest_known_ancestor_depth(raw: &str, known_refs: &KnownReferenceIndex) -> usize {
+    let parts = path_utils::split_path_with_indices(raw);
+    if parts.len() <= 1 {
+        return 0;
+    }
+    // Walk longest → shortest so we find the deepest known prefix.
+    for take in (1..parts.len()).rev() {
+        let mut prefix = String::new();
+        for part in parts.iter().take(take) {
+            if !prefix.is_empty() {
+                prefix.push('.');
+            }
+            prefix.push_str(part);
+        }
+        let normalized = path_utils::strip_all_subscripts(&prefix);
+        if known_refs.flat_queries.contains(prefix.as_str())
+            || known_refs.dae_queries.contains(prefix.as_str())
+            || known_refs.flat_queries.contains(normalized.as_str())
+            || known_refs.dae_queries.contains(normalized.as_str())
+        {
+            return take;
+        }
+    }
+    0
 }
 
 #[cfg(test)]
