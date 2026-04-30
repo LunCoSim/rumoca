@@ -1,4 +1,5 @@
 use super::{ClassDef, DefId, SourceId, SourceMap, StoredDefinition};
+use rumoca_ir_ast::ClassType;
 use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 thread_local! {
@@ -9,7 +10,21 @@ thread_local! {
 struct SemanticLookupIndex {
     def_ptr: *const StoredDefinition,
     qualified_names: HashMap<String, Arc<[String]>>,
-    nested_short_names: HashMap<String, Arc<[String]>>,
+    /// Multi-candidate index: simple class name → every qualified
+    /// path that matches, paired with its `ClassType`. The previous
+    /// implementation kept only the first insertion via
+    /// `or_insert_with`, which made the global lookup non-
+    /// deterministic when multiple classes share a simple name
+    /// (e.g. `Modelica.Units.SI.Temperature` (Type) vs
+    /// `Modelica.Fluid.Sensors.Temperature` (Model)). Resolving a
+    /// record-component type then sometimes returned the Model and
+    /// produced a spurious ER023 "record component has type X which
+    /// is a model" error. Storing every candidate lets
+    /// [`find_class_by_name`] pick the most-likely intended class
+    /// (Type/Record/Connector first, then Model/Block/Function/
+    /// Package) — a pragmatic stand-in for full MLS §5.3
+    /// scope-aware lookup until that lands.
+    nested_short_names: HashMap<String, Vec<(Arc<[String]>, ClassType)>>,
     by_def_id: HashMap<DefId, Arc<[String]>>,
 }
 
@@ -37,7 +52,8 @@ impl SemanticLookupIndex {
         if path.len() > 1 {
             self.nested_short_names
                 .entry(class.name.text.to_string())
-                .or_insert_with(|| qualified_path.clone());
+                .or_default()
+                .push((qualified_path.clone(), class.class_type.clone()));
         }
         if let Some(def_id) = class.def_id {
             self.by_def_id.insert(def_id, qualified_path.clone());
@@ -47,6 +63,36 @@ impl SemanticLookupIndex {
             nested_path.push(name.clone());
             self.index_qualified_class(nested, &nested_path);
         }
+    }
+
+    /// Pick the best candidate for a simple-name lookup.
+    ///
+    /// When several classes share a simple name, prefer Type > Record
+    /// > Connector > Package > Block > Model > Function > Operator.
+    /// Component types in records and connectors are virtually always
+    /// Type aliases or other Records — preferring those resolves the
+    /// SI.Temperature vs Fluid.Sensors.Temperature collision (and
+    /// every analogous one across the MSL) without a full §5.3 walk.
+    fn pick_best_candidate(
+        candidates: &[(Arc<[String]>, ClassType)],
+    ) -> Option<Arc<[String]>> {
+        let preference = |kind: &ClassType| -> u8 {
+            match kind {
+                ClassType::Type => 0,
+                ClassType::Record => 1,
+                ClassType::Connector => 2,
+                ClassType::Package => 3,
+                ClassType::Block => 4,
+                ClassType::Model => 5,
+                ClassType::Function => 6,
+                ClassType::Operator => 7,
+                ClassType::Class => 8,
+            }
+        };
+        candidates
+            .iter()
+            .min_by_key(|(path, kind)| (preference(kind), path.len(), path.join(".")))
+            .map(|(p, _)| p.clone())
     }
 }
 
@@ -113,7 +159,10 @@ pub(super) fn find_class_by_name<'a>(
     }
 
     match with_active_lookup(def, |lookup| {
-        lookup.nested_short_names.get(type_name).cloned()
+        lookup
+            .nested_short_names
+            .get(type_name)
+            .and_then(|cands| SemanticLookupIndex::pick_best_candidate(cands))
     }) {
         Some(Some(class)) => return find_class_by_path(def, &class),
         Some(None) => return None,
