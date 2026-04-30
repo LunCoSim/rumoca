@@ -1287,6 +1287,20 @@ fn validate_partial_component_instantiation(
         return Ok(());
     }
 
+    // A `replaceable partial <kind>` is a placeholder that the model
+    // expects to have redeclared before simulation. The MLS doesn't
+    // forbid compiling without the redeclaration — only simulating.
+    // For component types reached through a `replaceable package`
+    // (the typical Modelica.Fluid / Modelica.Media pattern, e.g.
+    // `Medium.BaseProperties medium` where `Medium` defaults to
+    // `PartialMedium`), this lets the compile pass produce a DAE
+    // that's structurally complete; the user later redeclares
+    // Medium for an executable simulation. Without this relaxation
+    // every Modelica.Fluid model is uncompilable.
+    if class_def.is_some_and(|class| class.is_replaceable) {
+        return Ok(());
+    }
+
     let span = location_to_span(&comp.location, &tree.source_map);
     Err(Box::new(InstantiateError::partial_class_instantiation(
         qualified_name.to_flat_string(),
