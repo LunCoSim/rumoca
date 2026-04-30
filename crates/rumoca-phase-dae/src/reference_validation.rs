@@ -984,6 +984,21 @@ fn is_known_dae_reference(name: &VarName, known_refs: &KnownReferenceIndex) -> b
         return true;
     }
 
+    // Modelica.Media.Interfaces.Partial* paths reference *abstract*
+    // API members of partial medium classes. The concrete value
+    // comes from a `redeclare package Medium = ConcreteMedium`
+    // the user supplies; PartialSimpleIdealGasMedium.R_gas etc. are
+    // structural placeholders that the flat IR doesn't materialise
+    // until the partial is redeclared. Accept them at compile-shape
+    // — simulation will resolve through the actual binding (or
+    // fail there with a clearer error) at run time.
+    if raw.starts_with("Modelica.Media.Interfaces.Partial")
+        || raw.starts_with("Modelica.Media.Interfaces.PartialMedium")
+        || raw.starts_with("Modelica.Fluid.Interfaces.Partial")
+    {
+        return true;
+    }
+
     // Compile-tolerance for references that walk *into* an
     // unexpanded sub-component — typically a `replaceable` model
     // declared with a `partial` default (Modelica.Fluid /
