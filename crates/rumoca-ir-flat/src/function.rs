@@ -12,6 +12,8 @@ impl Function {
             pure: true, // Default to pure
             external: None,
             derivatives: Vec::new(),
+            is_partial: false,
+            is_replaceable: false,
             span,
         }
     }

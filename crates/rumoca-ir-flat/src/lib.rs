@@ -1390,6 +1390,19 @@ pub struct Function {
     /// Derivative annotations (MLS §12.7.1).
     /// A function may have multiple derivative annotations for different orders.
     pub derivatives: Vec<DerivativeAnnotation>,
+    /// True if the AST-level class was declared `partial`. MLS §4.7
+    /// allows partial functions to lack a body — they are placeholders
+    /// for redeclaration. The DAE phase tolerates an empty body when
+    /// this flag is set; the simulation phase still rejects the
+    /// uninstantiated call (the user must redeclare to run).
+    #[serde(default)]
+    pub is_partial: bool,
+    /// True if the AST-level class was declared `replaceable`. Partial
+    /// classes that are *not* replaceable are still real bugs (an
+    /// abstract function nobody can fill in); a `replaceable partial`
+    /// is the explicit "fill this in via redeclare" signal.
+    #[serde(default)]
+    pub is_replaceable: bool,
     /// Source span for error reporting.
     pub span: Span,
 }

@@ -622,6 +622,15 @@ fn convert_function(
         class_def.location.end as usize,
     );
     let mut func = flat::Function::new(qualified_name, span);
+    // Propagate `partial` / `replaceable` from the AST. The DAE phase
+    // tolerates a `replaceable partial function` with no body — it's
+    // a placeholder for redeclaration; the simulation phase still
+    // rejects calling it without a redeclare. Without these flags
+    // every Modelica.Media `replaceable partial function` triggered
+    // ED006 ("function has no algorithm body") at the DAE-phase
+    // boundary, blocking compile of every Modelica.Fluid model.
+    func.is_partial = class_def.partial;
+    func.is_replaceable = class_def.is_replaceable;
     let context = collect_function_context(tree, class_def);
     let effective_components = context.components;
     let mut import_map = qualify::ImportMap::default();

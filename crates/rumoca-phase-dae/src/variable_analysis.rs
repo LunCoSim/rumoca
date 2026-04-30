@@ -747,7 +747,20 @@ fn validate_function_call_name(name: &VarName, flat: &Model, span: Span) -> Resu
             .rsplit('.')
             .next()
             .unwrap_or(func.name.as_str());
-        if !is_runtime_intrinsic_function_short_name(short_name) {
+        // `replaceable function …` (with or without an explicit
+        // `partial` keyword) is the Modelica signal for "this body
+        // is supplied by a redeclare at use site". Includes:
+        //   * `replaceable partial function` (explicit, e.g. all of
+        //     Modelica.Media's medium API)
+        //   * `replaceable function f = X` short-form aliases that
+        //     resolve to a partial base (e.g.
+        //     `Modelica.Fluid.Machines.BaseClasses.PartialPump.flowCharacteristic`
+        //     defaulting to `PumpCharacteristics.baseFlow`)
+        // Compile leaves the body empty for both shapes; the
+        // simulation phase rejects calling without a redeclare.
+        // Without this exemption every Modelica.Fluid model is
+        // uncompilable.
+        if !func.is_replaceable && !is_runtime_intrinsic_function_short_name(short_name) {
             return Err(ToDaeError::function_without_body(func.name.as_str(), span));
         }
     }
