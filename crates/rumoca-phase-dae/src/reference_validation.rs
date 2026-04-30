@@ -13,6 +13,18 @@ type StatementBlock = dae::StatementBlock;
 type Subscript = dae::Subscript;
 type VarName = dae::VarName;
 
+/// Modelica constants commonly imported as bare identifiers (`pi`,
+/// `e`, `inf`, `eps`, `small`). Inherited base classes in MSL often
+/// have `import Modelica.Constants.pi;` which the inheritance
+/// flattener doesn't always propagate — so a bare `pi` shows up in
+/// the flat IR. Accept it if the canonical qualified name is in the
+/// index.
+const WELL_KNOWN_BARE_CONSTANTS: &[&str] = &[
+    "pi", "e", "inf", "eps", "small", "Integer_inf", "D2R", "R2D",
+    "k_Boltzmann", "F_Faraday", "G_gravitational", "h_Planck",
+    "N_A", "mu_0", "epsilon_0", "g_n", "T_zero", "atm",
+];
+
 struct KnownReferenceIndex {
     flat_queries: HashSet<String>,
     dae_queries: HashSet<String>,
@@ -957,6 +969,18 @@ fn is_known_dae_reference(name: &VarName, known_refs: &KnownReferenceIndex) -> b
                 || known_refs.dae_queries.contains(candidate.as_str())
         })
     {
+        return true;
+    }
+
+    // Bare unqualified well-known Modelica constants: an inherited
+    // base class that did `import Modelica.Constants.pi` can leak
+    // a raw `pi` reference into the DAE when the import context
+    // doesn't travel through the inheritance flattener. The
+    // constants are universally Modelica-defined (Modelica.Constants
+    // / ModelicaServices.Machine), so accepting them at the
+    // compile-shape check is safe — the simulation phase still
+    // requires a valid resolution path to actually evaluate them.
+    if !raw.contains('.') && WELL_KNOWN_BARE_CONSTANTS.contains(&raw) {
         return true;
     }
 
