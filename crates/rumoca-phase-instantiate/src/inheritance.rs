@@ -1208,7 +1208,55 @@ fn classes_are_compatible(existing: &ast::ClassDef, incoming: &ast::ClassDef) ->
         return true;
     }
 
-    existing.to_modelica("") == incoming.to_modelica("")
+    if existing.to_modelica("") == incoming.to_modelica("") {
+        return true;
+    }
+
+    // Diamond-inherited `replaceable package`s: both bases declare e.g.
+    // `replaceable package Medium = Modelica.Media.Interfaces.PartialMedium
+    // constrainedby PartialMedium`. The default-type reference and the
+    // constraining-clause type are what matter for §7.3.2 conformance —
+    // surrounding annotations / whitespace / token positions can differ
+    // legitimately. Modelica.Fluid stacks its inheritance so two extends
+    // chains both reach a `replaceable package Medium` from
+    // PartialTwoPort and PartialStaggeredFlowModel respectively; strict
+    // text comparison rejected this even though they declare the same
+    // package alias. Treat them compatible when:
+    //
+    //   * both declarations are `replaceable`, AND
+    //   * the same `class_type`, AND
+    //   * they each `extends` a single base of the same name (the
+    //     default-type binding for a short-form package alias surfaces
+    //     here as a single `extends` clause on the synthesized package),
+    //     AND
+    //   * the `constrainedby` clauses agree (both absent, or naming the
+    //     same type).
+    //
+    // This is narrower than full §7.3.2 sub-type checking but covers the
+    // diamond-replaceable-default case that every Modelica.Fluid model
+    // hits without relaxing the rule for non-replaceable nested classes.
+    if existing.is_replaceable
+        && incoming.is_replaceable
+        && existing.class_type == incoming.class_type
+    {
+        let same_constraint = match (&existing.constrainedby, &incoming.constrainedby) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.to_string() == b.to_string(),
+            _ => false,
+        };
+        let same_default_alias = match (existing.extends.as_slice(), incoming.extends.as_slice()) {
+            ([a], [b]) => a.base_name.to_string() == b.base_name.to_string(),
+            // No-extends or multi-extends → fall back to strict text
+            // comparison (already done above), so reaching here means
+            // they differ; treat as incompatible.
+            _ => false,
+        };
+        if same_constraint && same_default_alias {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Merge inherited content from a base class.
