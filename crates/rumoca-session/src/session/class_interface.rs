@@ -52,6 +52,10 @@ pub(crate) struct ComponentInterface {
     is_replaceable: bool,
     constrainedby: Option<String>,
     shape: Vec<usize>,
+    /// Stringified default-value binding (`= <expr>` from the source,
+    /// e.g. `"100"`, `"10*kg"`). `None` when the declaration has no
+    /// binding. Available via [`Self::binding`].
+    binding: Option<String>,
 }
 
 impl ComponentInterface {
@@ -65,6 +69,10 @@ impl ComponentInterface {
 
     pub(crate) fn causality(&self) -> &ast::Causality {
         &self.causality
+    }
+
+    pub(crate) fn binding(&self) -> Option<&str> {
+        self.binding.as_deref()
     }
 
     #[cfg(test)]
@@ -312,6 +320,7 @@ impl ClassInterface {
                             is_replaceable: component.is_replaceable,
                             constrainedby: component.constrainedby.clone(),
                             shape: component.shape.clone(),
+                            binding: component.binding.clone(),
                         },
                     )
                 })

@@ -914,6 +914,10 @@ pub struct ClassMemberInfo {
     pub type_name: String,
     pub variability: ClassMemberVariability,
     pub causality: ClassMemberCausality,
+    /// Stringified default-value expression from the declaration's
+    /// `= ...` binding (e.g. `"100"`, `"10*kg"`). `None` when the
+    /// member has no binding (a free variable).
+    pub default_value: Option<String>,
 }
 
 /// Coarse variability bucket — drops the AST `Token` payload so the

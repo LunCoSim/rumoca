@@ -1270,6 +1270,7 @@ impl Session {
                         type_name: ci.type_name().to_string(),
                         variability: class_member_variability_from_ast(ci.variability()),
                         causality: class_member_causality_from_ast(ci.causality()),
+                        default_value: ci.binding().map(str::to_string),
                     },
                 )
             })

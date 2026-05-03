@@ -160,6 +160,13 @@ pub(crate) struct ComponentSummary {
     pub(crate) shape: Vec<usize>,
     pub(crate) shape_expr: Vec<ast::Subscript>,
     pub(crate) condition: Option<String>,
+    /// Stringified `= <expr>` binding from the declaration (e.g.
+    /// `Real R = 100`'s binding becomes `Some("100")`). Empty when
+    /// the declaration has no binding. Stored as text so the
+    /// summary stays cheap to serialise — consumers that need the
+    /// typed Expression should fall back to the full AST.
+    #[serde(default)]
+    pub(crate) binding: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -297,6 +304,11 @@ impl ComponentSummary {
             shape: component.shape.clone(),
             shape_expr: component.shape_expr.clone(),
             condition: component.condition.as_ref().map(ToString::to_string),
+            binding: component
+                .binding
+                .as_ref()
+                .filter(|_| component.has_explicit_binding)
+                .map(ToString::to_string),
         }
     }
 }
