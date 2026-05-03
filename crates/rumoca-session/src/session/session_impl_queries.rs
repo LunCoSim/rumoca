@@ -1194,6 +1194,109 @@ impl Session {
             .map(ModelKey::new)
     }
 
+    /// Inheritance-merged member info with variability + causality.
+    ///
+    /// Walks the same `extends` chain as
+    /// [`Self::class_component_members_query`] and emits typed entries
+    /// instead of `(name, type)` tuples — useful for downstream
+    /// consumers that need to distinguish parameters from continuous
+    /// variables, or inputs from outputs, without doing their own
+    /// per-class AST walk.
+    ///
+    /// Returns an empty vector when the class cannot be uniquely
+    /// resolved (same fallback contract as
+    /// [`Self::class_component_members_query`]).
+    pub fn class_component_members_typed_query(
+        &mut self,
+        class_name: &str,
+    ) -> Vec<ClassMemberInfo> {
+        let Some(target) = self.lookup_query_class_target(class_name) else {
+            return Vec::new();
+        };
+        let mut members: IndexMap<String, ClassMemberInfo> = IndexMap::new();
+        let mut visiting: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut signature = SummarySignature::new();
+        self.collect_query_class_typed_members(
+            &target.uri,
+            &target.qualified_name,
+            &mut members,
+            &mut visiting,
+            &mut signature,
+        );
+        // Note: typed results aren't separately cached today — the
+        // underlying `class_interface_query` is already cached, so
+        // the per-call cost is just the visitor walk + cheap field
+        // copies. If profiling shows pressure, mirror the
+        // `cached_query_class_component_members` LRU here.
+        members.into_iter().map(|(_, v)| v).collect()
+    }
+
+    fn collect_query_class_typed_members(
+        &mut self,
+        uri: &str,
+        qualified_name: &str,
+        members: &mut IndexMap<String, ClassMemberInfo>,
+        visiting: &mut std::collections::HashSet<String>,
+        signature: &mut SummarySignature,
+    ) {
+        if !visiting.insert(qualified_name.to_string()) {
+            return;
+        }
+        self.record_query_dependency_signature(uri, signature);
+
+        let Some(class_interface) = self.class_interface_query(uri, qualified_name) else {
+            visiting.remove(qualified_name);
+            return;
+        };
+        let imports = class_interface.import_map().clone();
+        let extends_pairs: Vec<(String, Vec<String>)> = class_interface
+            .extends()
+            .iter()
+            .map(|e| {
+                (
+                    e.base_name().to_string(),
+                    e.break_names().iter().cloned().collect(),
+                )
+            })
+            .collect();
+        let local_pairs: Vec<(String, ClassMemberInfo)> = class_interface
+            .component_interfaces()
+            .map(|(name, ci)| {
+                (
+                    name.clone(),
+                    ClassMemberInfo {
+                        name: name.clone(),
+                        type_name: ci.type_name().to_string(),
+                        variability: class_member_variability_from_ast(ci.variability()),
+                        causality: class_member_causality_from_ast(ci.causality()),
+                    },
+                )
+            })
+            .collect();
+
+        for (base_name, breaks) in extends_pairs {
+            if let Some(base_target) = self.lookup_query_extends_target(&base_name, &imports) {
+                self.collect_query_class_typed_members(
+                    &base_target.uri,
+                    &base_target.qualified_name,
+                    members,
+                    visiting,
+                    signature,
+                );
+                for break_name in breaks {
+                    members.shift_remove(&break_name);
+                }
+            }
+        }
+
+        for (name, info) in local_pairs {
+            members.insert(name, info);
+        }
+
+        visiting.remove(qualified_name);
+    }
+
     /// Collect component members from the parsed query layer.
     ///
     /// This follows local components and `extends` edges, applying `break`

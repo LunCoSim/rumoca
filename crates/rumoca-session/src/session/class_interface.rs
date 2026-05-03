@@ -59,6 +59,14 @@ impl ComponentInterface {
         &self.type_name
     }
 
+    pub(crate) fn variability(&self) -> &ast::Variability {
+        &self.variability
+    }
+
+    pub(crate) fn causality(&self) -> &ast::Causality {
+        &self.causality
+    }
+
     #[cfg(test)]
     pub(crate) fn is_replaceable(&self) -> bool {
         self.is_replaceable

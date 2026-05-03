@@ -135,8 +135,9 @@ pub mod compile {
         SessionCacheStatsSnapshot, reset_session_cache_stats, session_cache_stats,
     };
     pub use crate::session::{
-        ClassLocalCompletionItem, ClassLocalCompletionKind, CompilationMode, CompilationResult,
-        CompilationSummary, CompilePhaseTimingSnapshot, CompilePhaseTimingStat, CompiledSourceRoot,
+        ClassLocalCompletionItem, ClassLocalCompletionKind, ClassMemberCausality, ClassMemberInfo,
+        ClassMemberVariability, CompilationMode, CompilationResult, CompilationSummary,
+        CompilePhaseTimingSnapshot, CompilePhaseTimingStat, CompiledSourceRoot,
         DaeCompilationResult, Document, DocumentSymbol, DocumentSymbolKind, FailedPhase,
         LocalComponentInfo, ModelDiagnostics, ModelFailureDiagnostic, NavigationClassTargetInfo,
         ParsedSourceRootLoad, PhaseResult, SemanticDiagnosticsMode, Session, SessionChange,

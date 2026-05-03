@@ -903,6 +903,54 @@ pub struct LocalComponentInfo {
     pub declaration_location: ast::Location,
 }
 
+/// Inheritance-merged class member info returned by
+/// [`Session::class_component_members_typed_query`]. Same shape as
+/// [`Session::class_component_members_query`]'s `(name, type)` tuples
+/// but with variability + causality preserved so consumers don't have
+/// to re-walk the AST to distinguish parameters / inputs / outputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassMemberInfo {
+    pub name: String,
+    pub type_name: String,
+    pub variability: ClassMemberVariability,
+    pub causality: ClassMemberCausality,
+}
+
+/// Coarse variability bucket — drops the AST `Token` payload so the
+/// public API doesn't leak parser internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassMemberVariability {
+    Continuous,
+    Discrete,
+    Parameter,
+    Constant,
+}
+
+/// Coarse causality bucket. `None` covers the unannotated case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassMemberCausality {
+    None,
+    Input,
+    Output,
+}
+
+pub(crate) fn class_member_variability_from_ast(v: &ast::Variability) -> ClassMemberVariability {
+    match v {
+        ast::Variability::Empty => ClassMemberVariability::Continuous,
+        ast::Variability::Constant(_) => ClassMemberVariability::Constant,
+        ast::Variability::Discrete(_) => ClassMemberVariability::Discrete,
+        ast::Variability::Parameter(_) => ClassMemberVariability::Parameter,
+    }
+}
+
+pub(crate) fn class_member_causality_from_ast(c: &ast::Causality) -> ClassMemberCausality {
+    match c {
+        ast::Causality::Empty => ClassMemberCausality::None,
+        ast::Causality::Input(_) => ClassMemberCausality::Input,
+        ast::Causality::Output(_) => ClassMemberCausality::Output,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NavigationClassTargetInfo {
     pub target_uri: String,
