@@ -1194,6 +1194,109 @@ impl Session {
             .map(ModelKey::new)
     }
 
+    /// Inheritance chain of annotation lists for a class.
+    ///
+    /// Walks the same `extends` chain as
+    /// [`Self::class_component_members_query`], returns each visited
+    /// class's `annotation: Vec<Expression>` in **base → derived**
+    /// order. The deriving class's own annotation is the LAST entry.
+    /// Cycle-safe (visits each qualified name at most once).
+    ///
+    /// Useful for consumers that need to merge annotations across
+    /// the inheritance chain — e.g. typed Icon extraction where each
+    /// base layer contributes graphics that the derived class can
+    /// extend or override per-field. The caller controls the merge
+    /// policy (rumoca doesn't bake in Icon-specific semantics).
+    ///
+    /// Returns an empty vector when the class cannot be uniquely
+    /// resolved.
+    pub fn class_inherited_annotations_query(
+        &mut self,
+        class_name: &str,
+    ) -> Vec<Vec<ast::Expression>> {
+        let Some(target) = self.lookup_query_class_target(class_name) else {
+            return Vec::new();
+        };
+        let mut layers: Vec<Vec<ast::Expression>> = Vec::new();
+        let mut visiting: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        self.collect_query_class_inherited_annotations(
+            &target.uri,
+            &target.qualified_name,
+            &mut layers,
+            &mut visiting,
+        );
+        layers
+    }
+
+    fn collect_query_class_inherited_annotations(
+        &mut self,
+        uri: &str,
+        qualified_name: &str,
+        layers: &mut Vec<Vec<ast::Expression>>,
+        visiting: &mut std::collections::HashSet<String>,
+    ) {
+        if !visiting.insert(qualified_name.to_string()) {
+            return;
+        }
+        // First recurse into bases (so they land before this class
+        // in the layer list — base → derived order).
+        let extends_bases: Vec<String> = self
+            .class_interface_query(uri, qualified_name)
+            .map(|ci| {
+                ci.extends()
+                    .iter()
+                    .map(|e| e.base_name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let imports = self
+            .class_interface_query(uri, qualified_name)
+            .map(|ci| ci.import_map().clone())
+            .unwrap_or_default();
+        for base_name in extends_bases {
+            if let Some(base_target) = self.lookup_query_extends_target(&base_name, &imports) {
+                self.collect_query_class_inherited_annotations(
+                    &base_target.uri,
+                    &base_target.qualified_name,
+                    layers,
+                    visiting,
+                );
+            }
+        }
+        // Now this class's own annotation, fetched from the parsed
+        // file directly (annotations aren't in the ClassInterface).
+        if let Some(class_def) = self.find_class_def_in_file(uri, qualified_name) {
+            if !class_def.annotation.is_empty() {
+                layers.push(class_def.annotation.clone());
+            } else {
+                // Push an empty layer so the caller can still see the
+                // chain length — useful for "did this class get an
+                // override?" checks.
+                layers.push(Vec::new());
+            }
+        }
+        visiting.remove(qualified_name);
+    }
+
+    /// Resolve `qualified_name` to a `ClassDef` inside the parsed
+    /// `uri`. Walks the dotted path through nested classes.
+    fn find_class_def_in_file(
+        &mut self,
+        uri: &str,
+        qualified_name: &str,
+    ) -> Option<ast::ClassDef> {
+        let parsed = self.parsed_file_query(uri)?;
+        let mut parts = qualified_name.split('.');
+        let first = parts.next()?;
+        let mut current = parsed.classes.get(first)?.clone();
+        for part in parts {
+            let nested = current.classes.get(part)?.clone();
+            current = nested;
+        }
+        Some(current)
+    }
+
     /// Inheritance-merged member info with variability + causality.
     ///
     /// Walks the same `extends` chain as
