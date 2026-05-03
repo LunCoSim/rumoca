@@ -1038,6 +1038,54 @@ impl Debug for ComponentReference {
     }
 }
 
+impl Component {
+    /// Byte range covering the `= <expr>` portion of this component's
+    /// declaration in `source` — including the `=` token, any
+    /// surrounding whitespace, and the binding expression itself.
+    /// Returns `None` when the component has no binding or when the
+    /// declared binding location can't be located in `source`.
+    ///
+    /// Use case: an external rewriter that wants to strip default
+    /// values from `input` declarations (a common workaround for
+    /// runtime-tunability) without re-running a regex over source.
+    pub fn binding_range_with_equals(
+        &self,
+        source: &str,
+    ) -> Option<(usize, usize)> {
+        if !self.has_explicit_binding {
+            return None;
+        }
+        let binding = self.binding.as_ref()?;
+        let binding_loc = binding.get_location()?;
+        let binding_start = binding_loc.start as usize;
+        let binding_end = binding_loc.end as usize;
+        if binding_end > source.len() {
+            return None;
+        }
+        // Walk backward from binding.start through whitespace to find
+        // the `=` token. The grammar guarantees `=` is the only
+        // non-whitespace byte between the modifier list (or name) and
+        // the binding expression in declaration form.
+        let bytes = source.as_bytes();
+        let mut i = binding_start;
+        while i > 0 && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
+            i -= 1;
+        }
+        if i == 0 || bytes[i - 1] != b'=' {
+            return None;
+        }
+        let eq_pos = i - 1;
+        // Also absorb whitespace immediately preceding the `=` so the
+        // splice doesn't leave a dangling space after the rest of
+        // the declaration.
+        let mut start = eq_pos;
+        while start > 0 && (bytes[start - 1] == b' ' || bytes[start - 1] == b'\t') {
+            start -= 1;
+        }
+        Some((start, binding_end))
+    }
+}
+
 impl ComponentReference {
     /// Get the source location of the first token in this component reference.
     pub fn get_location(&self) -> Option<&Location> {
