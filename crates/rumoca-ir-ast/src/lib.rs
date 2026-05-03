@@ -724,6 +724,37 @@ pub struct ClassDef {
 }
 
 impl ClassDef {
+    /// Byte range covering the full class declaration (`<keyword>
+    /// Name … end Name;`) plus any preceding lines that consist
+    /// entirely of `// …` line comments or `/* … */` block comments.
+    /// Blank lines between leading comments and the header are
+    /// preserved (treated as part of the comment block).
+    ///
+    /// Returns `None` when the AST `location` doesn't refer into
+    /// `source` (caller passed the wrong source string).
+    ///
+    /// Use case: extracting a class for duplication into a new file
+    /// while preserving header comments so the duplicated artifact
+    /// keeps its description / authoring metadata.
+    pub fn full_span_with_leading_comments(
+        &self,
+        source: &str,
+    ) -> Option<(usize, usize)> {
+        let raw_start = self.location.start as usize;
+        let raw_end = self.location.end as usize;
+        if raw_start > raw_end || raw_end > source.len() {
+            return None;
+        }
+        let start = rewind_through_leading_comments(source, raw_start);
+        // Advance the end past the trailing `;` of `end Name;` — the
+        // AST location ends after the closing `end Name` token but
+        // before the semicolon, while callers extracting a class for
+        // duplication need the complete `end Name;` including the
+        // statement terminator.
+        let end = advance_past_trailing_semicolon(source, raw_end);
+        Some((start, end))
+    }
+
     /// Iterate over all component declarations with their names.
     ///
     /// This provides a convenient way to iterate over components without
@@ -759,6 +790,72 @@ impl ClassDef {
             .flatten()
             .chain(self.initial_algorithms.iter().flatten())
     }
+}
+
+/// Skip whitespace and consume a single trailing `;` after `pos`.
+/// Used by [`ClassDef::full_span_with_leading_comments`] to include
+/// the `end Name;` semicolon that the AST `location` stops short of.
+fn advance_past_trailing_semicolon(source: &str, pos: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut i = pos;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b';' {
+        i += 1;
+    }
+    i
+}
+
+/// Walk backwards line-by-line from `header_start` (the byte offset
+/// of the first character of the class header line) and absorb
+/// preceding lines that are entirely whitespace, `// …` line
+/// comments, or `/* … */` block comments. Stops at any other
+/// content. Used by [`ClassDef::full_span_with_leading_comments`].
+fn rewind_through_leading_comments(source: &str, header_start: usize) -> usize {
+    let header_line_start = source[..header_start]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let mut line_starts: Vec<usize> = std::iter::once(0)
+        .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    line_starts.retain(|&o| o < header_line_start);
+
+    let mut keep = header_line_start;
+    let mut in_block_comment = false;
+    for &lstart in line_starts.iter().rev() {
+        let lend = source[lstart..]
+            .find('\n')
+            .map(|i| lstart + i)
+            .unwrap_or(source.len());
+        let line = &source[lstart..lend];
+        let trimmed = line.trim();
+        if in_block_comment {
+            if trimmed.starts_with("/*") {
+                in_block_comment = false;
+                keep = lstart;
+                continue;
+            }
+            keep = lstart;
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            keep = lstart;
+            continue;
+        }
+        if trimmed.ends_with("*/") {
+            if trimmed.starts_with("/*") {
+                keep = lstart;
+                continue;
+            }
+            in_block_comment = true;
+            keep = lstart;
+            continue;
+        }
+        break;
+    }
+    keep
 }
 
 /// MLS §7.1: Extends clause for inheritance.
