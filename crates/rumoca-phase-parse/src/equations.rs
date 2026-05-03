@@ -121,9 +121,14 @@ impl TryFrom<&modelica_grammar_trait::SomeEquation> for rumoca_ir_ast::Equation 
                 convert_simple_equation(&eq.simple_equation)
             }
             modelica_grammar_trait::SomeEquationOption::ConnectEquation(eq) => {
+                // Pull the annotation off the surrounding `SomeEquation`
+                // description — same path Component / ClassDef use.
+                // Empty Vec when the source had no `annotation(...)`.
+                let annotation = crate::elements::extract_annotation(&ast.description)?;
                 Ok(rumoca_ir_ast::Equation::Connect {
                     lhs: eq.connect_equation.component_reference.clone(),
                     rhs: eq.connect_equation.component_reference0.clone(),
+                    annotation,
                 })
             }
             modelica_grammar_trait::SomeEquationOption::ForEquation(eq) => {

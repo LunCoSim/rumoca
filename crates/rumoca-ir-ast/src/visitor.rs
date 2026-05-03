@@ -345,7 +345,7 @@ pub trait Visitor {
         match eq {
             Equation::Empty => Continue(()),
             Equation::Simple { lhs, rhs } => self.visit_simple_equation(lhs, rhs),
-            Equation::Connect { lhs, rhs } => self.visit_connect(lhs, rhs),
+            Equation::Connect { lhs, rhs, .. } => self.visit_connect(lhs, rhs),
             Equation::For { indices, equations } => self.visit_for_equation(indices, equations),
             Equation::When(blocks) => self.visit_when_equation(blocks),
             Equation::If {
@@ -1032,6 +1032,7 @@ mod tests {
             Equation::Connect {
                 lhs: make_comp_ref("a"),
                 rhs: make_comp_ref("b"),
+                annotation: Vec::new(),
             },
             Equation::Simple {
                 lhs: make_var("x"),
@@ -1040,6 +1041,7 @@ mod tests {
             Equation::Connect {
                 lhs: make_comp_ref("c"),
                 rhs: make_comp_ref("d"),
+                annotation: Vec::new(),
             },
         ];
 
@@ -1079,10 +1081,12 @@ mod tests {
                 Equation::Connect {
                     lhs: make_comp_ref("first"),
                     rhs: make_comp_ref("a"),
+                    annotation: Vec::new(),
                 },
                 Equation::Connect {
                     lhs: make_comp_ref("second"),
                     rhs: make_comp_ref("b"),
+                    annotation: Vec::new(),
                 },
             ],
         };

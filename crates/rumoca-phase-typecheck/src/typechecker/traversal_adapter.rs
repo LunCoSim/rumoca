@@ -47,7 +47,7 @@ pub(crate) fn walk_equation<C: TypeCheckTraversalCallbacks>(
 ) {
     match equation {
         Equation::Empty => {}
-        Equation::Connect { lhs, rhs } => {
+        Equation::Connect { lhs, rhs, .. } => {
             callbacks.on_component_reference(lhs, type_table);
             callbacks.on_component_reference(rhs, type_table);
         }

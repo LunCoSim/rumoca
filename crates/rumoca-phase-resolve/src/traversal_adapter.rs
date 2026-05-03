@@ -37,7 +37,7 @@ pub(crate) fn walk_equation<C: ResolveTraversalCallbacks>(
             walk_expression(callbacks, lhs, scope);
             walk_expression(callbacks, rhs, scope);
         }
-        Equation::Connect { lhs, rhs } => {
+        Equation::Connect { lhs, rhs, .. } => {
             callbacks.on_component_reference(lhs, scope);
             callbacks.on_component_reference(rhs, scope);
         }

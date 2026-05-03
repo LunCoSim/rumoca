@@ -140,7 +140,7 @@ fn walk_equation_default<V: Visitor + ?Sized>(
     match eq {
         Equation::Empty => std::ops::ControlFlow::Continue(()),
         Equation::Simple { lhs, rhs } => visitor.visit_simple_equation(lhs, rhs),
-        Equation::Connect { lhs, rhs } => visitor.visit_connect(lhs, rhs),
+        Equation::Connect { lhs, rhs, .. } => visitor.visit_connect(lhs, rhs),
         Equation::For { indices, equations } => visitor.visit_for_equation(indices, equations),
         Equation::When(blocks) => visitor.visit_when_equation(blocks),
         Equation::If {

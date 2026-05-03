@@ -1371,7 +1371,7 @@ pub(crate) fn collect_function_calls_from_equation(
                 }
             }
         }
-        ast::Equation::Connect { lhs, rhs } => {
+        ast::Equation::Connect { lhs, rhs, .. } => {
             // Component references in connect don't contain function calls
             let _ = (lhs, rhs);
         }

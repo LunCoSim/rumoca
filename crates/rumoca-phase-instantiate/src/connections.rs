@@ -403,9 +403,10 @@ fn resolve_int_param_ref(
 /// Substitute an index variable with a concrete value in an equation.
 fn substitute_index_in_equation(eq: &ast::Equation, var_name: &str, value: i64) -> ast::Equation {
     match eq {
-        ast::Equation::Connect { lhs, rhs } => ast::Equation::Connect {
+        ast::Equation::Connect { lhs, rhs, annotation } => ast::Equation::Connect {
             lhs: substitute_index_in_comp_ref(lhs, var_name, value),
             rhs: substitute_index_in_comp_ref(rhs, var_name, value),
+            annotation: annotation.clone(),
         },
         ast::Equation::For { indices, equations } => ast::Equation::For {
             indices: indices
@@ -993,6 +994,7 @@ mod tests {
         let eq = ast::Equation::Connect {
             lhs: make_comp_ref(&["a", "p"]),
             rhs: make_comp_ref(&["b", "n"]),
+            annotation: Vec::new(),
         };
 
         let prefix = ast::QualifiedName::new();
@@ -1023,6 +1025,7 @@ mod tests {
         let eq = ast::Equation::Connect {
             lhs: make_comp_ref(&["mux2", "y"]),
             rhs: make_comp_ref_with_sub_at(range, &["mux5", "u"], 1),
+            annotation: Vec::new(),
         };
 
         let prefix = ast::QualifiedName::new();
@@ -1137,6 +1140,7 @@ mod tests {
                         }],
                         def_id: None,
                     },
+                    annotation: Vec::new(),
                 }],
             }],
         };

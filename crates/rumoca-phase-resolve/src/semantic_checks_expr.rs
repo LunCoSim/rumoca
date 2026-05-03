@@ -343,7 +343,7 @@ struct ConnectRequiresConnectorsVisitor<'a> {
 impl ast::Visitor for ConnectRequiresConnectorsVisitor<'_> {
     fn visit_equation(&mut self, eq: &Equation) -> std::ops::ControlFlow<()> {
         match eq {
-            Equation::Connect { lhs, rhs } => self.visit_connect(lhs, rhs),
+            Equation::Connect { lhs, rhs, .. } => self.visit_connect(lhs, rhs),
             Equation::For { equations, .. } => self.visit_each(equations, Self::visit_equation),
             Equation::If {
                 cond_blocks,

@@ -139,7 +139,7 @@ fn default_start_value(type_name: &str) -> rumoca_ir_ast::Expression {
 }
 
 /// Extract annotation arguments from a component description.
-fn extract_annotation(
+pub(crate) fn extract_annotation(
     desc: &modelica_grammar_trait::Description,
 ) -> anyhow::Result<Vec<rumoca_ir_ast::Expression>> {
     let Some(desc_opt) = &desc.description_opt else {

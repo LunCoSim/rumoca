@@ -60,6 +60,7 @@ fn test_equations_to_instance_without_connections_filters_connect_equations() {
                 }],
                 def_id: None,
             },
+            annotation: Vec::new(),
         },
         ast::Equation::Simple {
             lhs: make_comp_ref_expr(&["x"]),

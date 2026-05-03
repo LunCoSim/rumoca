@@ -981,6 +981,14 @@ pub enum Equation {
     Connect {
         lhs: ComponentReference,
         rhs: ComponentReference,
+        /// Annotation following the `connect(...)` equation, if any —
+        /// e.g. `connect(a.p, b.q) annotation(Line(points={{0,0},{10,10}}))`.
+        /// Empty when the source has no annotation. Captures the
+        /// modifications passed to `annotation(...)` as a flat list of
+        /// expression nodes — same shape as `Component::annotation` /
+        /// `ClassDef::annotation`.
+        #[serde(default)]
+        annotation: Vec<Expression>,
     },
     For {
         indices: Vec<ForIndex>,
@@ -1432,7 +1440,7 @@ impl std::fmt::Display for Equation {
         match self {
             Equation::Empty => write!(f, ""),
             Equation::Simple { lhs, rhs } => write!(f, "{} = {}", lhs, rhs),
-            Equation::Connect { lhs, rhs } => write!(f, "connect({}, {})", lhs, rhs),
+            Equation::Connect { lhs, rhs, .. } => write!(f, "connect({}, {})", lhs, rhs),
             Equation::For { indices, equations } => format_for_equation(f, indices, equations),
             Equation::When(blocks) => format_when_equation(f, blocks),
             Equation::If {

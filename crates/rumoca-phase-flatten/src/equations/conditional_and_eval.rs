@@ -922,9 +922,10 @@ pub(crate) fn substitute_index_in_equation(
                 })
                 .collect(),
         ),
-        ast::Equation::Connect { lhs, rhs } => ast::Equation::Connect {
+        ast::Equation::Connect { lhs, rhs, annotation } => ast::Equation::Connect {
             lhs: substitute_index_in_component_ref(lhs, var_name, value),
             rhs: substitute_index_in_component_ref(rhs, var_name, value),
+            annotation: annotation.clone(),
         },
         ast::Equation::FunctionCall { comp, args } => ast::Equation::FunctionCall {
             comp: substitute_index_in_component_ref(comp, var_name, value),
