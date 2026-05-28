@@ -23,6 +23,7 @@ impl SimSolverMode {
             || normalized.contains("dopri")
             || normalized.contains("esdirk")
             || normalized.contains("trbdf2")
+            || normalized.contains("tsit")
             || normalized.contains("euler")
             || normalized.contains("midpoint");
 

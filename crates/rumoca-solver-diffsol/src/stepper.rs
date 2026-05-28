@@ -14,7 +14,71 @@ use rumoca_sim_core::phase_structural::eliminate::EliminationResult;
 
 use super::{Dae, SimError};
 use rumoca_sim_core::TimeoutBudget;
+use rumoca_sim_core::SimSolverMode;
 use rumoca_sim_core::runtime::layout::SimulationContext;
+
+/// Which Runge-Kutta tableau to use when `solver_mode` is `RkLike`.
+/// Ignored for `Bdf` and `Auto`.
+///
+/// TBD — DESIGN DEBT: this enum coexisting with `SimSolverMode::RkLike`
+/// is a two-knob trap. Picking ESDIRK34 requires setting *both*
+/// `solver_mode = RkLike` and `rk_method = Esdirk34`; invalid combos
+/// like `solver_mode = Bdf + rk_method = Tsit45` are silently ignored.
+/// Done this way to avoid a fan-out refactor across `fallback.rs` and
+/// `SimOptions`. The cleaner shape is a single flat enum
+/// `StepperSolver { Bdf, Esdirk34, TrBdf2, Tsit45 }` exposed by
+/// `StepperOptions`, with the `SimSolverMode + RkMethod` pair kept
+/// private as an implementation detail. Schedule that refactor when
+/// touching `fallback.rs` next.
+///
+/// TBD — `Tsit45` is currently unusable on Modelica DAEs that produce
+/// a mass matrix (most of them): diffsol's explicit-RK rejects it with
+/// "Mass matrix not supported for this solver". Either filter Tsit45
+/// out at build-stepper time with a clear error, or wire scalarized-
+/// ODE detection to allow it only for systems with M = I.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RkMethod {
+    /// ESDIRK 3(4) — singly-diagonally-implicit, A- and L-stable.
+    /// Best general-purpose choice for stiff systems where BDF's
+    /// startup struggles with sharp near-discontinuities (tanh /
+    /// relop transitions in smooth models).
+    Esdirk34,
+    /// TR-BDF2 — implicit, A- and L-stable, two-stage. Strong on
+    /// moderately stiff problems with event-driven dynamics; often
+    /// matches DASSL on Modelica thermal/electrical models.
+    TrBdf2,
+    /// Tsitouras 4(5) — explicit RK, like Dormand-Prince. Fast on
+    /// non-stiff problems (rigid-body mechanics, kinematics). Will
+    /// blow up on stiff DAEs — don't pick this for thermal / chemical.
+    Tsit45,
+}
+
+impl Default for RkMethod {
+    fn default() -> Self {
+        Self::Esdirk34
+    }
+}
+
+impl RkMethod {
+    /// Map a user-facing solver name (case-insensitive, dashes /
+    /// underscores ignored) to a specific RK tableau. Returns `None`
+    /// for names that aren't RK-like.
+    pub fn from_external_name(name: &str) -> Option<Self> {
+        let n = name
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_', ' '], "");
+        if n.starts_with("esdirk") || n == "rk4" {
+            Some(Self::Esdirk34)
+        } else if n.starts_with("trbdf2") {
+            Some(Self::TrBdf2)
+        } else if n.starts_with("tsit") || n.contains("dopri") || n == "rk45" {
+            Some(Self::Tsit45)
+        } else {
+            None
+        }
+    }
+}
 
 /// Options for creating a [`SimStepper`].
 #[derive(Debug, Clone)]
@@ -23,6 +87,29 @@ pub struct StepperOptions {
     pub atol: f64,
     pub scalarize: bool,
     pub max_wall_seconds_per_step: Option<f64>,
+    /// Solver family. `Bdf` (default) for stiff DAEs. `RkLike` selects
+    /// a Runge-Kutta tableau picked by `rk_method`. `Auto` currently
+    /// maps to `Bdf` in the stepper path.
+    pub solver_mode: SimSolverMode,
+    /// Which RK tableau to use when `solver_mode == RkLike`. Ignored
+    /// otherwise.
+    pub rk_method: RkMethod,
+    /// Initial step size hint passed to diffsol's `problem.h0`. `None`
+    /// leaves the value picked by the active `SolverStartupProfile`
+    /// (currently `span/500`). `Some(h)` pins it to `h`.
+    ///
+    /// TBD — EMPIRICALLY INEFFECTIVE for BDF and SDIRK families on
+    /// stiff DAEs: diffsol's BDF/ESDIRK34/TR-BDF2 do their own
+    /// first-step estimation as part of startup and *clamp* the user
+    /// `h0` against their local Lipschitz estimate. Verified by sweep
+    /// across h0 ∈ {default, 1e-3, 1e-2, 1e-1, 1.0}: identical
+    /// `fail_t` to 16 sig digits. Knob still useful for (a) Tsit45
+    /// explicit RK once that path is fixed, (b) non-stiff problems
+    /// with smooth IC, (c) A/B diagnostics that prove h0 is *not*
+    /// the bottleneck. The principled replacement is Hairer-Wanner
+    /// auto-h0 estimation via two `eval_compiled_runtime_residual`
+    /// calls — rumoca has all the inputs, just not wired up.
+    pub initial_step: Option<f64>,
 }
 
 impl Default for StepperOptions {
@@ -32,6 +119,9 @@ impl Default for StepperOptions {
             atol: 1e-6,
             scalarize: true,
             max_wall_seconds_per_step: None,
+            solver_mode: SimSolverMode::Bdf,
+            rk_method: RkMethod::Esdirk34,
+            initial_step: None,
         }
     }
 }

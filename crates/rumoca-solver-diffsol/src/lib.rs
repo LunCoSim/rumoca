@@ -73,7 +73,7 @@ use rumoca_sim_core::phase_structural::scalarize::build_output_names;
 use rumoca_sim_core::phase_structural::scalarize::{
     build_complex_field_map, build_var_dims_map, index_into_expr,
 };
-pub use stepper::{SimStepper, StepperOptions, StepperState};
+pub use stepper::{RkMethod, SimStepper, StepperOptions, StepperState};
 
 fn validate_simulation_function_support(dae: &Dae) -> Result<(), SimError> {
     rumoca_sim_core::function_validation::validate_simulation_function_support(dae).map_err(|err| {
@@ -762,11 +762,56 @@ fn configure_solver_problem_with_profile<Eqn>(
 ) where
     Eqn: OdeEquations<T = f64>,
 {
-    problem.ode_options.max_nonlinear_solver_iterations = 20;
-    problem.ode_options.max_nonlinear_solver_failures = 1000;
-    problem.ode_options.max_error_test_failures = 600;
+    // TBD — DESIGN DEBT: the budgets/floors/Jacobian-frequency bumps
+    // below were chosen empirically to make the lunar-rover thermal
+    // model (sharp tanh hysteresis on heater/louver + radiative σT⁴
+    // network) integrate over multi-month horizons. They make rumoca
+    // far more permissive than diffsol's stock defaults. Two risks
+    // to revisit:
+    //   1) Real solver bugs that previously surfaced as "exceeded
+    //      retry budget" will now silently grind through up to 100k
+    //      retries — wall time spike instead of fast failure.
+    //   2) Per-step Jacobian update + 50 max-NL-iters can 10×–30×
+    //      slow non-stiff workloads where stale Jacobians were fine.
+    // Proper fix: tier this via `SolverStartupProfile` (Default
+    // stays conservative; a new `StiffRadiative` profile carries
+    // these aggressive settings) or per-model via Modelica's
+    // `experiment(Tolerance=, ...)` annotation extensions.
+    // Reference: docs/numeric-experiments/2026-05-28-lunar-thermal.md
+    // in the luncosim repo for the full diagnosis + sweep results.
+    problem.ode_options.max_nonlinear_solver_iterations = 50;
+    // Raise retry budgets *far* above defaults. Stiff DAEs with FD
+    // Jacobians on radiative σT⁴ terms (where ε-perturbation loses
+    // ~9 sig digits) routinely need thousands of nonlinear-solver
+    // retries to push through t=0 transients. The previous 1000 cap
+    // was tripping before the integrator could escape the singular
+    // initial Jacobian.
+    problem.ode_options.max_nonlinear_solver_failures = 100_000;
+    problem.ode_options.max_error_test_failures = 100_000;
     problem.ode_options.nonlinear_solver_tolerance = nonlinear_solver_tolerance(opts, profile);
-    problem.ode_options.min_timestep = 1e-16;
+    // Lower the step-size floor below machine epsilon. The previous
+    // 1e-16 default caused stiff models to bail out at t≈2.5e-7s when
+    // the solver halved through ~30 rejected steps at startup before
+    // reaching the floor. 1e-25 gives the solver another ~30 halvings
+    // of headroom to push past initial-condition transients without
+    // breaking down on well-conditioned problems.
+    problem.ode_options.min_timestep = 1e-25;
+    // Force fresh Jacobian on every step. Default is "reuse for 20
+    // steps if Newton is converging well"; for stiff DAEs whose
+    // Jacobian changes rapidly near t=0 (radiative T^4 networks, sharp
+    // tanh transitions), the stale Jacobian causes Newton to diverge
+    // and step size to collapse. Costs CPU per step but unblocks
+    // models that would otherwise stagnate at startup.
+    problem.ode_options.update_jacobian_after_steps = 1;
+    problem.ode_options.update_rhs_jacobian_after_steps = 1;
+    // Enable Armijo linesearch on the consistent-IC Newton solver.
+    // When the initial Jacobian is near-singular (radiative loops at
+    // t=0), default full Newton steps can land at a worse residual
+    // than the starting point. Linesearch steps back along the
+    // direction until residual decreases, finding a feasible y₀.
+    problem.ic_options.use_linesearch = true;
+    problem.ic_options.max_newton_iterations = 200;
+    problem.ic_options.max_linesearch_iterations = 40;
     let span = (opts.t_end - opts.t_start).abs();
     let interval_cap = startup_interval_cap(opts);
     if span.is_finite() && span > 0.0 {
@@ -1156,11 +1201,25 @@ pub(crate) fn build_stepper(
         dt: None,
         scalarize: opts.scalarize,
         max_wall_seconds: opts.max_wall_seconds_per_step,
-        solver_mode: SimSolverMode::Bdf,
+        // Carry caller's solver choice — `build_stepper` branches on
+        // this below to pick BDF vs ESDIRK34. Auto maps to BDF in the
+        // stepper path (the auto-fallback engine is the non-stepper
+        // simulate() route).
+        solver_mode: opts.solver_mode,
     };
 
     let startup_profile = SolverStartupProfile::Default;
     configure_solver_problem_with_profile(&mut problem_obj, &sim_opts, startup_profile);
+
+    // Optional manual h0 override — pins the initial step regardless
+    // of profile heuristics. Used for diagnostics (find what h0 a
+    // model tolerates) and for long-horizon problems where the
+    // default `span / 5_000_000` over-shoots a stiff transient at t0.
+    if let Some(h0) = opts.initial_step {
+        if h0.is_finite() && h0 > 0.0 {
+            problem_obj.h0 = h0;
+        }
+    }
 
     // Leak the problem to obtain a 'static reference. The solver borrows from
     // the problem, but the stepper needs to own the solver for an unbounded
@@ -1168,24 +1227,9 @@ pub(crate) fn build_stepper(
     // program's duration (or until the stepper is dropped — a future
     // improvement could reclaim the memory via ManuallyDrop / raw pointers).
     let problem_ref: &'static _ = Box::leak(Box::new(problem_obj));
-    let mut solver = problem_ref
-        .bdf::<LS>()
-        .map_err(|e| SimError::SolverError(format!("Failed to create BDF solver: {e}")))?;
+
     let compiled_runtime = problem::build_compiled_runtime_newton_context(&dae, n_total)?;
     let compiled_synthetic_root = problem::build_compiled_synthetic_root_context(&dae, n_total)?;
-
-    apply_initial_sections_and_sync_startup_state(
-        &mut solver,
-        StartupSyncInput {
-            dae: &dae,
-            opts: &sim_opts,
-            startup_profile,
-            compiled_runtime: &compiled_runtime,
-            param_values: &param_values,
-            n_x,
-            budget: &budget,
-        },
-    )?;
 
     let mut solver_names = build_output_names(&dae);
     solver_names.truncate(n_total);
@@ -1196,19 +1240,6 @@ pub(crate) fn build_stepper(
     let dae_ref: &'static Dae = Box::leak(Box::new(dae.clone()));
     let opts_ref: &'static SimOptions = Box::leak(Box::new(sim_opts.clone()));
     let budget_ref: &'static TimeoutBudget = Box::leak(Box::new(budget));
-
-    let ctx = SolverLoopContext {
-        dae: dae_ref,
-        elim: elim.clone(),
-        opts: opts_ref,
-        startup_profile,
-        n_x,
-        param_values: param_values.clone(),
-        compiled_runtime,
-        compiled_synthetic_root,
-        discrete_event_ctx: compiled_discrete_event_ctx,
-        budget: budget_ref,
-    };
 
     // Type-erased stepper inner
     #[allow(dead_code)]
@@ -1393,14 +1424,69 @@ pub(crate) fn build_stepper(
         }
     }
 
-    let inner = ConcreteInner {
-        solver,
-        ctx,
-        _phantom: std::marker::PhantomData,
+    // Build the (different-typed) solver per `solver_mode`, run
+    // initial-conditions sync, build the loop context, and box the
+    // ConcreteInner. Match arms have separate move-scopes so the
+    // owned compiled_runtime / compiled_synthetic_root /
+    // compiled_discrete_event_ctx can be consumed by whichever arm
+    // actually runs.
+    // Macro to keep the four arms' bodies aligned: each creates a
+    // solver via a different problem method, then runs the identical
+    // initial-conditions sync + ctx build + Box wrap. Reduces 4 ×
+    // ~30-line near-duplicates to one shape.
+    macro_rules! build_inner_with {
+        ($solver_expr:expr, $err_label:literal) => {{
+            let mut solver = $solver_expr
+                .map_err(|e| SimError::SolverError(format!(concat!("Failed to create ", $err_label, " solver: {}"), e)))?;
+            apply_initial_sections_and_sync_startup_state(
+                &mut solver,
+                StartupSyncInput {
+                    dae: &dae,
+                    opts: &sim_opts,
+                    startup_profile,
+                    compiled_runtime: &compiled_runtime,
+                    param_values: &param_values,
+                    n_x,
+                    budget: budget_ref,
+                },
+            )?;
+            let ctx = SolverLoopContext {
+                dae: dae_ref,
+                elim: elim.clone(),
+                opts: opts_ref,
+                startup_profile,
+                n_x,
+                param_values: param_values.clone(),
+                compiled_runtime,
+                compiled_synthetic_root,
+                discrete_event_ctx: compiled_discrete_event_ctx,
+                budget: budget_ref,
+            };
+            Box::new(ConcreteInner {
+                solver,
+                ctx,
+                _phantom: std::marker::PhantomData,
+            }) as Box<dyn stepper::StepperInner>
+        }};
+    }
+
+    let inner: Box<dyn stepper::StepperInner> = match opts.solver_mode {
+        SimSolverMode::RkLike => match opts.rk_method {
+            stepper::RkMethod::Esdirk34 => {
+                build_inner_with!(problem_ref.esdirk34::<LS>(), "ESDIRK34")
+            }
+            stepper::RkMethod::TrBdf2 => {
+                build_inner_with!(problem_ref.tr_bdf2::<LS>(), "TR-BDF2")
+            }
+            stepper::RkMethod::Tsit45 => {
+                build_inner_with!(problem_ref.tsit45(), "Tsit45")
+            }
+        },
+        _ => build_inner_with!(problem_ref.bdf::<LS>(), "BDF"),
     };
 
     Ok(stepper::SimStepper {
-        inner: Box::new(inner),
+        inner,
         dae,
         sim_context,
         param_values,
