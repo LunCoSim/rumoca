@@ -34,6 +34,7 @@ fn test_todae_inherits_scalarized_element_start_from_array_base() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("todae should inherit scalarized element starts from array base declaration");
@@ -94,6 +95,7 @@ fn test_todae_keeps_non_primitive_leaf_outputs() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("todae should keep non-primitive leaf output variables");
@@ -182,6 +184,7 @@ fn test_todae_classifies_clocked_flat_assignment_as_discrete_real_and_routes_to_
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("clocked assignment should convert");
@@ -259,6 +262,7 @@ fn test_todae_routes_if_lhs_clocked_assignment_with_supersample_to_f_z() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("if-lhs clocked superSample assignment should convert");
@@ -306,6 +310,7 @@ fn test_todae_routes_clocked_binding_out_of_fx_even_without_discrete_type_flag()
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("clocked binding must not remain in f_x");
@@ -359,6 +364,7 @@ fn test_todae_routes_discrete_valued_clocked_binding_to_fm() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("clocked discrete-valued binding should convert");
@@ -424,6 +430,7 @@ fn test_todae_routes_clocked_tuple_assignment_to_f_z() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("clocked tuple assignment should convert");
@@ -492,6 +499,7 @@ fn test_todae_routes_algorithm_when_sample_assignment_to_f_z() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("algorithm when sample assignment should lower to discrete partition");
@@ -553,6 +561,7 @@ fn test_todae_merges_sequential_when_statements_for_same_target_in_source_order(
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("sequential when-statements should lower to one ordered discrete equation");
@@ -828,6 +837,7 @@ fn test_todae_keeps_time_guarded_discrete_output_binding_and_alias_consumer() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("todae should preserve time-guarded discrete output bindings");
@@ -920,6 +930,7 @@ fn test_todae_converts_non_primitive_leaf_discrete_binding_to_f_m() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("todae should keep non-primitive leaf discrete bindings");
@@ -1119,6 +1130,7 @@ fn test_connected_discrete_input_alias_keeps_discrete_partition() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("to_dae should succeed for connected discrete input aliases");
@@ -1177,6 +1189,7 @@ fn test_connected_real_input_propagates_discrete_partition_from_peer() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("to_dae should succeed for connected clocked real inputs");
@@ -1235,6 +1248,7 @@ fn test_when_clause_guard_for_var_condition_uses_edge_activation() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("when clause should lower to guarded discrete update");
@@ -1312,6 +1326,7 @@ fn test_when_clause_guard_for_vector_var_conditions_uses_edge_activation_per_ele
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("vector when clause should lower to guarded discrete update");
@@ -1439,6 +1454,7 @@ fn test_when_boolean_alias_guard_matches_inline_relational_guard() {
         &direct_flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("direct-guard model should lower");
@@ -1446,6 +1462,7 @@ fn test_when_boolean_alias_guard_matches_inline_relational_guard() {
         &alias_flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("alias-guard model should lower");

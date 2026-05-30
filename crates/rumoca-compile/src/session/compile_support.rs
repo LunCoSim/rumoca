@@ -128,6 +128,13 @@ fn summarize_typecheck_error_code(diags: &CommonDiagnostics) -> Option<String> {
 pub(super) fn todae_options_for_tree(tree: &ast::ClassTree) -> ToDaeOptions {
     ToDaeOptions {
         error_on_unbalanced: !has_multiple_top_level_classes(tree),
+        // Keep computed parameter start expressions symbolic so an interactive
+        // host (lunica) can override a base parameter between runs and have the
+        // dependents recompute without recompiling from source. NOTE: this is
+        // the shared compile-session path — confirm it does not regress any
+        // codegen-from-session golden output before relying on it. Set false to
+        // restore the historical literal-folding behaviour.
+        preserve_overridable_param_starts: true,
     }
 }
 

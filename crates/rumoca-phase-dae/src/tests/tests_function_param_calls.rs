@@ -55,6 +55,7 @@ fn test_todae_accepts_function_typed_parameter_calls_in_function_body() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("function-typed function parameters should be callable in function bodies");

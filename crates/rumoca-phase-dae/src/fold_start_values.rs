@@ -12,10 +12,28 @@ use std::collections::HashMap;
 
 /// Evaluate all parameter/state/constant start expressions to numeric literals
 /// where possible. Modifies the DAE in place.
-pub(crate) fn fold_start_values_to_literals(dae: &mut Dae) {
+///
+/// When `preserve_overridable_param_starts` is set, a *parameter* whose `start`
+/// expression references one or more other parameters is left symbolic instead
+/// of being folded to a literal. This keeps the dependency live so that a
+/// runtime override of a base parameter (e.g. `Isp`) propagates to its computed
+/// dependents (e.g. `massRatio = exp(dv_hop/(Isp*g0))`) when the interpreter
+/// re-evaluates start expressions via `build_params`, without recompiling from
+/// source. `sort_parameters_by_start_dependency` (run earlier in the ToDAE
+/// pipeline) already orders the chain for forward evaluation. Defaults to the
+/// historical behaviour (`false`) so codegen backends keep getting literals.
+pub(crate) fn fold_start_values_to_literals(dae: &mut Dae, preserve_overridable_param_starts: bool) {
     // Phase 1: build a name→value map from constants, enum ordinals, and
     // parameter start expressions (fixed-point iteration).
     let mut values: HashMap<String, f64> = HashMap::new();
+
+    // Set of all parameter names — used by the override-preservation carve-out
+    // to detect parameter→parameter dependencies in a start expression.
+    let param_names: std::collections::HashSet<String> = dae
+        .parameters
+        .keys()
+        .map(|k| k.as_str().to_string())
+        .collect();
 
     // Seed with enum literal ordinals
     for (name, ordinal) in &dae.enum_literal_ordinals {
@@ -59,7 +77,7 @@ pub(crate) fn fold_start_values_to_literals(dae: &mut Dae) {
 
     // Phase 2: rewrite start expressions to literals where we found values.
     // Also clear self-referencing defaults (start = VarRef(self_name)).
-    let rewrite = |var: &mut Variable| {
+    let rewrite = |var: &mut Variable, is_param: bool| {
         if let Some(ref start) = var.start {
             // Check for self-reference: start = VarRef(own_name)
             if let Expression::VarRef { name, subscripts } = start
@@ -76,10 +94,19 @@ pub(crate) fn fold_start_values_to_literals(dae: &mut Dae) {
             // - Parameter refs preserve the dependency so downstream
             //   overrides (FMI parameter tweaks, structural parameters)
             //   flow through to dependents instead of being locked at
-            //   compile time. Topo-sorting (sort_parameters_by_start_deps)
+            //   compile time. Topo-sorting (sort_parameters_by_start_dependency)
             //   already orders the chain for forward-eval templates.
             if let Expression::VarRef { subscripts, .. } = start
                 && subscripts.is_empty()
+            {
+                return;
+            }
+            // Override-preservation carve-out: keep a *computed* parameter start
+            // (not just a bare alias) symbolic when it references another
+            // parameter, so runtime base-parameter overrides propagate to it.
+            if is_param
+                && preserve_overridable_param_starts
+                && !collect_param_refs(start, &param_names).is_empty()
             {
                 return;
             }
@@ -90,28 +117,28 @@ pub(crate) fn fold_start_values_to_literals(dae: &mut Dae) {
     };
 
     for var in dae.constants.values_mut() {
-        rewrite(var);
+        rewrite(var, false);
     }
     for var in dae.parameters.values_mut() {
-        rewrite(var);
+        rewrite(var, true);
     }
     for var in dae.states.values_mut() {
-        rewrite(var);
+        rewrite(var, false);
     }
     for var in dae.inputs.values_mut() {
-        rewrite(var);
+        rewrite(var, false);
     }
     for var in dae.discrete_reals.values_mut() {
-        rewrite(var);
+        rewrite(var, false);
     }
     for var in dae.discrete_valued.values_mut() {
-        rewrite(var);
+        rewrite(var, false);
     }
     for var in dae.algebraics.values_mut() {
-        rewrite(var);
+        rewrite(var, false);
     }
     for var in dae.outputs.values_mut() {
-        rewrite(var);
+        rewrite(var, false);
     }
 }
 

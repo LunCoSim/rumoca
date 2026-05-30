@@ -329,6 +329,7 @@ fn test_todae_preserves_function_algorithm_bodies_for_codegen_readability() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("to_dae should keep reachable function bodies");
@@ -363,6 +364,7 @@ fn test_todae_lowers_supported_model_algorithms_to_equations() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("to_dae should lower simple model algorithms");
@@ -404,6 +406,7 @@ fn test_todae_lowers_model_algorithm_for_loop_with_static_range() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("for-loop algorithms with static ranges should lower to equations");
@@ -452,6 +455,7 @@ fn test_todae_lowers_model_algorithm_for_loop_with_subscripted_targets() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("for-loop algorithms with static indexed targets should lower to equations");
@@ -524,6 +528,7 @@ fn test_todae_lowers_when_algorithm_for_loop_with_subscripted_targets() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("when for-loop algorithms with static indexed targets should lower to event equations");
@@ -616,6 +621,7 @@ fn test_todae_lowers_when_algorithm_for_loop_with_sequential_cross_target_update
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("when for-loop algorithms with sequential updates should lower");
@@ -725,6 +731,7 @@ fn test_todae_lowers_when_algorithm_preceding_assignment_visible_inside_for_loop
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("when assignments before for-loop should stay visible inside the loop");
@@ -760,6 +767,7 @@ fn test_todae_lowers_top_level_algorithm_assignment_before_for_loop_sequentially
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("top-level sequential algorithm state should stay visible inside following for-loop");
@@ -795,6 +803,7 @@ fn test_todae_rejects_model_algorithm_for_loop_with_non_constant_range() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect_err("for-loop algorithms with non-constant ranges must fail");
@@ -855,6 +864,7 @@ fn test_todae_accepts_model_algorithm_for_loop_with_constant_array_binding_range
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("for-loop algorithms with constant array binding ranges should lower");
@@ -867,6 +877,7 @@ fn test_todae_lowers_supported_algorithm_slice_row_write_and_read() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("supported row slice algorithm should lower");
@@ -940,6 +951,7 @@ fn test_todae_lowers_supported_algorithm_slice_row_read_to_scalar_refs() {
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("supported row slice read should lower");
@@ -994,6 +1006,7 @@ fn test_todae_lowers_multi_output_algorithm_function_call_to_output_projections(
         &flat,
         ToDaeOptions {
             error_on_unbalanced: false,
+            ..Default::default()
         },
     )
     .expect("multi-output model algorithm calls should lower to projection equations");
