@@ -1976,3 +1976,82 @@ fn reverse_implicit_residual_vjp_transposes_forward_jvp() {
         "test point should produce a nonzero pairing"
     );
 }
+
+#[test]
+fn newton_backtracks_before_leaving_square_root_domain() {
+    use solve::LinearOp::{Binary, Const, LoadY, StoreOutput, Unary};
+    use solve::{BinaryOp, ComputeBlock, UnaryOp};
+    // a=sqrt(b), b=2-3*a has a positive root. The first GS sweep
+    // gives (.01,1.97). Its full Newton step makes b negative; a
+    // smaller step reaches the root without relaxing convergence.
+    let mut model = solve::SolveModel::default();
+    model.problem.solve_layout.algebraic_scalar_count = 2;
+    model.problem.solve_layout.solver_maps.names = vec!["a".into(), "b".into()];
+    model.problem.continuous.implicit_rhs = ComputeBlock::from_scalar_program_block(spanned_block(
+        vec![
+            vec![
+                LoadY { dst: 0, index: 1 },
+                Unary {
+                    dst: 1,
+                    op: UnaryOp::Sqrt,
+                    arg: 0,
+                },
+                LoadY { dst: 2, index: 0 },
+                Binary {
+                    dst: 3,
+                    op: BinaryOp::Sub,
+                    lhs: 2,
+                    rhs: 1,
+                },
+                StoreOutput { src: 3 },
+            ],
+            vec![
+                LoadY { dst: 0, index: 0 },
+                Const { dst: 1, value: 3.0 },
+                Binary {
+                    dst: 2,
+                    op: BinaryOp::Mul,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                Const { dst: 3, value: 2.0 },
+                Binary {
+                    dst: 4,
+                    op: BinaryOp::Sub,
+                    lhs: 3,
+                    rhs: 2,
+                },
+                LoadY { dst: 5, index: 1 },
+                Binary {
+                    dst: 6,
+                    op: BinaryOp::Sub,
+                    lhs: 5,
+                    rhs: 4,
+                },
+                StoreOutput { src: 6 },
+            ],
+        ],
+        "square_root_domain.mo",
+    ));
+    model.problem.continuous.implicit_row_targets = (0..2)
+        .map(|index| Some(solve::scalar_slot_y(index)))
+        .collect();
+    model.problem.continuous.algebraic_projection_plan = solve::AlgebraicProjectionPlan {
+        blocks: vec![solve::AlgebraicProjectionBlock {
+            rows: vec![0, 1],
+            y_indices: vec![0, 1],
+            causal_steps: Vec::new(),
+        }],
+    };
+    model.initial_y = vec![0.01, 0.0001];
+    let runtime = SolveRuntime::new(&model).expect("valid square-root model");
+    let values = runtime
+        .full_solver_y(0.0, &[], &[], 1.0e-10, 4)
+        .expect("Newton must backtrack a non-finite trial, not reject the valid root");
+    let expected_a = (17.0_f64.sqrt() - 3.0) / 2.0;
+    assert!((values[0] - expected_a).abs() < 1.0e-10, "{values:?}");
+    assert!(
+        (values[1] - expected_a * expected_a).abs() < 1.0e-10,
+        "{values:?}"
+    );
+}

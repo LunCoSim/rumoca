@@ -442,11 +442,67 @@ impl SolveRuntime {
             if crate::linear_solve::gaussian_eliminate(&mut augmented).is_none() {
                 return Err(self.refresh_newton_failure(iter_idx + 1, &last_max));
             }
-            if !apply_newton_steps(&mut x, &augmented) {
+            let Some(candidate) = self.backtrack_newton_step(probe, &augmented, solver_y)? else {
                 return Err(self.refresh_newton_failure(iter_idx + 1, &last_max));
-            }
+            };
+            x = candidate;
         }
         Err(self.refresh_newton_failure(MAX_NEWTON_ITERS, &last_max))
+    }
+
+    /// Accept a finite Newton trial only when its scaled residual decreases.
+    /// Scaling stays fixed across the line search; convergence still uses the
+    /// requested absolute tolerance and the existing bounded roundoff floor.
+    fn backtrack_newton_step(
+        &self,
+        probe: NewtonProbe<'_>,
+        augmented: &crate::linear_solve::AugmentedMatrix,
+        solver_y: &mut [f64],
+    ) -> Result<Option<Vec<f64>>, RuntimeSolveError> {
+        const MAX_BACKTRACKS: usize = 16;
+        let mut scales = copy_runtime_values(probe.x, "Newton residual scales")?;
+        for ((scale, value), mapped) in scales.iter_mut().zip(probe.x).zip(probe.f_base) {
+            *scale = 1.0_f64.max(value.abs()).max(mapped.abs());
+        }
+        let merit = probe
+            .residual
+            .iter()
+            .zip(&scales)
+            .fold(0.0_f64, |norm, (residual, scale)| {
+                norm.max(residual.abs() / scale)
+            });
+        let mut fraction = 1.0;
+        for _ in 0..MAX_BACKTRACKS {
+            let mut candidate = copy_runtime_values(probe.x, "Newton trial")?;
+            if apply_newton_steps(&mut candidate, augmented, fraction) {
+                let mapped = match self.refresh_newton_sweep(
+                    probe.rows,
+                    &candidate,
+                    probe.t,
+                    solver_y,
+                    probe.params,
+                ) {
+                    Ok(mapped) => Some(mapped),
+                    Err(RuntimeSolveError::NonFiniteValue { .. }) => None,
+                    Err(error) => return Err(error),
+                };
+                if let Some(mapped) = mapped {
+                    let trial_merit = candidate
+                        .iter()
+                        .zip(&mapped)
+                        .zip(&scales)
+                        .fold(0.0_f64, |norm, ((value, mapped), scale)| {
+                            norm.max((value - mapped).abs() / scale)
+                        });
+                    if trial_merit.is_finite() && trial_merit <= merit * (1.0 - 1.0e-4 * fraction) {
+                        return Ok(Some(candidate));
+                    }
+                }
+            }
+            fraction *= 0.5;
+        }
+        write_refresh_targets(probe.rows, probe.x, solver_y);
+        Ok(None)
     }
 
     /// Evaluate the refresh map `F` at `x` (writing `x` into the target slots

@@ -12,6 +12,7 @@ pub(super) fn write_refresh_targets(rows: &[AlgebraicRefreshRow], x: &[f64], sol
 }
 
 /// Borrowed inputs for one Newton Jacobian assembly.
+#[derive(Clone, Copy)]
 pub(super) struct NewtonProbe<'a> {
     pub(super) rows: &'a [AlgebraicRefreshRow],
     pub(super) x: &'a [f64],
@@ -25,6 +26,7 @@ pub(super) struct NewtonProbe<'a> {
 pub(super) fn apply_newton_steps(
     x: &mut [f64],
     augmented: &crate::linear_solve::AugmentedMatrix,
+    fraction: f64,
 ) -> bool {
     let m = x.len();
     for (j, value) in x.iter_mut().enumerate() {
@@ -32,7 +34,10 @@ pub(super) fn apply_newton_steps(
         if !step.is_finite() {
             return false;
         }
-        *value += step;
+        *value += fraction * step;
+        if !value.is_finite() {
+            return false;
+        }
     }
     true
 }
