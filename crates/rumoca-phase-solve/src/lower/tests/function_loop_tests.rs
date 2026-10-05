@@ -542,3 +542,102 @@ fn lower_expression_uses_actual_matrix_shape_for_function_input_size() {
     let (regs, _) = eval_linear_ops(&lowered.ops, &[], &p, 0.0);
     assert!((read_reg(&regs, lowered.result) - 7.0).abs() <= 1e-12);
 }
+
+#[test]
+fn runtime_bisection_loop_keeps_updated_bounds() {
+    let span = lower_test_span();
+    let mut model = dae::Dae::default();
+    model
+        .variables
+        .algebraics
+        .insert(rumoca_core::VarName::new("u"), scalar_var("u"));
+    let mut function = test_function("My.bisect", span);
+    function.inputs.push(function_param("u"));
+    function.outputs.push(function_param("out"));
+    for name in ["lower", "upper", "midpoint"] {
+        function.locals.push(function_param(name));
+    }
+    let assign = |name: &str, value| rumoca_core::Statement::Assignment {
+        comp: component_ref(name),
+        value,
+        span,
+    };
+    function.body.push(assign("lower", real_lit(1.0)));
+    function.body.push(assign("upper", real_lit(4.0)));
+    function.body.push(rumoca_core::Statement::For {
+        indices: vec![rumoca_core::ForIndex {
+            ident: "i".into(),
+            range: rumoca_core::Expression::Range {
+                start: Box::new(int_lit(1)),
+                step: None,
+                end: Box::new(int_lit(12)),
+                span,
+            },
+        }],
+        equations: vec![
+            assign(
+                "midpoint",
+                rumoca_core::Expression::Binary {
+                    op: rumoca_core::OpBinary::Div,
+                    lhs: Box::new(add(var("lower"), var("upper"))),
+                    rhs: Box::new(real_lit(2.0)),
+                    span,
+                },
+            ),
+            rumoca_core::Statement::If {
+                cond_blocks: vec![rumoca_core::StatementBlock {
+                    cond: rumoca_core::Expression::Binary {
+                        op: rumoca_core::OpBinary::Lt,
+                        lhs: Box::new(var("midpoint")),
+                        rhs: Box::new(var("u")),
+                        span,
+                    },
+                    stmts: vec![assign("lower", var("midpoint"))],
+                }],
+                else_block: Some(vec![assign("upper", var("midpoint"))]),
+                span,
+            },
+        ],
+        span,
+    });
+    function
+        .body
+        .push(assign("out", add(var("lower"), var("upper"))));
+    model
+        .symbols
+        .functions
+        .insert(function.name.clone(), function);
+    let expression = rumoca_core::Expression::FunctionCall {
+        name: rumoca_core::Reference::generated("My.bisect"),
+        args: vec![source_var("u")],
+        is_constructor: false,
+        span,
+    };
+    let layout = build_var_layout(&model).expect("layout");
+    let starts = IndexMap::from([("u".to_string(), real_lit(0.0))]);
+    let mut builder = crate::lower::LowerBuilder::new_with_metadata(
+        &layout,
+        &model.symbols.functions,
+        crate::lower::LowerBuilderMetadata {
+            variable_starts: Some(&starts),
+            ..Default::default()
+        },
+    );
+    let result = builder
+        .lower_expr(&expression, &Scope::new(), 0)
+        .expect("lower");
+    let lowered = crate::lower::LoweredExpression {
+        ops: builder.ops,
+        result,
+    };
+    for input in [1.5, 2.0, 3.5] {
+        let mut y = vec![0.0; layout.y_scalars()];
+        set_y_value(&layout, &mut y, "u", input);
+        let (regs, _) = eval_linear_ops(&lowered.ops, &y, &[], 0.0);
+        assert!(
+            (read_reg(&regs, lowered.result) - 2.0 * input).abs() < 0.001,
+            "input={input}, result={}",
+            read_reg(&regs, lowered.result)
+        );
+    }
+}

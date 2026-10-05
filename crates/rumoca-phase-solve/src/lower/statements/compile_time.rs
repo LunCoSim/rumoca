@@ -210,6 +210,19 @@ impl<'a> LowerBuilder<'a> {
         if let Some(value) = self.structural_bindings.get(key.as_str()) {
             return Ok(*value);
         }
+        // A runtime slot's start is an initialization guess, not a structural
+        // value (MLS 4.4/4.5). Folding it here freezes function branches and
+        // loop calculations at that guess even after the input changes.
+        if self
+            .layout
+            .binding(key.as_str())
+            .is_some_and(|slot| !matches!(slot, ScalarSlot::Constant(_)))
+        {
+            return Err(unsupported_at(
+                format!("for-loop range expression requires compile-time constant `{key}`"),
+                span,
+            ));
+        }
         if let Some(start) = self
             .variable_starts
             .and_then(|starts| starts.get(key.as_str()))
