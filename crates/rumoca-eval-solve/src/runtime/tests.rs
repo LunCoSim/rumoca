@@ -10,6 +10,115 @@ fn valid_algebraic_refresh_plan(
     }
 }
 
+#[test]
+fn refresh_convergence_allows_only_bounded_roundoff() {
+    let value = 2.0_f64.powi(30);
+    let ulp = value.next_up() - value;
+    for signed in [value, -value] {
+        assert!(refresh_difference_converged(16.0 * ulp, signed, 1.0e-10));
+        assert!(!refresh_difference_converged(32.0 * ulp, signed, 1.0e-10));
+    }
+    assert!(refresh_difference_converged(1.0e-10, 0.5, 1.0e-10));
+    assert!(!refresh_difference_converged(2.0e-10, 0.5, 1.0e-10));
+    assert!(!refresh_difference_converged(f64::INFINITY, value, 1.0e-10));
+    assert!(!refresh_difference_converged(0.0, f64::NAN, 1.0e-10));
+    assert!(refresh_difference_converged(0.0, f64::MAX, 1.0e-10));
+    assert!(!refresh_difference_converged(1.0, f64::MAX, 1.0e-10));
+}
+
+#[test]
+fn newton_retry_preserves_evaluated_constant_dependencies() {
+    use solve::LinearOp::{Binary, Const, LoadY, StoreOutput};
+    use solve::{BinaryOp, ComputeBlock};
+    // The loop a = 2*b + 1, b = 3*a + 2 requires Newton. The unrelated
+    // acyclic quotient must use c = 0.25, even when its initial slot is zero.
+    // MLS Appendix B: solve the simultaneous equations without substituting
+    // unevaluated initial guesses for their constant binding equations.
+    let loop_row = |target, index, gain, offset| {
+        vec![
+            LoadY { dst: 0, index },
+            Const {
+                dst: 1,
+                value: gain,
+            },
+            Binary {
+                dst: 2,
+                op: BinaryOp::Mul,
+                lhs: 0,
+                rhs: 1,
+            },
+            Const {
+                dst: 3,
+                value: offset,
+            },
+            Binary {
+                dst: 4,
+                op: BinaryOp::Add,
+                lhs: 2,
+                rhs: 3,
+            },
+            LoadY {
+                dst: 5,
+                index: target,
+            },
+            Binary {
+                dst: 6,
+                op: BinaryOp::Sub,
+                lhs: 5,
+                rhs: 4,
+            },
+            StoreOutput { src: 6 },
+        ]
+    };
+    let mut model = solve::SolveModel::default();
+    model.problem.solve_layout.algebraic_scalar_count = 4;
+    model.problem.solve_layout.solver_maps.names =
+        vec!["c".into(), "quotient".into(), "a".into(), "b".into()];
+    model.problem.continuous.implicit_rhs = ComputeBlock::from_scalar_program_block(spanned_block(
+        vec![
+            vec![
+                Const {
+                    dst: 0,
+                    value: 0.25,
+                },
+                StoreOutput { src: 0 },
+            ],
+            vec![
+                Const { dst: 0, value: 1.0 },
+                LoadY { dst: 1, index: 0 },
+                Binary {
+                    dst: 2,
+                    op: BinaryOp::Div,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                StoreOutput { src: 2 },
+            ],
+            loop_row(2, 3, 2.0, 1.0),
+            loop_row(3, 2, 3.0, 2.0),
+        ],
+        "constant_and_loop.mo",
+    ));
+    model.problem.continuous.implicit_row_targets = (0..4)
+        .map(|index| Some(solve::scalar_slot_y(index)))
+        .collect();
+    model.problem.continuous.algebraic_projection_plan = solve::AlgebraicProjectionPlan {
+        blocks: vec![solve::AlgebraicProjectionBlock {
+            rows: vec![2, 3],
+            y_indices: vec![2, 3],
+            causal_steps: Vec::new(),
+        }],
+    };
+    model.initial_y = vec![0.0; 4];
+    let runtime = SolveRuntime::new(&model).expect("valid runtime should prepare");
+    let values = runtime
+        .full_solver_y(0.0, &[], &[], 1.0e-9, 4)
+        .expect("Newton must preserve evaluated acyclic constants");
+    for (actual, expected) in values.iter().zip([0.25, 4.0, -1.0, -1.0]) {
+        assert!((actual - expected).abs() < 1.0e-8, "{values:?}");
+    }
+}
+
 fn test_span(name: &'static str) -> rumoca_core::Span {
     rumoca_core::Span::from_offsets(rumoca_core::SourceId::from_source_name(name), 1, 2)
 }

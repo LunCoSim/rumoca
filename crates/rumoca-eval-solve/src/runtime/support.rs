@@ -37,6 +37,18 @@ pub(super) fn apply_newton_steps(
     true
 }
 
+/// Preserve the requested absolute tolerance, with a sixteen-ULP floor for
+/// accumulated evaluation/subtraction roundoff in compound rows. A traced
+/// power/photometry row retained eight ULPs after Newton settled; twice that
+/// bounds numerical noise without a relative engineering tolerance.
+pub(super) fn refresh_difference_converged(difference: f64, value: f64, tol: f64) -> bool {
+    let magnitude = value.abs();
+    let roundoff = 16.0 * (magnitude.next_up() - magnitude);
+    difference.is_finite()
+        && value.is_finite()
+        && (difference.abs() <= tol || (roundoff.is_finite() && difference.abs() <= roundoff))
+}
+
 pub(super) fn zero_runtime_values(
     len: usize,
     context: &'static str,

@@ -39,8 +39,8 @@ use plans::{
 };
 use support::{
     NewtonProbe, apply_newton_steps, copy_runtime_values, copy_runtime_values_into,
-    reserve_runtime_index_map_capacity, reserve_runtime_vec_capacity, resize_runtime_values,
-    write_refresh_targets, zero_runtime_values,
+    refresh_difference_converged, reserve_runtime_index_map_capacity, reserve_runtime_vec_capacity,
+    resize_runtime_values, write_refresh_targets, zero_runtime_values,
 };
 
 struct RefreshSlotArgs<'a> {
@@ -54,6 +54,7 @@ struct RefreshSlotArgs<'a> {
 struct RefreshIterationMax {
     delta: f64,
     target: Option<(usize, usize, f64)>,
+    converged: bool,
 }
 
 impl From<solve_eval::EvalSolveError> for RuntimeSolveError {
@@ -317,13 +318,15 @@ impl SolveRuntime {
             tol,
             max_iters,
         } = args;
-        // Snapshot the targets: if Gauss-Seidel diverges (coupled loop with
-        // gain > 1, e.g. torque loops through a gear ratio), Newton restarts
-        // from these values rather than the diverged iterates.
-        let snapshot = self.refresh_target_snapshot(rows, solver_y)?;
+        // Keep a finite restart point before later Gauss-Seidel sweeps can
+        // diverge. After the first successful sweep, preserve its evaluated
+        // acyclic dependencies too: their initial guesses need not satisfy
+        // binding equations and may be invalid divisors in Newton's map.
+        let mut snapshot = self.refresh_target_snapshot(rows, solver_y)?;
         let mut last_max = RefreshIterationMax {
             delta: 0.0,
             target: None,
+            converged: false,
         };
         // A coupled cycle with gain > 1 (any geared torque loop) makes the
         // sweep delta grow monotonically; burning the full iteration budget
@@ -333,7 +336,7 @@ impl SolveRuntime {
         let mut growing_sweeps = 0usize;
         for iter_idx in 0..max_iters {
             let previous_delta = last_max.delta;
-            match self.refresh_slots_iteration(rows, t, solver_y, params) {
+            match self.refresh_slots_iteration(rows, t, solver_y, params, tol) {
                 Ok(iteration_max) => last_max = iteration_max,
                 Err(error) => {
                     // Divergence to non-finite values: retry with Newton from
@@ -342,8 +345,11 @@ impl SolveRuntime {
                     return self.refresh_slots_newton(rows, &snapshot, t, solver_y, params, tol);
                 }
             }
+            if iter_idx == 0 {
+                snapshot = self.refresh_target_snapshot(rows, solver_y)?;
+            }
             self.trace_refresh_iteration(iter_idx, &last_max);
-            if last_max.delta <= tol {
+            if last_max.converged {
                 return Ok(());
             }
             let growing = iter_idx > 0 && last_max.delta > previous_delta;
@@ -390,6 +396,7 @@ impl SolveRuntime {
                 &RefreshIterationMax {
                     delta: f64::INFINITY,
                     target: None,
+                    converged: false,
                 },
             ));
         }
@@ -397,17 +404,32 @@ impl SolveRuntime {
         let mut x = Vec::new();
         reserve_runtime_vec_capacity(&mut x, snapshot.len(), "Newton iterate")?;
         x.extend(snapshot);
-        for _ in 0..MAX_NEWTON_ITERS {
+        let mut last_max = RefreshIterationMax {
+            delta: 0.0,
+            target: None,
+            converged: false,
+        };
+        for iter_idx in 0..MAX_NEWTON_ITERS {
             let f_base = self.refresh_newton_sweep(rows, &x, t, solver_y, params)?;
             let mut residual = Vec::new();
             reserve_runtime_vec_capacity(&mut residual, x.len(), "Newton residual")?;
             residual.extend(x.iter().zip(&f_base).map(|(xi, fi)| xi - fi));
             let max_residual = residual.iter().fold(0.0_f64, |acc, r| acc.max(r.abs()));
             tracing::debug!(target: "rumoca_eval_solve::refresh", "newton residual={max_residual:e}");
-            if max_residual <= tol {
+            let unsettled = residual
+                .iter()
+                .enumerate()
+                .find(|(index, r)| !refresh_difference_converged(**r, x[*index], tol));
+            let Some((index, difference)) = unsettled else {
                 write_refresh_targets(rows, &x, solver_y);
                 return Ok(());
-            }
+            };
+            last_max = RefreshIterationMax {
+                delta: difference.abs(),
+                target: Some((rows[index].target_index, rows[index].row_idx, x[index])),
+                converged: false,
+            };
+            tracing::debug!(target: "rumoca_eval_solve::refresh", "newton unmet: target={} value={} residual={difference:e}", self.solver_name(rows[index].target_index), x[index]);
             let probe = NewtonProbe {
                 rows,
                 x: &x,
@@ -418,13 +440,13 @@ impl SolveRuntime {
             };
             let mut augmented = self.refresh_newton_augmented(probe, solver_y)?;
             if crate::linear_solve::gaussian_eliminate(&mut augmented).is_none() {
-                return Err(self.refresh_newton_failure());
+                return Err(self.refresh_newton_failure(iter_idx + 1, &last_max));
             }
             if !apply_newton_steps(&mut x, &augmented) {
-                return Err(self.refresh_newton_failure());
+                return Err(self.refresh_newton_failure(iter_idx + 1, &last_max));
             }
         }
-        Err(self.refresh_newton_failure())
+        Err(self.refresh_newton_failure(MAX_NEWTON_ITERS, &last_max))
     }
 
     /// Evaluate the refresh map `F` at `x` (writing `x` into the target slots
@@ -485,15 +507,13 @@ impl SolveRuntime {
         Ok(augmented)
     }
 
-    fn refresh_newton_failure(&self) -> RuntimeSolveError {
+    fn refresh_newton_failure(
+        &self,
+        iterations: usize,
+        max: &RefreshIterationMax,
+    ) -> RuntimeSolveError {
         tracing::debug!(target: "rumoca_eval_solve::refresh", "newton fallback FAILED");
-        self.refresh_convergence_error(
-            0,
-            &RefreshIterationMax {
-                delta: f64::INFINITY,
-                target: None,
-            },
-        )
+        self.refresh_convergence_error(iterations, max)
     }
 
     fn refresh_slots_iteration(
@@ -502,14 +522,17 @@ impl SolveRuntime {
         t: f64,
         solver_y: &mut [f64],
         params: &[f64],
+        tol: f64,
     ) -> Result<RefreshIterationMax, RuntimeSolveError> {
         let mut max_delta: f64 = 0.0;
         let mut max_target = None;
+        let mut converged = true;
         for refresh_row in rows {
             let row_idx = refresh_row.row_idx;
             let index = refresh_row.target_index;
             let value = self.eval_refresh_row(refresh_row, t, solver_y, params)?;
             let delta = (solver_y[index] - value).abs();
+            converged &= refresh_difference_converged(delta, value, tol);
             if delta > max_delta {
                 max_delta = delta;
                 max_target = Some((index, row_idx, value));
@@ -519,6 +542,7 @@ impl SolveRuntime {
         Ok(RefreshIterationMax {
             delta: max_delta,
             target: max_target,
+            converged,
         })
     }
 
