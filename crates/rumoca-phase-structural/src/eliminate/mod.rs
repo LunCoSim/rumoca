@@ -1872,6 +1872,15 @@ impl FallibleExpressionRewriter for SubstituteVarRewriter<'_> {
             );
             index_replacement_expr(self.replacement, &replacement_indices, span)
         } else if aggregate_subscript_ref_matches_var(name, subscripts, self.substitution) {
+            // A singleton alias may already hold a scalar projection (MLS
+            // 10.6.9). Its own [1] must not index that scalar a second time.
+            if self.replacement_dims.is_empty()
+                && self.substitution.var_dims.iter().all(|dim| *dim == 1)
+                && subscripts.len() == self.substitution.var_dims.len()
+                && subscripts_all_one(subscripts)
+            {
+                return Ok(replacement_with_owner_span(self.replacement, span));
+            }
             index_replacement_expr_with_subscripts(self.replacement, subscripts, span)
         } else if var_ref_matches_unknown_for_substitution(name, subscripts, self.substitution) {
             if !subscripts.is_empty() && !self.substitution.var_dims.is_empty() {
