@@ -169,7 +169,7 @@ impl MatchingContext<'_> {
     /// Detect algebraic loops using Tarjan SCC and generate diagnostics.
     pub(crate) fn detect_algebraic_loops(&self, result: &mut StructuralDiagnostics, n_eq: usize) {
         let adj = crate::incidence::build_dependency_graph(self.eq_unknowns, self.match_var, n_eq);
-        let sccs = crate::tarjan::tarjan_scc(n_eq, &adj);
+        let sccs = rumoca_core::tarjan_scc(n_eq, &adj);
 
         for scc in &sccs {
             if scc.len() <= 1 {
@@ -228,7 +228,7 @@ pub(crate) fn collect_warnings(
     adj: &[Vec<usize>],
     equations: &[&dae::Equation],
 ) -> Vec<Diagnostic> {
-    let sccs = crate::tarjan::tarjan_scc(incidence.n_eq, adj);
+    let sccs = rumoca_core::tarjan_scc(incidence.n_eq, adj);
     let mut warnings = Vec::new();
 
     for scc in &sccs {

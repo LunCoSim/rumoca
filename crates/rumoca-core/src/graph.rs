@@ -3,7 +3,8 @@
 /// Find all strongly connected components using Tarjan's algorithm.
 ///
 /// Returns SCCs in reverse topological order. Each SCC is a `Vec` of node indices.
-pub(crate) fn tarjan_scc(n: usize, adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
+/// `adj` must have `n` entries, with all neighbors in `0..n`.
+pub fn tarjan_scc(n: usize, adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
     let mut state = TarjanState::new(n);
     for v in 0..n {
         if state.index[v].is_none() {

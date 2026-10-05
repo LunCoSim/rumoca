@@ -1,8 +1,8 @@
 //! BLT (Block Lower Triangular) block construction from SCCs.
 
 use crate::incidence::Incidence;
-use crate::tarjan::tarjan_scc;
 use crate::types::{BltBlock, EquationRef, UnknownId};
+use rumoca_core::tarjan_scc;
 
 /// Build BLT blocks from the incidence data, matching, and dependency graph.
 ///

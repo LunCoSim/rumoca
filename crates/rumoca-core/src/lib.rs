@@ -41,6 +41,7 @@ use std::sync::Arc;
 // Previously lived in `rumoca-ir-core`; merged here per SPEC_0029 §3a.
 mod expression_rewriter;
 mod expression_visitor;
+mod graph;
 mod ir_primitives;
 mod modelica_builtins;
 mod statement_rewriter;
@@ -48,6 +49,7 @@ mod structured_domain;
 mod subscript;
 pub use expression_rewriter::{ExpressionRewriter, FallibleExpressionRewriter};
 pub use expression_visitor::{ExpressionScope, ExpressionVisitor, FallibleExpressionVisitor};
+pub use graph::tarjan_scc;
 pub use ir_primitives::*;
 pub use modelica_builtins::*;
 pub use statement_rewriter::{FallibleStatementRewriter, StatementRewriter};

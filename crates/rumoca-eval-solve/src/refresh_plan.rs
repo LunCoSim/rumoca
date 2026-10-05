@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 
 use indexmap::{IndexMap, IndexSet};
 use rumoca_ir_solve as solve;
@@ -49,8 +49,10 @@ pub(crate) fn trace_refresh_plan(model: &solve::SolveModel, name: &str, plan: &R
         .join(", ");
     tracing::debug!(
         target: "rumoca_eval_solve::refresh",
-        "{name} refresh plan: rows={} duplicate_targets={} missing={} iterative={} [{}] missing=[{}]",
+        "{name} refresh plan: rows={} blocks={} feedback_rows={} duplicate_targets={} missing={} iterative={} [{}] missing=[{}]",
         plan.rows.len(),
+        plan.blocks.len(),
+        plan.blocks.iter().filter(|block| block.iterative).map(|block| block.range.len()).sum::<usize>(),
         duplicate_targets,
         plan.missing_dependencies.len(),
         plan.iterative,
@@ -79,10 +81,17 @@ pub(crate) struct AlgebraicRefreshRow {
     pub(crate) assignment_target: Option<usize>,
 }
 
+#[derive(Clone)]
+pub(crate) struct RefreshBlock {
+    pub(crate) range: std::ops::Range<usize>,
+    pub(crate) iterative: bool,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct RefreshPlan {
     pub(crate) source_block: Arc<solve::ScalarProgramBlock>,
     pub(crate) rows: Vec<AlgebraicRefreshRow>,
+    pub(crate) blocks: Vec<RefreshBlock>,
     pub(crate) missing_dependencies: Vec<usize>,
     pub(crate) iterative: bool,
 }
@@ -479,9 +488,6 @@ fn order_refresh_rows(
     let mut edges = Vec::new();
     reserve_refresh_vec_capacity(&mut edges, rows.len(), "refresh order edges", span)?;
     edges.resize_with(rows.len(), Vec::new);
-    let mut indegree = Vec::new();
-    reserve_refresh_vec_capacity(&mut indegree, rows.len(), "refresh order indegree", span)?;
-    indegree.resize(rows.len(), 0usize);
     for (row_pos, row) in rows.iter().enumerate() {
         let Some(ops) = block.programs.get(row.row_idx) else {
             continue;
@@ -500,66 +506,89 @@ fn order_refresh_rows(
                 row_span(&block, row.row_idx),
             )?;
             edges[dep_pos].push(row_pos);
-            indegree[row_pos] += 1;
         }
     }
-    let mut ready = VecDeque::new();
-    reserve_refresh_deque_capacity(&mut ready, rows.len(), "refresh order queue", span)?;
-    ready.extend(
-        indegree
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, degree)| (*degree == 0).then_some(idx)),
-    );
     let mut ordered = Vec::new();
     reserve_refresh_vec_capacity(&mut ordered, rows.len(), "ordered refresh rows", span)?;
-    while let Some(row_pos) = ready.pop_front() {
-        ordered.push(rows[row_pos].clone());
-        for &next in &edges[row_pos] {
-            indegree[next] -= 1;
-            if indegree[next] == 0 {
-                ready.push_back(next);
+    let mut blocks: Vec<RefreshBlock> = Vec::new();
+    reserve_refresh_vec_capacity(&mut blocks, rows.len(), "refresh blocks", span)?;
+    // MLS Appendix B: nonlinear feedback is simultaneous, while dependent
+    // outputs follow its solution. Do not turn downstream photometry or other
+    // one-way outputs into unknowns of the same Newton subsystem.
+    // Stable source order among independent components preserves contiguous
+    // multi-output programs for the existing batching path.
+    for component in stable_refresh_components(&edges) {
+        let start = ordered.len();
+        let mut iterative = component.len() > 1;
+        for pos in component {
+            let row = &rows[pos];
+            if let Some(ops) = block.programs.get(row.row_idx) {
+                iterative |= row_is_nonlinear_in_target(ops, row.target_index)?;
             }
+            ordered.push(row.clone());
         }
-    }
-    // A row also needs iteration when it is *nonlinear in its own target*, even
-    // with no dependency cycle: the single secant step that the non-iterative
-    // single pass performs is exact only for residuals that are affine in the
-    // target (slope constant). A self-nonlinear acyclic row (e.g. `z*z = b*x`)
-    // would otherwise be left one secant step short of convergence.
-    let mut self_nonlinear = false;
-    for row in &ordered {
-        if let Some(ops) = block.programs.get(row.row_idx)
-            && row_is_nonlinear_in_target(ops, row.target_index)?
+        if !iterative
+            && let Some(previous) = blocks.last_mut()
+            && !previous.iterative
         {
-            self_nonlinear = true;
-            break;
+            previous.range.end = ordered.len();
+        } else {
+            blocks.push(RefreshBlock {
+                range: start..ordered.len(),
+                iterative,
+            });
         }
     }
-    let requires_iteration = ordered.len() != rows.len() || self_nonlinear;
-    if ordered.len() != rows.len() {
-        let mut emitted = Vec::new();
-        reserve_refresh_vec_capacity(&mut emitted, rows.len(), "refresh emitted flags", span)?;
-        emitted.resize(rows.len(), false);
-        for row in &ordered {
-            if let Some(pos) = rows.iter().position(|candidate| {
-                candidate.row_idx == row.row_idx && candidate.target_index == row.target_index
-            }) {
-                emitted[pos] = true;
-            }
-        }
-        ordered.extend(
-            rows.into_iter()
-                .enumerate()
-                .filter_map(|(idx, row)| (!emitted[idx]).then_some(row)),
-        );
-    }
+    let iterative = blocks.iter().any(|block| block.iterative);
     Ok(RefreshPlan {
         source_block: block,
         rows: ordered,
+        blocks,
         missing_dependencies: Vec::new(),
-        iterative: requires_iteration,
+        iterative,
     })
+}
+
+/// Topologically order feedback components, breaking independent ties by the
+/// earliest original row. No equation evaluation or model-specific naming.
+fn stable_refresh_components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut components = rumoca_core::tarjan_scc(edges.len(), edges);
+    let mut component_by_row = vec![0; edges.len()];
+    for (index, component) in components.iter_mut().enumerate() {
+        component.sort_unstable();
+        for &row in component.iter() {
+            component_by_row[row] = index;
+        }
+    }
+    let mut outgoing = vec![Vec::new(); components.len()];
+    let mut indegrees = vec![0; components.len()];
+    for (producer, consumers) in edges.iter().enumerate() {
+        let from = component_by_row[producer];
+        for &consumer in consumers {
+            let to = component_by_row[consumer];
+            if from != to && !outgoing[from].contains(&to) {
+                outgoing[from].push(to);
+                indegrees[to] += 1;
+            }
+        }
+    }
+    let mut ready = BTreeSet::new();
+    for (index, &degree) in indegrees.iter().enumerate() {
+        if degree == 0 {
+            ready.insert((components[index][0], index));
+        }
+    }
+    let mut ordered = Vec::with_capacity(components.len());
+    while let Some((_, index)) = ready.pop_first() {
+        for &next in &outgoing[index] {
+            indegrees[next] -= 1;
+            if indegrees[next] == 0 {
+                ready.insert((components[next][0], next));
+            }
+        }
+        ordered.push(std::mem::take(&mut components[index]));
+    }
+    ordered
 }
 
 /// How a register's value depends on the refresh row's own target solver-Y slot,
@@ -977,17 +1006,6 @@ fn required_program_position(
 
 fn reserve_refresh_vec_capacity<T>(
     values: &mut Vec<T>,
-    capacity: usize,
-    context: &'static str,
-    span: Option<rumoca_core::Span>,
-) -> Result<(), EvalSolveError> {
-    values
-        .try_reserve_exact(capacity)
-        .map_err(|_| refresh_plan_capacity_error(context, span))
-}
-
-fn reserve_refresh_deque_capacity<T>(
-    values: &mut VecDeque<T>,
     capacity: usize,
     context: &'static str,
     span: Option<rumoca_core::Span>,

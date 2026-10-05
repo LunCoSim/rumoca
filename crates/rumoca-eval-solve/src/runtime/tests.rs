@@ -1977,13 +1977,9 @@ fn reverse_implicit_residual_vjp_transposes_forward_jvp() {
     );
 }
 
-#[test]
-fn newton_backtracks_before_leaving_square_root_domain() {
+fn square_root_domain_model() -> solve::SolveModel {
     use solve::LinearOp::{Binary, Const, LoadY, StoreOutput, Unary};
     use solve::{BinaryOp, ComputeBlock, UnaryOp};
-    // a=sqrt(b), b=2-3*a has a positive root. The first GS sweep
-    // gives (.01,1.97). Its full Newton step makes b negative; a
-    // smaller step reaches the root without relaxing convergence.
     let mut model = solve::SolveModel::default();
     model.problem.solve_layout.algebraic_scalar_count = 2;
     model.problem.solve_layout.solver_maps.names = vec!["a".into(), "b".into()];
@@ -2044,6 +2040,14 @@ fn newton_backtracks_before_leaving_square_root_domain() {
         }],
     };
     model.initial_y = vec![0.01, 0.0001];
+    model
+}
+
+#[test]
+fn newton_backtracks_before_leaving_square_root_domain() {
+    // a=sqrt(b), b=2-3*a has a positive root. The first GS sweep
+    // gives (.01,1.97). A full Newton step makes b negative.
+    let model = square_root_domain_model();
     let runtime = SolveRuntime::new(&model).expect("valid square-root model");
     let values = runtime
         .full_solver_y(0.0, &[], &[], 1.0e-10, 4)
@@ -2156,4 +2160,96 @@ fn newton_retry_keeps_the_best_finite_sweep() {
         (values[1] / 1.0e8 - 3.0_f64.exp()).abs() < 1.0e-10,
         "{values:?}"
     );
+}
+
+#[test]
+fn feedback_solver_evaluates_one_way_outputs_after_the_cycle() {
+    use solve::LinearOp::{Binary, Const, LoadY, StoreOutput, Unary};
+    use solve::{BinaryOp, ComputeBlock, UnaryOp};
+    for (gain, scale) in [
+        (0.01, 1.0e8),
+        (0.1, 1.0e8),
+        (1.0, 1.0e8),
+        (30.0, 1.0e8),
+        (100.0, 1.0e8),
+        (10.0, 1.0e12),
+    ] {
+        let mut model = square_root_domain_model();
+        // A physical output can magnify harmless upstream roundoff. It must be
+        // refreshed from the accepted cycle without increasing equation tolerance.
+        let solve::ComputeNode::ScalarPrograms(scalar) =
+            &model.problem.continuous.implicit_rhs.nodes[0]
+        else {
+            panic!("square-root fixture must contain scalar programs");
+        };
+        let mut rows = scalar.programs.clone();
+        rows.push(vec![
+            LoadY { dst: 0, index: 0 },
+            Const {
+                dst: 1,
+                value: gain,
+            },
+            Binary {
+                dst: 2,
+                op: BinaryOp::Mul,
+                lhs: 0,
+                rhs: 1,
+            },
+            Unary {
+                dst: 3,
+                op: UnaryOp::Exp,
+                arg: 2,
+            },
+            Const {
+                dst: 4,
+                value: scale,
+            },
+            Binary {
+                dst: 5,
+                op: BinaryOp::Mul,
+                lhs: 3,
+                rhs: 4,
+            },
+            LoadY { dst: 6, index: 2 },
+            Binary {
+                dst: 7,
+                op: BinaryOp::Sub,
+                lhs: 6,
+                rhs: 5,
+            },
+            StoreOutput { src: 7 },
+        ]);
+        model.problem.continuous.implicit_rhs =
+            ComputeBlock::from_scalar_program_block(spanned_block(rows, "dependent_output.mo"));
+        model.problem.solve_layout.algebraic_scalar_count = 3;
+        model
+            .problem
+            .solve_layout
+            .solver_maps
+            .names
+            .push("dependent_output".into());
+        model
+            .problem
+            .continuous
+            .implicit_row_targets
+            .push(Some(solve::scalar_slot_y(2)));
+        model.problem.continuous.algebraic_projection_plan.blocks[0]
+            .rows
+            .push(2);
+        model.problem.continuous.algebraic_projection_plan.blocks[0]
+            .y_indices
+            .push(2);
+        model.initial_y.push(scale * (gain * 0.01_f64).exp());
+        let runtime = SolveRuntime::new(&model).expect("valid dependent-output model");
+        let values = runtime
+            .full_solver_y(0.0, &[], &[], 1.0e-10, 4)
+            .unwrap_or_else(|error| panic!("gain={gain} scale={scale}: {error}"));
+        let expected_a = (17.0_f64.sqrt() - 3.0) / 2.0;
+        assert!((values[0] - expected_a).abs() < 1.0e-10, "{values:?}");
+        let expected_output = scale * (gain * values[0]).exp();
+        assert!(
+            refresh_difference_converged(values[2] - expected_output, values[2], 1.0e-10),
+            "{values:?}"
+        );
+    }
 }

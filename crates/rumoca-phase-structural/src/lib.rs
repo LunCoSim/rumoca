@@ -19,7 +19,6 @@ pub mod projection_maps;
 pub mod report;
 pub mod runtime_defined;
 pub mod scalarize;
-mod tarjan;
 pub mod tearing;
 mod types;
 mod variable_scope;

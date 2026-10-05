@@ -272,11 +272,24 @@ impl SolveRuntime {
         if plan.rows.is_empty() {
             return Ok(());
         }
-        if !plan.iterative {
-            self.refresh_slots_once(&plan.rows, args.t, args.solver_y, args.params)?;
-            return Ok(());
+        for block in &plan.blocks {
+            let rows = &plan.rows[block.range.clone()];
+            if !block.iterative {
+                self.refresh_slots_once(rows, args.t, args.solver_y, args.params)?;
+                continue;
+            }
+            self.refresh_slots_iterative(
+                rows,
+                RefreshSlotArgs {
+                    t: args.t,
+                    solver_y: args.solver_y,
+                    params: args.params,
+                    tol: args.tol,
+                    max_iters: args.max_iters,
+                },
+            )?;
         }
-        self.refresh_slots_iterative(&plan.rows, args)
+        Ok(())
     }
 
     fn validate_refresh_plan(
