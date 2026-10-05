@@ -318,11 +318,13 @@ impl SolveRuntime {
             tol,
             max_iters,
         } = args;
-        // Keep a finite restart point before later Gauss-Seidel sweeps can
-        // diverge. After the first successful sweep, preserve its evaluated
-        // acyclic dependencies too: their initial guesses need not satisfy
-        // binding equations and may be invalid divisors in Newton's map.
+        // Keep the finite sweep with the smallest update for Newton restart.
+        // The first successful sweep also evaluates acyclic dependencies whose
+        // initial guesses may be invalid divisors. Later improving sweeps must
+        // replace it: discarding near-root progress can restart at a singular
+        // Jacobian even though a subsequent finite sweep reached the solution.
         let mut snapshot = self.refresh_target_snapshot(rows, solver_y)?;
+        let mut best_delta = f64::INFINITY;
         let mut last_max = RefreshIterationMax {
             delta: 0.0,
             target: None,
@@ -345,8 +347,9 @@ impl SolveRuntime {
                     return self.refresh_slots_newton(rows, &snapshot, t, solver_y, params, tol);
                 }
             }
-            if iter_idx == 0 {
+            if last_max.delta < best_delta {
                 snapshot = self.refresh_target_snapshot(rows, solver_y)?;
+                best_delta = last_max.delta;
             }
             self.trace_refresh_iteration(iter_idx, &last_max);
             if last_max.converged {

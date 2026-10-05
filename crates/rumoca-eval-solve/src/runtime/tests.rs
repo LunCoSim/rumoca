@@ -2055,3 +2055,68 @@ fn newton_backtracks_before_leaving_square_root_domain() {
         "{values:?}"
     );
 }
+
+#[test]
+fn newton_retry_keeps_the_best_finite_sweep() {
+    use solve::LinearOp::{Binary, Const, LoadY, StoreOutput};
+    use solve::{BinaryOp, ComputeBlock};
+    // MLS Appendix B: solve x = -x^2 + 5*x - 3 simultaneously.
+    // The first sweep lands at x=2, where the residual's derivative is zero.
+    // The second reaches x=3, a root. Restarting at the first sweep throws
+    // away that progress and exhausts the bounded Newton line search.
+    let mut model = solve::SolveModel::default();
+    model.problem.solve_layout.algebraic_scalar_count = 1;
+    model.problem.solve_layout.solver_maps.names = vec!["x".into()];
+    let row = vec![
+        LoadY { dst: 0, index: 0 },
+        Binary {
+            dst: 1,
+            op: BinaryOp::Mul,
+            lhs: 0,
+            rhs: 0,
+        },
+        Const { dst: 2, value: 5.0 },
+        Binary {
+            dst: 3,
+            op: BinaryOp::Mul,
+            lhs: 0,
+            rhs: 2,
+        },
+        Binary {
+            dst: 4,
+            op: BinaryOp::Sub,
+            lhs: 3,
+            rhs: 1,
+        },
+        Const { dst: 5, value: 3.0 },
+        Binary {
+            dst: 6,
+            op: BinaryOp::Sub,
+            lhs: 4,
+            rhs: 5,
+        },
+        Binary {
+            dst: 7,
+            op: BinaryOp::Sub,
+            lhs: 0,
+            rhs: 6,
+        },
+        StoreOutput { src: 7 },
+    ];
+    model.problem.continuous.implicit_rhs =
+        ComputeBlock::from_scalar_program_block(spanned_block(vec![row], "best_sweep.mo"));
+    model.problem.continuous.implicit_row_targets = vec![Some(solve::scalar_slot_y(0))];
+    model.problem.continuous.algebraic_projection_plan = solve::AlgebraicProjectionPlan {
+        blocks: vec![solve::AlgebraicProjectionBlock {
+            rows: vec![0],
+            y_indices: vec![0],
+            causal_steps: Vec::new(),
+        }],
+    };
+    model.initial_y = vec![(5.0 + 5.0_f64.sqrt()) / 2.0];
+    let runtime = SolveRuntime::new(&model).expect("valid polynomial model");
+    let values = runtime
+        .full_solver_y(0.0, &[], &[], 1.0e-10, 2)
+        .expect("Newton must retain the later finite sweep near the root");
+    assert!((values[0] - 3.0).abs() < 1.0e-10, "{values:?}");
+}
