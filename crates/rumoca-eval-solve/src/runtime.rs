@@ -53,6 +53,7 @@ struct RefreshSlotArgs<'a> {
 
 struct RefreshIterationMax {
     delta: f64,
+    scaled_delta: f64,
     target: Option<(usize, usize, f64)>,
     converged: bool,
 }
@@ -318,15 +319,17 @@ impl SolveRuntime {
             tol,
             max_iters,
         } = args;
-        // Keep the finite sweep with the smallest update for Newton restart.
+        // Keep the finite sweep with the smallest scaled update for Newton
+        // restart; physical units must not dominate the restart ranking.
         // The first successful sweep also evaluates acyclic dependencies whose
         // initial guesses may be invalid divisors. Later improving sweeps must
         // replace it: discarding near-root progress can restart at a singular
         // Jacobian even though a subsequent finite sweep reached the solution.
         let mut snapshot = self.refresh_target_snapshot(rows, solver_y)?;
-        let mut best_delta = f64::INFINITY;
+        let mut best_scaled_delta = f64::INFINITY;
         let mut last_max = RefreshIterationMax {
             delta: 0.0,
+            scaled_delta: 0.0,
             target: None,
             converged: false,
         };
@@ -347,9 +350,9 @@ impl SolveRuntime {
                     return self.refresh_slots_newton(rows, &snapshot, t, solver_y, params, tol);
                 }
             }
-            if last_max.delta < best_delta {
+            if last_max.scaled_delta < best_scaled_delta {
                 snapshot = self.refresh_target_snapshot(rows, solver_y)?;
-                best_delta = last_max.delta;
+                best_scaled_delta = last_max.scaled_delta;
             }
             self.trace_refresh_iteration(iter_idx, &last_max);
             if last_max.converged {
@@ -398,6 +401,7 @@ impl SolveRuntime {
                 0,
                 &RefreshIterationMax {
                     delta: f64::INFINITY,
+                    scaled_delta: f64::INFINITY,
                     target: None,
                     converged: false,
                 },
@@ -409,6 +413,7 @@ impl SolveRuntime {
         x.extend(snapshot);
         let mut last_max = RefreshIterationMax {
             delta: 0.0,
+            scaled_delta: 0.0,
             target: None,
             converged: false,
         };
@@ -429,6 +434,7 @@ impl SolveRuntime {
             };
             last_max = RefreshIterationMax {
                 delta: difference.abs(),
+                scaled_delta: difference.abs(),
                 target: Some((rows[index].target_index, rows[index].row_idx, x[index])),
                 converged: false,
             };
@@ -443,9 +449,11 @@ impl SolveRuntime {
             };
             let mut augmented = self.refresh_newton_augmented(probe, solver_y)?;
             if crate::linear_solve::gaussian_eliminate(&mut augmented).is_none() {
+                tracing::debug!(target: "rumoca_eval_solve::refresh", "newton Jacobian is singular");
                 return Err(self.refresh_newton_failure(iter_idx + 1, &last_max));
             }
             let Some(candidate) = self.backtrack_newton_step(probe, &augmented, solver_y)? else {
+                tracing::debug!(target: "rumoca_eval_solve::refresh", "newton line search exhausted");
                 return Err(self.refresh_newton_failure(iter_idx + 1, &last_max));
             };
             x = candidate;
@@ -584,6 +592,7 @@ impl SolveRuntime {
         tol: f64,
     ) -> Result<RefreshIterationMax, RuntimeSolveError> {
         let mut max_delta: f64 = 0.0;
+        let mut max_scaled_delta: f64 = 0.0;
         let mut max_target = None;
         let mut converged = true;
         for refresh_row in rows {
@@ -591,6 +600,8 @@ impl SolveRuntime {
             let index = refresh_row.target_index;
             let value = self.eval_refresh_row(refresh_row, t, solver_y, params)?;
             let delta = (solver_y[index] - value).abs();
+            let scale = 1.0_f64.max(solver_y[index].abs()).max(value.abs());
+            max_scaled_delta = max_scaled_delta.max(delta / scale);
             converged &= refresh_difference_converged(delta, value, tol);
             if delta > max_delta {
                 max_delta = delta;
@@ -600,6 +611,7 @@ impl SolveRuntime {
         }
         Ok(RefreshIterationMax {
             delta: max_delta,
+            scaled_delta: max_scaled_delta,
             target: max_target,
             converged,
         })
