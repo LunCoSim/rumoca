@@ -258,27 +258,6 @@ pub(crate) fn count_interface_flows(flat: &Model) -> usize {
     let normalized_top_level_connectors =
         normalized_top_level_names(flat.top_level_connectors.iter());
 
-    // Count Connection-origin equations that involve stream variables.
-    // These equations (e.g., h_outflow_1 = h_outflow_2) are already in f_x,
-    // so each one reduces the number of "phantom" interface equations needed.
-    // For N stream variables in a connection set, N-1 connection equations
-    // are generated, leaving exactly 1 interface equation needed per set.
-    let stream_connection_eq_count: usize = flat
-        .equations
-        .iter()
-        .filter(|eq| {
-            if let EquationOrigin::Connection { lhs, .. } = &eq.origin {
-                // Check if the LHS variable is a stream variable
-                flat.variables
-                    .get(&VarName::from(lhs.as_str()))
-                    .is_some_and(|v| v.stream)
-            } else {
-                false
-            }
-        })
-        .map(|eq| eq.scalar_count)
-        .sum();
-
     let mut count: usize = 0;
     for (name, var) in &flat.variables {
         // Count flow AND stream variables in top-level public connectors (MLS §4.7)
@@ -295,11 +274,7 @@ pub(crate) fn count_interface_flows(flat: &Model) -> usize {
         }
     }
 
-    // Subtract stream connection equations already in f_x to avoid double-counting.
-    // The raw count includes all connected stream vars, but N-1 of them already
-    // have connection equations. Only the remaining 1 per connection set needs
-    // an interface equation.
-    count.saturating_sub(stream_connection_eq_count)
+    count
 }
 
 fn interface_scalar_size(dims: &[i64]) -> usize {

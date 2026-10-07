@@ -26,12 +26,11 @@ use rumoca_ir_flat as flat;
 use rustc_hash::FxHashMap;
 
 use crate::errors::FlattenError;
-use crate::path_utils::{
-    first_path_segment_without_index, segments as path_segments_of, strip_array_index,
-};
+use crate::path_utils::{segments as path_segments_of, strip_array_index};
 
 mod equation_generation;
 mod path_index;
+mod streams;
 use equation_generation::*;
 pub(crate) use equation_generation::{connection_involves_disabled, process_connections};
 use path_index::*;
@@ -344,7 +343,6 @@ struct ConnectionSet {
 enum ConnectionKind {
     Flow,
     Potential,
-    Stream,
 }
 
 /// Union-Find data structure for building connection sets.
@@ -1331,149 +1329,6 @@ fn expand_connector_connection(
     }
 }
 
-fn collect_existing_lhs_vars(
-    flat: &flat::Model,
-) -> std::collections::HashSet<rumoca_core::VarName> {
-    let mut lhs_vars = std::collections::HashSet::new();
-    for eq in &flat.equations {
-        let rumoca_core::Expression::Binary { op, lhs, .. } = &eq.residual else {
-            continue;
-        };
-        if !matches!(op, rumoca_core::OpBinary::Sub) {
-            continue;
-        }
-        if let rumoca_core::Expression::VarRef { name, .. } = lhs.as_ref() {
-            lhs_vars.insert(name.var_name().clone());
-        }
-    }
-    lhs_vars
-}
-
-fn collect_existing_var_refs(
-    flat: &flat::Model,
-) -> std::collections::HashSet<rumoca_core::VarName> {
-    let mut refs = std::collections::HashSet::new();
-    for eq in &flat.equations {
-        eq.residual.collect_var_refs(&mut refs);
-    }
-    refs
-}
-
-fn stream_var_present_in_set(
-    flat: &flat::Model,
-    var: &rumoca_core::VarName,
-    vars: &std::collections::HashSet<rumoca_core::VarName>,
-) -> bool {
-    if vars.contains(var) {
-        return true;
-    }
-    if let Some(base) = subscripted_base_var(var, flat)
-        && vars.contains(&base)
-    {
-        return true;
-    }
-    if let Some(stripped) = strip_embedded_array_indices(var.as_str())
-        && vars.contains(&rumoca_core::VarName::new(stripped))
-    {
-        return true;
-    }
-    false
-}
-
-fn stream_set_touches_top_level_connector(
-    flat: &flat::Model,
-    vars: &[rumoca_core::VarName],
-) -> bool {
-    vars.iter().any(|var| {
-        first_path_segment_without_index(var.as_str())
-            .is_some_and(|prefix| flat.top_level_connectors.contains(prefix))
-    })
-}
-
-fn classify_stream_vars_by_presence(
-    flat: &flat::Model,
-    vars: Vec<rumoca_core::VarName>,
-    present: &std::collections::HashSet<rumoca_core::VarName>,
-) -> (Vec<rumoca_core::VarName>, Vec<rumoca_core::VarName>) {
-    let mut defined = Vec::new();
-    let mut undefined = Vec::new();
-    for var in vars {
-        if stream_var_present_in_set(flat, &var, present) {
-            defined.push(var);
-        } else {
-            undefined.push(var);
-        }
-    }
-    (defined, undefined)
-}
-
-fn append_stream_connection_sets_for_group(
-    flat: &flat::Model,
-    vars: Vec<rumoca_core::VarName>,
-    existing_lhs_vars: &std::collections::HashSet<rumoca_core::VarName>,
-    existing_var_refs: &mut Option<std::collections::HashSet<rumoca_core::VarName>>,
-    result: &mut Vec<ConnectionSet>,
-    span: rumoca_core::Span,
-) {
-    if vars.len() < 2 {
-        return;
-    }
-
-    let touches_top_level = stream_set_touches_top_level_connector(flat, &vars);
-    let (mut defined_streams, mut undefined_streams) =
-        classify_stream_vars_by_presence(flat, vars, existing_lhs_vars);
-    if undefined_streams.is_empty() {
-        return;
-    }
-
-    undefined_streams.sort_by(|a, b| compare_path_index_order(a.as_str(), b.as_str()));
-    defined_streams.sort_by(|a, b| compare_path_index_order(a.as_str(), b.as_str()));
-
-    if touches_top_level {
-        if undefined_streams.len() >= 2 {
-            result.push(ConnectionSet {
-                variables: undefined_streams,
-                kind: ConnectionKind::Stream,
-                scope: String::new(),
-                span,
-            });
-        }
-        return;
-    }
-
-    let refs = existing_var_refs.get_or_insert_with(|| collect_existing_var_refs(flat));
-    let (referenced_streams, mut still_undefined) =
-        classify_stream_vars_by_presence(flat, undefined_streams, refs);
-    if still_undefined.is_empty() {
-        return;
-    }
-
-    defined_streams.extend(referenced_streams);
-    defined_streams.sort_by(|a, b| compare_path_index_order(a.as_str(), b.as_str()));
-    still_undefined.sort_by(|a, b| compare_path_index_order(a.as_str(), b.as_str()));
-
-    if let Some(anchor) = defined_streams.first().cloned() {
-        for missing in still_undefined {
-            result.push(ConnectionSet {
-                variables: vec![missing, anchor.clone()],
-                kind: ConnectionKind::Stream,
-                scope: String::new(),
-                span,
-            });
-        }
-        return;
-    }
-
-    if still_undefined.len() >= 2 {
-        result.push(ConnectionSet {
-            variables: still_undefined,
-            kind: ConnectionKind::Stream,
-            scope: String::new(),
-            span,
-        });
-    }
-}
-
 /// Build connection sets from individual connections.
 ///
 /// Uses union-find to group connected variables transitively.
@@ -1491,18 +1346,17 @@ fn append_stream_connection_sets_for_group(
 ///
 /// Potential (equality) connection sets use a global union-find since
 /// N-1 equality equations give the same count whether split or merged.
-/// Connection sets plus the raw stream groups (the semantic stream
-/// connection sets used for the MLS §15.2 inStream rewrite, independent of
-/// the balance-oriented stream ConnectionSets).
+/// Stream connection sets are per scope as well: MLS §15.2 distinguishes
+/// inside and outside connectors relative to the scope of each connect().
 fn build_connection_sets(
     connections: &[&ast::InstanceConnection],
     flat: &flat::Model,
     prefix_children: &FxHashMap<String, Vec<rumoca_core::VarName>>,
     var_index: &ConnectionVarIndex,
-) -> Result<(Vec<ConnectionSet>, Vec<Vec<rumoca_core::VarName>>), FlattenError> {
+) -> Result<(Vec<ConnectionSet>, Vec<streams::StreamConnectionSet>), FlattenError> {
     let mut potential_uf = UnionFind::new();
-    let mut stream_uf = UnionFind::new();
     let mut result = Vec::new();
+    let mut stream_sets = Vec::new();
 
     // SPEC_0008: every generated connection equation carries real provenance.
     // Track direct connect() spans first; scalarized array members that do not
@@ -1540,6 +1394,7 @@ fn build_connection_sets(
     // Process each scope separately for flow pairs, globally for potential
     for (scope, scope_conns) in &connections_by_scope {
         let mut flow_pairs: Vec<(rumoca_core::VarName, rumoca_core::VarName)> = Vec::new();
+        let mut stream_uf = UnionFind::new();
         for conn in scope_conns {
             process_connection(
                 conn,
@@ -1568,6 +1423,14 @@ fn build_connection_sets(
                 });
             }
         }
+        for (_root, members) in stream_uf.get_sets() {
+            let span = representative_connection_span(&members, &var_first_span, flat)?;
+            stream_sets.push(streams::StreamConnectionSet {
+                scope: (*scope).to_string(),
+                members,
+                span,
+            });
+        }
     }
 
     // Extract potential connection sets (global — equality equations count
@@ -1584,26 +1447,7 @@ fn build_connection_sets(
         }
     }
 
-    let stream_sets = stream_uf.get_sets();
-    let mut raw_stream_groups: Vec<Vec<rumoca_core::VarName>> = Vec::new();
-    if !stream_sets.is_empty() {
-        let existing_lhs_vars = collect_existing_lhs_vars(flat);
-        let mut existing_var_refs: Option<std::collections::HashSet<rumoca_core::VarName>> = None;
-        for (_root, vars) in stream_sets {
-            raw_stream_groups.push(vars.clone());
-            let span = representative_connection_span(&vars, &var_first_span, flat)?;
-            append_stream_connection_sets_for_group(
-                flat,
-                vars,
-                &existing_lhs_vars,
-                &mut existing_var_refs,
-                &mut result,
-                span,
-            );
-        }
-    }
-
-    Ok((result, raw_stream_groups))
+    Ok((result, stream_sets))
 }
 
 fn representative_connection_span(

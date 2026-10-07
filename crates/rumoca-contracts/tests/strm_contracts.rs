@@ -564,3 +564,147 @@ fn strm_007_array_instream_elementwise_peer_values() {
     );
     assert_eq!(trace.final_value("v1.h_in[2]"), 5.0);
 }
+
+// =============================================================================
+// STRM-004 / MLS §15.2: hierarchical and N-way stream connection sets
+// =============================================================================
+
+const STREAM_PARTS: &str = r#"
+    connector C
+        Real p;
+        flow Real m_flow;
+        stream Real h;
+    end C;
+    model Vol
+        C port;
+        parameter Real h_out = 2;
+        Real h_in;
+        Real h_actual;
+    equation
+        port.h = h_out;
+        h_in = inStream(port.h);
+        h_actual = actualStream(port.h);
+    end Vol;
+    model Wrapped
+        C port;
+        Vol v;
+    equation
+        connect(port, v.port);
+    end Wrapped;
+"#;
+
+fn stream_model(body: &str) -> String {
+    format!("model M\n{STREAM_PARTS}\n{body}\nend M;\n")
+}
+
+#[test]
+fn strm_004_hierarchical_outside_connector_is_balanced_and_transparent() {
+    // `w.port` is an outside connector of `w`: STRM-004 gives its stream
+    // variable one equation, and inStream crosses the hierarchy in both
+    // directions without changing the carried value.
+    let source = stream_model(
+        r#"
+        Vol s(h_out = 7);
+        Wrapped w(v(h_out = 3));
+        Real t(start = 0, fixed = true);
+    equation
+        der(t) = 1;
+        connect(s.port, w.port);
+        s.port.p = 1;
+        w.v.port.m_flow = 2;
+    "#,
+    );
+    rumoca_contracts::test_support::expect_balanced(&source, "M");
+    let trace = rumoca_contracts::test_support::simulate_model(&source, "M", 1.0);
+    assert_eq!(trace.final_value("w.v.h_in"), 7.0);
+    assert_eq!(trace.final_value("s.h_in"), 3.0);
+    assert_eq!(trace.final_value("w.port.h"), 3.0);
+}
+
+#[test]
+fn strm_n_way_instream_mixes_by_outflow() {
+    // v1 consumes 3 kg/s supplied 1 by v2 and 2 by v3, so its inflowing
+    // stream is the outflow-weighted mixture (1*4 + 2*10)/3 = 8.
+    let source = stream_model(
+        r#"
+        Vol v1(h_out = 2);
+        Vol v2(h_out = 4);
+        Vol v3(h_out = 10);
+        Real t(start = 0, fixed = true);
+    equation
+        der(t) = 1;
+        connect(v1.port, v2.port);
+        connect(v1.port, v3.port);
+        v1.port.p = 1;
+        v1.port.m_flow = 3;
+        v2.port.m_flow = -1;
+    "#,
+    );
+    rumoca_contracts::test_support::expect_balanced(&source, "M");
+    let trace = rumoca_contracts::test_support::simulate_model(&source, "M", 1.0);
+    assert!((trace.final_value("v1.h_in") - 8.0).abs() < 1.0e-9);
+    // v2 receives what leaves the node towards it: only v3 supplies the node
+    // besides v2 itself, so its inflowing stream is v3's enthalpy.
+    assert!((trace.final_value("v2.h_in") - 10.0).abs() < 1.0e-6);
+}
+
+#[test]
+fn strm_shared_source_feeds_wrapped_consumers() {
+    // One source port feeds three wrapped consumers: every consumer receives
+    // the source enthalpy through its outside connector.
+    let source = stream_model(
+        r#"
+        Vol tank(h_out = 5);
+        Wrapped e1(v(h_out = 1));
+        Wrapped e2(v(h_out = 1));
+        Wrapped e3(v(h_out = 1));
+        Real t(start = 0, fixed = true);
+    equation
+        der(t) = 1;
+        connect(tank.port, e1.port);
+        connect(tank.port, e2.port);
+        connect(tank.port, e3.port);
+        tank.port.p = 1;
+        e1.v.port.m_flow = 1;
+        e2.v.port.m_flow = 2;
+        e3.v.port.m_flow = 3;
+    "#,
+    );
+    rumoca_contracts::test_support::expect_balanced(&source, "M");
+    let trace = rumoca_contracts::test_support::simulate_model(&source, "M", 1.0);
+    for consumer in ["e1", "e2", "e3"] {
+        assert!(
+            (trace.final_value(&format!("{consumer}.v.h_in")) - 5.0).abs() < 1.0e-6,
+            "{consumer} must receive the source enthalpy"
+        );
+    }
+}
+
+#[test]
+fn strm_010_actual_stream_follows_flow_direction() {
+    // actualStream(v) = if m_flow > 0 then inStream(v) else v (MLS §15.3).
+    let source = stream_model(
+        r#"
+        Vol v1(h_out = 2);
+        Vol v2(h_out = 4);
+        Real t(start = 0, fixed = true);
+    equation
+        der(t) = 1;
+        connect(v1.port, v2.port);
+        v1.port.p = 1;
+        v1.port.m_flow = time - 1;
+    "#,
+    );
+    let trace = rumoca_contracts::test_support::simulate_model(&source, "M", 2.0);
+    let actual = trace.channel("v1.h_actual");
+    assert_eq!(
+        actual.first().copied(),
+        Some(2.0),
+        "outflow carries own stream"
+    );
+    assert_eq!(
+        actual.last().copied(),
+        Some(4.0),
+        "inflow carries the peer stream"
+    );
+}
