@@ -1,6 +1,50 @@
 use super::*;
 
 #[test]
+fn external_input_binding_initializes_slot_while_internal_binding_defines_equation() {
+    // Runtime input slots use their declaration binding as an initial value;
+    // internal component inputs retain their defining binding equations.
+    let mut flat = Model::new();
+    for (name, value) in [("u", 2.0), ("component.u", 3.0)] {
+        flat.add_variable(
+            VarName::new(name),
+            crate::test_support::with_component_ref(flat::Variable {
+                name: VarName::new(name),
+                causality: rumoca_core::Causality::Input(rumoca_core::Token::default()),
+                is_primitive: true,
+                binding: Some(rumoca_core::Expression::Literal {
+                    value: Literal::Real(value),
+                    span: crate::test_support::test_span(),
+                }),
+                ..flat::Variable::empty_with_span(crate::test_support::test_span())
+            }),
+        );
+    }
+    let dae = to_dae(&flat).expect("bound internal input supplies one equation");
+    let input = dae
+        .variables
+        .inputs
+        .get(&VarName::new("u"))
+        .expect("external bound input retains its runtime slot");
+    assert!(
+        matches!(input.start.as_ref(), Some(rumoca_core::Expression::Literal {
+        value: Literal::Real(value), ..
+    }) if *value == 2.0)
+    );
+    assert!(
+        dae.variables
+            .algebraics
+            .contains_key(&VarName::new("component.u"))
+    );
+    assert_eq!(
+        dae.continuous.equations.len(),
+        1,
+        "only the internal binding is an equation"
+    );
+    assert_eq!(crate::balance::balance(&dae).expect("valid balance"), 0);
+}
+
+#[test]
 fn test_should_skip_binding_for_explicit_var_keeps_record_prefix_unknown_binding() {
     let name = VarName::new("core.V_m.re");
     let var = flat::Variable {

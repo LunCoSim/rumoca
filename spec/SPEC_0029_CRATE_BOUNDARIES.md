@@ -87,6 +87,9 @@ implementation.
 | `expr_refers_to_var` | `rumoca-ir-dae::expr_query` | Same single-source rule. |
 | `expr_contains_der_of` | `rumoca-ir-dae::expr_query` | Same single-source rule. |
 | Solver runtime time-event helpers (`event_right_limit_time`, scheduled/periodic time-event filtering, dynamic time-event parameter lookup) | `rumoca-solver::timeline` | Concrete solver backends call the shared runtime policy instead of copying time-grid rules. |
+| Solver output-grid admission (`output_sample_count`) | `rumoca-solver::timeline` | Count the same endpoint-inclusive output grid without allocating it, stopping when the admitted sample capacity is exceeded. |
+| Scoped solver cancellation (`SolverCancellationGuard`, `solver_cancellation_requested`) | `rumoca-solver::runtime::cancellation` | A host installs one thread-local cancellation flag for an admitted solve; evaluators observe it cooperatively and nested scopes restore their caller. |
+| Retained output admission (`SolverOutputBudget`, `SolverOutputBudgetGuard`, `validate_solver_output_dimensions`) | `rumoca-solver::runtime::output_budget` | Shared recorders admit output growth before mutation, including the time column, and report overflow or exhaustion as a solve error. Guards cannot move threads. |
 | Solver runtime event-boundary helpers (`process_runtime_event_boundary`, `runtime_event_horizon`, `runtime_root_event_application_time`, `RuntimeEventBoundaryHandler`) | `rumoca-solver::runtime::event` | Concrete solver backends provide callback hooks for backend-local row application/state reset while shared Modelica event-boundary policy stays in `rumoca-solver`. |
 | Solver zero-state orchestration helpers (`run_no_state_output_schedule`, `NoStateOrchestrationBackend`, `NoStateEventStep`) | `rumoca-solver::runtime::no_state` | Concrete solver backends provide row/root/event callbacks while shared no-state output/event-loop policy stays in `rumoca-solver`. |
 | Solver pre-parameter snapshot helpers (`write_pre_params_from_sources`, `update_slot`, `commit_pre_params_after_event`) | `rumoca-solver::runtime::pre_params` | Concrete solver backends call the shared pre-state write policy instead of copying `pre(...)` snapshot mechanics. |
@@ -199,6 +202,7 @@ LSP, WASM, and CLI cannot drift into separate cache/invalidation policies.
 | Rule | Where | Why |
 |---|---|---|
 | Source-root membership, status, cache hydration live here | `rumoca-compile` | Single source of truth for project membership |
+| Strict DAE compile source provenance (`CompiledSourceClosure`, `CompiledSourceContribution`) | `rumoca-compile::compile` | The strict compile records the requested target and participating document/source-set identities while its admitted source roots remain available. Clients consume this result instead of reconstructing a closure from all loaded documents. |
 | Incremental class graph + namespace/package views live here | `rumoca-compile` | One incremental story across all clients |
 | Workspace roots and imported roots are semantically identical | `rumoca-compile` | Retention/restore differ; semantics do not |
 | Clients MUST NOT implement their own invalidation policy or rebuild scope | tool-lsp / bind-wasm / CLI | Avoid divergent cache stories |

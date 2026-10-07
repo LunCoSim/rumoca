@@ -128,6 +128,11 @@ B partitions. Backend products such as mass matrices, Jacobians, BLT orderings,
 tearing choices, state-selection reports, and scalarized variants belong in
 structural analysis results or Solve artifacts.
 
+Structural elimination must retain an output's producer when substituting that
+output would expose a state derivative. Runtime observations read variable slots;
+`der(state)` is not such a slot. Ordinary output aliases to runtime inputs or
+other produced variables remain eligible for elimination and reconstruction.
+
 `conditions.relations` owns MLS Appendix B relation surfaces. Runtime metadata
 passes must not rediscover roots from continuous equations. Non-Appendix-B
 runtime surfaces, such as numeric roots from `abs(...)` or `sign(...)`, belong
@@ -141,6 +146,7 @@ has the same meaning as the default. Incompatible schema changes bump
 
 | Rule | Where | Why |
 |---|---|---|
+| External unconnected input declaration bindings initialize their DAE input slots; internal or connected input bindings retain equation ownership | `rumoca-phase-dae` input classification and binding conversion | A runtime-supplied external value remains in `DaeVariables.inputs` and is not simultaneously constrained by a residual equation; the authored binding supplies its initial value. |
 | No source temporal operators (`pre`, `edge`, `change`, `sample`, `previous`) survive in f_x, f_z, f_m, f_c, relations, or initialization equations | DAE lowering rewrites them into Appendix B constructs: explicit `__pre__.*` inputs, relation/c variables, scheduled events, clock metadata, and ordinary equations over `v` | MLS Appendix B states the DAE as functions over `v` and `relation(v)`; source temporal operators are not computable DAE/Solve graph nodes |
 | No `der()` on RHS | derivatives flow via `dae.states` + equation structure | Inline `der()` would hide state identity |
 | No `initial()` in f_x/f_z/f_m/f_c | initial phase is handled separately | Avoids mixing initialization into runtime equations |

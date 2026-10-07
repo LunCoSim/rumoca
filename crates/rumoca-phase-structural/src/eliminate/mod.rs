@@ -687,10 +687,9 @@ fn choose_solvable_unknown_for_elimination(
             continue;
         }
         let is_output = output_partition_contains_unknown(dae, candidate);
-        // Skip equations with state derivatives — unless the candidate is an
-        // output that forms a direct alias (e.g. `output y = der(x)`), which
-        // can be safely eliminated.
-        if has_state_derivative && !is_output {
+        // A state derivative is not a runtime observation slot. Retain its
+        // output producer instead of reconstructing an output as der(state).
+        if has_state_derivative {
             continue;
         }
         // Try the simple top-level Sub pattern first; fall back to the additive
@@ -1138,7 +1137,7 @@ fn scalar_blt_solution(
     let eq_idx = equation.0;
     let is_output = output_partition_contains_unknown(dae, &var_name);
     let has_state_derivative = equation_has_state_derivative(dae, eq_idx, state_derivative_matcher);
-    if has_state_derivative && !is_output {
+    if has_state_derivative {
         return Ok(None);
     }
 

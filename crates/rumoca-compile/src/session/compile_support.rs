@@ -551,6 +551,7 @@ fn dae_compilation_result_from_artifact(
     let balance_detail = rumoca_phase_dae::balance_detail(&artifact.dae)?;
 
     Ok(DaeCompilationResult {
+        source_closure: None,
         flat: artifact.flat,
         dae: artifact.dae,
         source_map: Some(source_map),

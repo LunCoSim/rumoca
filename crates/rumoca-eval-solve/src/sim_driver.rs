@@ -226,6 +226,7 @@ pub fn simulate_state_targets<St: SolverAdvanceBackend + ?Sized>(
     };
 
     for &target in times {
+        check_cancellation()?;
         if state
             .recorded_times
             .last()
@@ -235,6 +236,7 @@ pub fn simulate_state_targets<St: SolverAdvanceBackend + ?Sized>(
         }
         let tol = opts.atol.max(1.0e-12);
         while target > *state.current_t + tol {
+            check_cancellation()?;
             match resolve_pending_root(
                 &mut pending_root_t,
                 make_ctx(),
@@ -644,6 +646,7 @@ fn advance_to_target_once<St: SolverAdvanceBackend + ?Sized>(
     backend: &mut St,
     deferred_root: &mut Option<f64>,
 ) -> Result<bool, SimDriverError> {
+    check_cancellation()?;
     if event_stop.is_some() {
         return advance_to_scheduled_stop(ctx, state, target, backend);
     }
@@ -670,6 +673,7 @@ fn advance_to_scheduled_stop<St: SolverAdvanceBackend + ?Sized>(
     }
     backend.set_stop_time(target)?;
     loop {
+        check_cancellation()?;
         let outcome = match backend.step() {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -718,6 +722,7 @@ fn advance_output_interval<St: SolverAdvanceBackend + ?Sized>(
         return advance_output_interval_clamped(ctx, state, target, backend);
     }
     loop {
+        check_cancellation()?;
         if backend.time() >= target {
             let y_at_target = backend.interpolate(target)?;
             *state.current_t = target;
@@ -779,6 +784,7 @@ fn advance_output_interval_clamped<St: SolverAdvanceBackend + ?Sized>(
     }
     backend.set_stop_time(target)?;
     loop {
+        check_cancellation()?;
         let outcome = match backend.step() {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -889,4 +895,13 @@ fn trace_step_event(kind: &str, solver_t: f64, root_t: Option<f64>) {
         return;
     }
     tracing::debug!(target: EVENT_TRACE_TARGET, "{kind} solver_t={solver_t:.12} root_t={root_t:?}");
+}
+
+fn check_cancellation() -> Result<(), SimDriverError> {
+    if rumoca_solver::solver_cancellation_requested() {
+        return Err(SimDriverError::Runtime(RuntimeSolveError::solve_ir(
+            "simulation cancelled",
+        )));
+    }
+    Ok(())
 }

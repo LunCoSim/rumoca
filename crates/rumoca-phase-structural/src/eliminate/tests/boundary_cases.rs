@@ -363,8 +363,9 @@ fn test_boundary_skips_ode_equations() {
 }
 
 #[test]
-fn test_boundary_eliminates_derivative_dependent_output_alias() {
-    // Keep true ODE equation and eliminate derivative-dependent output alias.
+fn test_boundary_keeps_output_used_as_state_derivative() {
+    // The aggregate output has its own runtime producer. Replacing it with
+    // der(x) would leave observations without an evaluable variable slot.
     let mut dae = Dae::new();
 
     let mut var_x = test_dae_variable("x");
@@ -376,8 +377,13 @@ fn test_boundary_eliminates_derivative_dependent_output_alias() {
     dae.variables
         .outputs
         .insert(VarName::new("y"), test_dae_variable("y"));
+    for name in ["u", "v"] {
+        dae.variables
+            .inputs
+            .insert(VarName::new(name), test_dae_variable(name));
+    }
 
-    // ODE: 0 = der(x) - 1.0
+    // ODE: 0 = der(x) - y
     dae.continuous.equations.push(dae::Equation {
         lhs: None,
         rhs: Expression::Binary {
@@ -387,7 +393,7 @@ fn test_boundary_eliminates_derivative_dependent_output_alias() {
                 args: vec![var_ref("x")],
                 span: rumoca_core::Span::DUMMY,
             }),
-            rhs: Box::new(lit(1.0)),
+            rhs: Box::new(var_ref("y")),
             span: rumoca_core::Span::DUMMY,
         },
         span: Span::DUMMY,
@@ -395,30 +401,36 @@ fn test_boundary_eliminates_derivative_dependent_output_alias() {
         scalar_count: 1,
     });
 
-    // Alias output: 0 = y - der(x)
+    // Aggregate output: 0 = y - (u + v)
     dae.continuous.equations.push(dae::Equation {
         lhs: None,
         rhs: Expression::Binary {
             op: sub_op(),
             lhs: Box::new(var_ref("y")),
-            rhs: Box::new(Expression::BuiltinCall {
-                function: BuiltinFunction::Der,
-                args: vec![var_ref("x")],
+            rhs: Box::new(Expression::Binary {
+                op: OpBinary::Add,
+                lhs: Box::new(var_ref("u")),
+                rhs: Box::new(var_ref("v")),
                 span: rumoca_core::Span::DUMMY,
             }),
             span: rumoca_core::Span::DUMMY,
         },
         span: Span::DUMMY,
-        origin: "y_alias".to_string(),
+        origin: "aggregate_output".to_string(),
         scalar_count: 1,
     });
 
     let result = eliminate_trivial(&mut dae).expect("structural elimination should succeed");
-    assert_eq!(result.n_eliminated, 1);
-    assert_eq!(result.substitutions.len(), 1);
-    assert_eq!(result.substitutions[0].var_name.as_str(), "y");
-    assert_eq!(dae.continuous.equations.len(), 1);
-    assert!(!dae.variables.outputs.contains_key(&VarName::new("y")));
+    assert_eq!(result.n_eliminated, 0);
+    assert!(result.substitutions.is_empty());
+    assert_eq!(dae.continuous.equations.len(), 2);
+    assert!(dae.variables.outputs.contains_key(&VarName::new("y")));
+    assert!(
+        dae.continuous
+            .equations
+            .iter()
+            .any(|eq| eq.origin == "aggregate_output")
+    );
 }
 
 #[test]

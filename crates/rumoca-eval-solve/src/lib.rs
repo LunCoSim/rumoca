@@ -92,6 +92,7 @@ type BlockEvalStatsMap = BTreeMap<(&'static str, usize), BlockEvalStats>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalSolveError {
+    Cancelled,
     ExternalTable {
         operation: &'static str,
         table_id: f64,
@@ -237,6 +238,7 @@ impl EvalSolveError {
 impl std::fmt::Display for EvalSolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Cancelled => write!(f, "simulation cancelled"),
             Self::ExternalTable {
                 operation,
                 table_id,
@@ -789,6 +791,7 @@ pub fn eval_row_with_context(
     t: f64,
     context: RowEvalContext<'_>,
 ) -> Result<f64, EvalSolveError> {
+    check_solver_cancellation()?;
     let local_runtime_state;
     let context = match context.runtime_state {
         Some(_) => context,
@@ -832,6 +835,7 @@ pub(crate) fn eval_row_prepared_maybe_fast(
     scratch: &mut RowEvalScratch,
     sink: &mut OutputCursor<'_>,
 ) -> Result<(), EvalSolveError> {
+    check_solver_cancellation()?;
     let start = solve_row_eval_trace_active().then(Instant::now);
     let result = if register_safe {
         eval_row_prepared_fast(input, scratch, sink)
@@ -1930,3 +1934,26 @@ pub(crate) fn eval_compare(op: CompareOp, lhs: f64, rhs: f64) -> f64 {
 
 #[cfg(test)]
 mod tests;
+
+#[inline]
+fn check_solver_cancellation() -> Result<(), EvalSolveError> {
+    if rumoca_solver::solver_cancellation_requested() {
+        return Err(EvalSolveError::Cancelled);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn prepared_evaluation_observes_cancellation_without_panic() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let _guard = rumoca_solver::SolverCancellationGuard::install(flag.clone());
+        flag.store(true, Ordering::SeqCst);
+        assert_eq!(
+            eval_row(&[], &[], &[], 0.0, None),
+            Err(EvalSolveError::Cancelled)
+        );
+    }
+}

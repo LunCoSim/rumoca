@@ -620,6 +620,15 @@ fn classify_variables(
         let kind = classification::classify_variable(var, inputs.state_vars);
         let mut dae_var = create_dae_variable(name, var, &known_var_names)?;
         inherit_scalarized_start_from_base(name, flat, &mut dae_var, &known_var_names)?;
+        // External declaration bindings initialize the input at its full path.
+        if (inputs.connector_input_members.contains(name)
+            || (matches!(kind, dae::VariableKind::Input)
+                && !inputs.connected_inputs.contains(name)
+                && !inputs.internal_inputs.contains(name)))
+            && let Some(binding) = &var.binding
+        {
+            dae_var.start = Some(binding.clone());
+        }
         record_variable_start_metadata(dae, name, &dae_var);
 
         // Top-level connector members connected only to internal inputs act as
@@ -676,8 +685,10 @@ fn classify_variables(
                         .insert(flat_to_dae_var_name(name), dae_var);
                     continue;
                 }
-                // Connected inputs or inputs with bindings become algebraic (MLS §4.4.1)
-                if !(inputs.connected_inputs.contains(name) || var.binding.is_some()) {
+                // External input bindings supply initialization defaults. Internal
+                // and connected inputs retain their equation-owned values.
+                if !inputs.connected_inputs.contains(name) && !inputs.internal_inputs.contains(name)
+                {
                     dae.variables
                         .inputs
                         .insert(flat_to_dae_var_name(name), dae_var);

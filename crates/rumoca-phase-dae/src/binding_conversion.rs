@@ -38,9 +38,8 @@ struct BindingEquationSpec<'a> {
 /// Convert variable bindings to equations (MLS §4.4.1).
 /// A declaration `Real y = expr` is equivalent to `Real y; equation y = expr;`
 ///
-/// For input variables with bindings that are NOT connected, the binding also
-/// becomes an equation. This handles cases like `input Integer expr[:] = {4, 6}`
-/// where the binding provides the default value for the unconnected input.
+/// External input bindings initialize their DAE input slots. Internal input
+/// bindings remain equations, subject to connection ownership.
 ///
 /// IMPORTANT: Bindings are default values that can be overridden by explicit equations.
 /// However, if a binding relates the variable to OTHER unknowns (not just constants/parameters),
@@ -83,6 +82,15 @@ pub(super) fn convert_bindings_to_equations(
     let defined_by_unknown_rhs = collect_vars_with_unknown_rhs(flat, &unknowns);
 
     for (name, var) in &flat.variables {
+        // External bindings initialize the runtime interface; they do not
+        // constrain the equation system. Internal bindings remain equations.
+        if dae
+            .variables
+            .inputs
+            .contains_key(&flat_to_dae_var_name(name))
+        {
+            continue;
+        }
         if !var.is_primitive && prefix_children.contains_key(name.as_str()) {
             continue;
         }

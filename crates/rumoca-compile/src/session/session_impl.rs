@@ -1366,7 +1366,16 @@ impl Session {
         }
 
         match requested_result {
-            DaePhaseResult::Success(result) => Ok(result),
+            DaePhaseResult::Success(mut result) => {
+                result.source_closure = Some(super::CompiledSourceClosure {
+                    target: model_name.to_owned(),
+                    files: target_source_files.iter().map(|uri| super::CompiledSourceContribution {
+                        uri: uri.clone(),
+                        source_set_keys: self.source_root_backing_keys_for_uri(uri).into_iter().collect(),
+                    }).collect(),
+                });
+                Ok(result)
+            },
             DaePhaseResult::NeedsInner { .. } | DaePhaseResult::Failed { .. } => Err(
                 "strict DAE compile returned non-success requested result without collected diagnostics"
                     .to_string(),
