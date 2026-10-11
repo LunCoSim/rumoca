@@ -172,7 +172,7 @@ impl<'a> MeModelSource<'a> {
 
     /// The root-location rules the component was constructed with; a test
     /// fixture has no component and takes the standard plan.
-    pub(crate) fn root_location(&self) -> rumoca_ir_solve::fmi::RootLocationPlan {
+    pub fn root_location(&self) -> rumoca_ir_solve::fmi::RootLocationPlan {
         match &self.0 {
             MeModelSourceInner::Correlated(view) => *view.root_location(),
             #[cfg(test)]

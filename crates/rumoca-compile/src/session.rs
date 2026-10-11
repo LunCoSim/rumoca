@@ -1651,9 +1651,24 @@ pub struct CompilationResult {
     pub experiment_solver: Option<String>,
 }
 
+/// Participating sources captured by a successful strict compile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledSourceClosure {
+    pub target: String,
+    pub files: Vec<CompiledSourceContribution>,
+}
+
+/// One participating document and its admitted source-root owners.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledSourceContribution {
+    pub uri: String,
+    pub source_set_keys: Vec<String>,
+}
+
 /// Result of compiling a single model through the DAE stage only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaeCompilationResult {
+    pub source_closure: Option<CompiledSourceClosure>,
     /// The flattened representation used to produce this DAE.
     pub flat: Arc<flat::Model>,
     /// The final DAE representation.

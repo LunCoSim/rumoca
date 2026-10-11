@@ -63,6 +63,15 @@ import that path.
 | Process global allocator and its startup configuration (`ProcessAllocator`, `ProcessAllocatorError`, `MIMALLOC_ARENA_RESERVE_KIB`, `GLIBC_MALLOC_ARENA_MAX`) | `rumoca-allocator` | Rules in §6. The only production crate that implements `GlobalAlloc` or sets mimalloc/glibc allocator options; it has no workspace dependencies. `xtask` stays free of every Rumoca workspace dependency (row below) and installs no global allocator. |
 | MSL parity observation-grid policy (`msl_sim_output_dt`, `MSL_SIM_OUTPUT_INTERVALS`) | `rumoca-worker` | A valid Modelica experiment interval owns the grid; otherwise Rumoca uses the same scale-invariant uniform base grid as the OMC oracle. Solver event instants remain additional output points. |
 
+Runtime hosts borrow the checked `FmiComponent` through the simulation facade;
+`prepare_fmi_component` and `rk45::SimulationSession::from_fmi_component` use
+one correlated kernel and metadata inventory. Runtime persistence emits the
+current construction wire, retaining the exact admitted declaration inputs
+(including zero-storage declarations), and decodes through the same constructor.
+Scoped evaluator cancellation and trace output budgets belong to their evaluator
+and FMI ME recorder owners. Instrumentation uses the foundation timing helpers;
+solver timeout clocks remain independent of optional instrumentation.
+
 ### 2. Session-Owned Source-Root And Class-Graph Catalog (SPEC_0029 §10)
 
 | Rule | Where | Why |

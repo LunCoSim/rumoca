@@ -215,17 +215,17 @@ pub mod compile {
     pub use crate::session::{
         ClassLocalCompletionItem, ClassLocalCompletionKind, CompilationMode, CompilationResult,
         CompilationSummary, CompilePhaseEvent, CompilePhaseObserverGuard,
-        CompilePhaseTimingSnapshot, CompilePhaseTimingStat, CompiledSourceRoot,
-        DaeCompilationResult, Document, DocumentSymbol, DocumentSymbolKind, FailedPhase,
-        LocalComponentInfo, ModelDiagnostics, ModelFailureDiagnostic, NavigationClassTargetInfo,
-        ParsedSourceDocument, ParsedSourceRootLoad, PhaseResult, SemanticDiagnosticsMode, Session,
-        SessionChange, SessionConfig, SessionSnapshot, SourceRootActivityKind,
-        SourceRootActivityPhase, SourceRootActivitySnapshot, SourceRootDurability, SourceRootKind,
-        SourceRootLoadMode, SourceRootLoadReport, SourceRootStatusSnapshot, StrictCheckTiming,
-        StrictCompilation, StrictCompileFailure, StrictCompileReport, StructuralOverride,
-        WorkspaceSymbol, WorkspaceSymbolKind, WorkspaceSymbolSnapshotTiming,
-        compile_phase_timing_stats, install_compile_phase_observer,
-        reset_compile_phase_timing_stats,
+        CompilePhaseTimingSnapshot, CompilePhaseTimingStat, CompiledSourceClosure,
+        CompiledSourceContribution, CompiledSourceRoot, DaeCompilationResult, Document,
+        DocumentSymbol, DocumentSymbolKind, FailedPhase, LocalComponentInfo, ModelDiagnostics,
+        ModelFailureDiagnostic, NavigationClassTargetInfo, ParsedSourceDocument,
+        ParsedSourceRootLoad, PhaseResult, SemanticDiagnosticsMode, Session, SessionChange,
+        SessionConfig, SessionSnapshot, SourceRootActivityKind, SourceRootActivityPhase,
+        SourceRootActivitySnapshot, SourceRootDurability, SourceRootKind, SourceRootLoadMode,
+        SourceRootLoadReport, SourceRootStatusSnapshot, StrictCheckTiming, StrictCompilation,
+        StrictCompileFailure, StrictCompileReport, StructuralOverride, WorkspaceSymbol,
+        WorkspaceSymbolKind, WorkspaceSymbolSnapshotTiming, compile_phase_timing_stats,
+        install_compile_phase_observer, reset_compile_phase_timing_stats,
     };
 }
 

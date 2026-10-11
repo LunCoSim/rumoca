@@ -1,4 +1,4 @@
-use std::time::Instant;
+use rumoca_core::{maybe_elapsed_seconds, maybe_start_timer};
 
 use indexmap::IndexMap;
 use rumoca_ir_dae as dae;
@@ -104,23 +104,23 @@ impl SimulationSession {
             )
             .map_err(diagnostic_sim_error)?;
         begin_stage("sim_overrides");
-        let override_apply_start = Instant::now();
+        let override_apply_start = maybe_start_timer();
         apply_correlated_simulation_overrides(&mut lowered, dae_model, &opts)
             .map_err(diagnostic_sim_error)?;
-        let override_apply_seconds = override_apply_start.elapsed().as_secs_f64();
+        let override_apply_seconds = maybe_elapsed_seconds(override_apply_start);
         begin_stage("sim_build");
-        let backend_build_start = Instant::now();
+        let backend_build_start = maybe_start_timer();
         let (artifact, execution_backend) =
             finish_runtime_fmi_artifact(lowered, &opts).map_err(diagnostic_sim_error)?;
         require_rk_mode(opts.solver_mode)?;
         let inner = BackendSimulationSession::new(
-            artifact,
+            artifact.source(),
             &opts,
             execution_backend,
             INSTANCE_NAME,
             RK45_INTEGRATOR,
         )?;
-        let backend_build_seconds = backend_build_start.elapsed().as_secs_f64();
+        let backend_build_seconds = maybe_elapsed_seconds(backend_build_start);
         Ok((
             Self { inner },
             BuildSimulationTimings {
@@ -150,13 +150,35 @@ impl SimulationSession {
         require_rk_mode(opts.solver_mode)
             .map_err(|err| SimulationDiagnosticError::Solver(err.to_string()))?;
         let inner = BackendSimulationSession::new(
-            artifact,
+            artifact.source(),
             &opts,
             execution_backend,
             INSTANCE_NAME,
             RK45_INTEGRATOR,
         )
         .map_err(|err| SimulationDiagnosticError::Solver(err.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Instantiate a checked prepared FMI component without repeating lowering.
+    pub fn from_fmi_component(
+        component: &rumoca_ir_solve::fmi::FmiComponent,
+        opts: rumoca_solver::SimOptions,
+    ) -> Result<Self, SimulationDiagnosticError> {
+        require_rk_mode(opts.solver_mode)
+            .map_err(|error| SimulationDiagnosticError::Solver(error.to_string()))?;
+        let execution_backend = crate::native_execution::admitted_native_execution_backend(
+            &opts,
+            component.runtime_view().model(),
+        );
+        let inner = BackendSimulationSession::new(
+            component.into(),
+            &opts,
+            execution_backend,
+            INSTANCE_NAME,
+            RK45_INTEGRATOR,
+        )
+        .map_err(|error| SimulationDiagnosticError::Solver(error.to_string()))?;
         Ok(Self { inner })
     }
 

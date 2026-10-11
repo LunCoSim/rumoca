@@ -393,6 +393,7 @@ impl FmiMetadata {
 /// views below, and codegen consumes the whole thing into [`FmiCodegenView`].
 #[derive(Debug)]
 pub struct FmiComponent {
+    construction_inputs: Vec<FmiVariableInput>,
     metadata: FmiMetadata,
     event_indicators: FmiEventIndicatorInventory,
     root_location: RootLocationPlan,
@@ -414,15 +415,24 @@ impl FmiComponent {
         model
             .validate()
             .map_err(|error| FmiComponentError::InvalidSolve(error.to_string()))?;
-        let metadata = checked_metadata(&model.problem, inputs)?;
+        let metadata = checked_metadata(&model.problem, inputs.clone())?;
         let event_indicators = FmiEventIndicatorInventory::derive(&model)?;
         Ok(Self {
+            construction_inputs: inputs,
             metadata,
             event_indicators,
             root_location: RootLocationPlan::STANDARD,
             co_simulation: CoSimulationStepPlan::STANDARD,
             model: Arc::new(model),
         })
+    }
+
+    /// Exact admitted declaration facts for canonical persistence. Runtime
+    /// metadata omits empty storage runs and normalizes FMI attributes, so it
+    /// cannot be inverted into the original construction inputs.
+    #[must_use]
+    pub fn construction_inputs(&self) -> &[FmiVariableInput] {
+        &self.construction_inputs
     }
 
     #[must_use]

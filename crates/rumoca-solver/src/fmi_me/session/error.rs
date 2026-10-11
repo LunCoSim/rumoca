@@ -18,6 +18,11 @@ use crate::{
 /// termination is not a failure at all: it is a successful `SimTermination`.
 #[derive(Debug, thiserror::Error)]
 pub enum MeSessionError {
+    #[error("simulation cancelled")]
+    Cancelled,
+
+    #[error("{reason}")]
+    OutputBudget { reason: String },
     /// A standard component operation failed.
     #[error(transparent)]
     Component(#[from] MeError),
@@ -252,6 +257,7 @@ impl From<TimeoutExceeded> for MeSessionError {
 impl From<MeTraceViolation> for MeSessionError {
     fn from(value: MeTraceViolation) -> Self {
         match value {
+            MeTraceViolation::OutputBudget { reason } => Self::OutputBudget { reason },
             MeTraceViolation::Allocation { context, entries } => {
                 Self::Allocation { context, entries }
             }

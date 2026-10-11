@@ -1,11 +1,12 @@
 //! Solver-neutral composition of a numerical ME plugin with the common host.
 
 use indexmap::IndexMap;
+#[cfg(feature = "solver-diffsol")]
+use rumoca_solver::fmi_me::MeModelArtifact;
 use rumoca_solver::{
     SimOptions,
     fmi_me::{
-        MeExecutionBackend, MeInstanceConfig, MeIntegratorBackend, MeModelArtifact,
-        MeNumericalSetup,
+        MeExecutionBackend, MeInstanceConfig, MeIntegratorBackend, MeModelSource, MeNumericalSetup,
         driver::{advance_live_session, batch_session_options, live_session_options},
         session::{MeRetainedComponent, MeSimulationSession},
     },
@@ -31,7 +32,7 @@ pub(crate) struct BackendSimulationSession {
 
 impl BackendSimulationSession {
     pub(crate) fn new(
-        artifact: MeModelArtifact,
+        source: MeModelSource<'_>,
         opts: &SimOptions,
         execution_backend: Option<MeExecutionBackend>,
         instance_name: &'static str,
@@ -41,13 +42,14 @@ impl BackendSimulationSession {
             opts.execution_policy,
             execution_backend,
         )?;
+        let root_location = source.root_location();
         let retained = MeRetainedComponent::instantiate(
-            artifact.source(),
+            source,
             &instance_config(instance_name, opts)?,
             execution_backend,
         )?;
         let options = live_session_options(
-            &artifact.root_location(),
+            &root_location,
             opts.t_start,
             opts.rtol,
             opts.atol,

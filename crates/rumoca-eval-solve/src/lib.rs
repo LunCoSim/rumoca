@@ -27,6 +27,9 @@ use rumoca_ir_solve::{
     resolve_indexed_slot,
 };
 
+mod cancellation;
+pub use cancellation::{EvaluationCancellationGuard, evaluation_cancellation_requested};
+
 mod block_residual_split;
 mod compute_block_scalarize;
 pub mod dense_basis;
@@ -139,6 +142,7 @@ type BlockEvalStatsMap = BTreeMap<(&'static str, usize), BlockEvalStats>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalSolveError {
+    Cancelled,
     ExternalTable {
         operation: &'static str,
         table_id: f64,
@@ -302,6 +306,7 @@ impl EvalSolveError {
 impl std::fmt::Display for EvalSolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Cancelled => write!(f, "simulation cancelled"),
             Self::ExternalTable {
                 operation,
                 table_id,
@@ -1561,6 +1566,7 @@ pub(crate) fn eval_row_prepared_maybe_fast(
     scratch: &mut RowEvalScratch,
     sink: &mut OutputCursor<'_>,
 ) -> Result<(), EvalSolveError> {
+    cancellation::check_evaluation_cancellation()?;
     let start = solve_row_eval_trace_active().then(Instant::now);
     let result = if register_safe && input.lazy_plan.is_some() {
         eval_row_prepared_lazy(input, scratch, sink)
@@ -1584,6 +1590,7 @@ fn eval_row_prepared_lazy(
     let plan = input
         .lazy_plan
         .expect("lazy row evaluation requires a prepared plan");
+    cancellation::check_evaluation_cancellation()?;
     scratch.regs.resize(input.register_count, 0.0);
     scratch.lazy_outputs.clear();
     if let Some(trace) = plan.trace.borrow().as_deref()

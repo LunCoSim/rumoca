@@ -483,6 +483,9 @@ impl MeSimulationSession<'_, '_> {
             if self.host.terminated {
                 return Ok(MeAdvanceOutcome::Terminated);
             }
+            if rumoca_eval_solve::evaluation_cancellation_requested() {
+                return Err(MeSessionError::Cancelled);
+            }
             self.host.budget.check()?;
             let resolved = self.resolve_without_advance(yield_time, cursor)?;
             match resolved {
@@ -1412,6 +1415,9 @@ impl RootScanTarget for SessionScanTarget<'_> {
     }
 
     fn check_budget(&self) -> Result<(), MeSessionError> {
+        if rumoca_eval_solve::evaluation_cancellation_requested() {
+            return Err(MeSessionError::Cancelled);
+        }
         Ok(self.budget.check()?)
     }
 }

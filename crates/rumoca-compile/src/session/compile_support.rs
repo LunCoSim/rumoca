@@ -310,6 +310,7 @@ fn dae_compilation_result_from_artifact(
 ) -> Result<DaeCompilationResult, ToDaeError> {
     let has_unbound_fixed_parameters = artifact.flat.has_unbound_fixed_parameters();
     Ok(DaeCompilationResult {
+        source_closure: None,
         flat: artifact.flat,
         dae: artifact.dae,
         source_map: Some(source_map),

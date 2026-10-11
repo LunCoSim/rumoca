@@ -61,6 +61,8 @@ enum TraceDecision {
 /// violation onto the public host-contract category.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub(super) enum MeTraceViolation {
+    #[error("{reason}")]
+    OutputBudget { reason: String },
     #[error("trace channel names must be unique; '{name}' appears more than once")]
     DuplicateChannel { name: String },
 
@@ -158,6 +160,11 @@ impl MeTraceRecorder {
                 return Err(MeTraceViolation::DuplicateChannel { name: name.clone() });
             }
         }
+        crate::validate_solver_output_dimensions(names.len(), capacity).map_err(|error| {
+            MeTraceViolation::OutputBudget {
+                reason: error.to_string(),
+            }
+        })?;
         let mut columns: Vec<Vec<f64>> = Vec::new();
         try_reserve(&mut columns, names.len(), "trace columns")?;
         for _ in 0..names.len() {
@@ -321,6 +328,11 @@ impl MeTraceRecorder {
         values: &[f64],
     ) -> Result<(), MeTraceViolation> {
         let next = self.times.len() + 1;
+        crate::validate_solver_output_dimensions(self.columns.len(), next).map_err(|error| {
+            MeTraceViolation::OutputBudget {
+                reason: error.to_string(),
+            }
+        })?;
         reserve_one(&mut self.times, next, "trace times")?;
         reserve_one(&mut self.roles, next, "trace roles")?;
         for column in &mut self.columns {
@@ -406,6 +418,25 @@ mod tests {
         values: [f64; 2],
     ) -> Result<bool, MeTraceViolation> {
         trace.record_with(role, time, || Ok(values.to_vec()))
+    }
+
+    #[test]
+    fn trace_budget_rejection_preserves_the_admitted_rectangle() {
+        let _budget =
+            crate::SolverOutputBudgetGuard::install(crate::SolverOutputBudget::new(3).unwrap());
+        assert!(matches!(
+            MeTraceRecorder::new(vec!["a".into(), "b".into()], Vec::new(), 0, 2),
+            Err(MeTraceViolation::OutputBudget { .. })
+        ));
+        let mut trace =
+            MeTraceRecorder::new(vec!["a".into(), "b".into()], Vec::new(), 0, 0).unwrap();
+        record(&mut trace, TraceObservationRole::Nominal, 0.0, [1.0, 2.0]).unwrap();
+        assert!(matches!(
+            record(&mut trace, TraceObservationRole::Nominal, 1.0, [3.0, 4.0]),
+            Err(MeTraceViolation::OutputBudget { .. })
+        ));
+        assert_eq!(trace.times, [0.0]);
+        assert_eq!(trace.columns, [vec![1.0], vec![2.0]]);
     }
 
     #[test]

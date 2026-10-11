@@ -1,5 +1,5 @@
 use super::*;
-use std::time::Instant;
+use rumoca_core::{maybe_elapsed_ms, maybe_start_timer};
 
 struct IsolatedLocalSourceRootCloneState {
     kept_source_root_keys: IndexSet<String>,
@@ -312,14 +312,14 @@ impl Session {
         &self,
     ) -> (SessionSnapshot, WorkspaceSymbolSnapshotTiming) {
         let mut timing = WorkspaceSymbolSnapshotTiming::default();
-        let validation_started = Instant::now();
+        let validation_started = maybe_start_timer();
         let source_set_caches_are_current = self.workspace_symbol_source_set_caches_are_current();
-        timing.source_set_validation_ms = validation_started.elapsed().as_millis() as u64;
+        timing.source_set_validation_ms = maybe_elapsed_ms(validation_started) as u64;
         if !source_set_caches_are_current {
             return self.build_workspace_symbol_rebuild_snapshot_with_timing(timing);
         }
 
-        let detached_documents_started = Instant::now();
+        let detached_documents_started = maybe_start_timer();
         let detached_documents = self
             .detached_document_uris
             .iter()
@@ -329,9 +329,9 @@ impl Session {
                     .map(|doc| (uri.clone(), doc.clone()))
             })
             .collect();
-        timing.detached_documents_ms = detached_documents_started.elapsed().as_millis() as u64;
+        timing.detached_documents_ms = maybe_elapsed_ms(detached_documents_started) as u64;
 
-        let detached_file_ids_started = Instant::now();
+        let detached_file_ids_started = maybe_start_timer();
         let detached_file_ids: IndexMap<String, FileId> = self
             .detached_document_uris
             .iter()
@@ -342,10 +342,10 @@ impl Session {
                     .map(|file_id| (uri.clone(), file_id))
             })
             .collect();
-        timing.detached_file_ids_ms = detached_file_ids_started.elapsed().as_millis() as u64;
+        timing.detached_file_ids_ms = maybe_elapsed_ms(detached_file_ids_started) as u64;
         let detached_file_id_set = detached_file_ids.values().copied().collect::<IndexSet<_>>();
 
-        let source_set_signatures_started = Instant::now();
+        let source_set_signatures_started = maybe_start_timer();
         let source_set_signature_overrides = self
             .source_sets
             .values()
@@ -354,17 +354,16 @@ impl Session {
                     .map(|signature| (record.id, signature))
             })
             .collect();
-        timing.source_set_signatures_ms =
-            source_set_signatures_started.elapsed().as_millis() as u64;
+        timing.source_set_signatures_ms = maybe_elapsed_ms(source_set_signatures_started) as u64;
 
-        let ast_state_started = Instant::now();
+        let ast_state_started = maybe_start_timer();
         let ast_query_state = self
             .query_state
             .ast
             .workspace_symbol_snapshot_state_for_detached(&detached_file_id_set);
-        timing.ast_state_ms = ast_state_started.elapsed().as_millis() as u64;
+        timing.ast_state_ms = maybe_elapsed_ms(ast_state_started) as u64;
 
-        let session_assemble_started = Instant::now();
+        let session_assemble_started = maybe_start_timer();
         let (snapshot_cache, lightweight_snapshot_cache, workspace_symbol_snapshot_cache) =
             fresh_session_snapshot_caches();
         let snapshot = Session {
@@ -394,7 +393,7 @@ impl Session {
             lightweight_snapshot_cache,
             workspace_symbol_snapshot_cache,
         };
-        timing.session_assemble_ms = session_assemble_started.elapsed().as_millis() as u64;
+        timing.session_assemble_ms = maybe_elapsed_ms(session_assemble_started) as u64;
         (SessionSnapshot::from_detached_session(snapshot), timing)
     }
 
@@ -409,11 +408,11 @@ impl Session {
             .filter_map(|uri| self.file_ids.get(uri).copied())
             .collect::<IndexSet<_>>();
 
-        let source_set_documents_started = Instant::now();
+        let source_set_documents_started = maybe_start_timer();
         let documents = self.documents.clone();
-        timing.source_set_documents_ms = source_set_documents_started.elapsed().as_millis() as u64;
+        timing.source_set_documents_ms = maybe_elapsed_ms(source_set_documents_started) as u64;
 
-        let source_set_signatures_started = Instant::now();
+        let source_set_signatures_started = maybe_start_timer();
         let source_set_signature_overrides = self
             .source_sets
             .values()
@@ -422,17 +421,16 @@ impl Session {
                     .map(|signature| (record.id, signature))
             })
             .collect();
-        timing.source_set_signatures_ms =
-            source_set_signatures_started.elapsed().as_millis() as u64;
+        timing.source_set_signatures_ms = maybe_elapsed_ms(source_set_signatures_started) as u64;
 
-        let ast_state_started = Instant::now();
+        let ast_state_started = maybe_start_timer();
         let ast_query_state = self
             .query_state
             .ast
             .workspace_symbol_rebuild_snapshot_state(&detached_file_ids);
-        timing.ast_state_ms = ast_state_started.elapsed().as_millis() as u64;
+        timing.ast_state_ms = maybe_elapsed_ms(ast_state_started) as u64;
 
-        let session_assemble_started = Instant::now();
+        let session_assemble_started = maybe_start_timer();
         let (snapshot_cache, lightweight_snapshot_cache, workspace_symbol_snapshot_cache) =
             fresh_session_snapshot_caches();
         let snapshot = Session {
@@ -462,7 +460,7 @@ impl Session {
             lightweight_snapshot_cache,
             workspace_symbol_snapshot_cache,
         };
-        timing.session_assemble_ms = session_assemble_started.elapsed().as_millis() as u64;
+        timing.session_assemble_ms = maybe_elapsed_ms(session_assemble_started) as u64;
         (SessionSnapshot::from_detached_session(snapshot), timing)
     }
 

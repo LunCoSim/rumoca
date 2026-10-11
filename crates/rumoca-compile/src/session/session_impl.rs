@@ -1252,7 +1252,17 @@ impl Session {
         }
 
         match requested_result {
-            DaePhaseResult::Success(result) => Ok(result),
+            DaePhaseResult::Success(mut result) => {
+                let files = collect_target_source_files(tree, &target.closure.reachable_classes);
+                result.source_closure = Some(super::CompiledSourceClosure {
+                    target: model_name.to_owned(),
+                    files: files.into_iter().map(|uri| super::CompiledSourceContribution {
+                        source_set_keys: self.source_root_backing_keys_for_uri(&uri).into_iter().collect(),
+                        uri,
+                    }).collect(),
+                });
+                Ok(result)
+            },
             DaePhaseResult::NeedsInner { .. } | DaePhaseResult::Failed { .. } => {
                 Err(Box::new(StrictCompileFailure::from_dae_phase_result(
                     "strict DAE compile returned non-success requested result without collected diagnostics"

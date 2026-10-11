@@ -1883,3 +1883,36 @@ fn strict_dae_recovery_string_api_matches_detailed_summary() {
         .expect_err("model is unbalanced");
     assert_eq!(detailed_summary, string_summary);
 }
+
+#[test]
+fn successful_strict_compile_carries_only_reachable_source_contributions() {
+    let mut session = crate::Session::default();
+    session
+        .add_document(
+            "helper.mo",
+            "package Helpers model Child output Real y; equation y=2; end Child; end Helpers;",
+        )
+        .unwrap();
+    session
+        .add_document(
+            "root.mo",
+            "model Root Helpers.Child child; output Real y; equation y=child.y; end Root;",
+        )
+        .unwrap();
+    session
+        .add_document(
+            "unused.mo",
+            "model Unused Real x; equation x=3; end Unused;",
+        )
+        .unwrap();
+    let compiled = session
+        .compile_model_dae_strict_reachable_uncached_with_recovery("Root")
+        .unwrap();
+    let closure = compiled
+        .source_closure
+        .expect("successful compile records its closure");
+    assert_eq!(closure.target, "Root");
+    let mut uris: Vec<_> = closure.files.into_iter().map(|file| file.uri).collect();
+    uris.sort();
+    assert_eq!(uris, ["helper.mo", "root.mo"]);
+}

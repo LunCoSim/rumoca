@@ -5,7 +5,7 @@ use super::*;
 ///
 /// Keeping the text beside the parsed definition preserves the parser's stable
 /// source identity through session assembly and into provenance-bearing IR.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParsedSourceDocument {
     uri: String,
     source: Arc<str>,
@@ -29,6 +29,16 @@ impl ParsedSourceDocument {
             source,
             definition,
         })
+    }
+
+    /// Immutable syntax paired with the retained source text.
+    pub fn definition(&self) -> &ast::StoredDefinition {
+        &self.definition
+    }
+
+    /// Exact expanded source addressed by the syntax spans.
+    pub fn source(&self) -> &str {
+        &self.source
     }
 
     pub fn uri(&self) -> &str {

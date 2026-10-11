@@ -263,6 +263,7 @@ impl PreparedScalarProgramBlock {
         context: RowEvalContext<'_>,
         out: &mut [f64],
     ) -> Result<(), EvalSolveError> {
+        crate::cancellation::check_evaluation_cancellation()?;
         let local_runtime_state;
         let context = match context.runtime_state {
             Some(_) => context,

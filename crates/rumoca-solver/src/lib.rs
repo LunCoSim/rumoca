@@ -42,6 +42,10 @@ pub use runtime::jacobian::{
 #[cfg(not(kani))]
 pub use runtime::mass_matrix::{PreparedMassMatrix, solve_mass_matrix};
 #[cfg(not(kani))]
+pub use runtime::output_budget::{
+    SolverOutputBudget, SolverOutputBudgetGuard, validate_solver_output_dimensions,
+};
+#[cfg(not(kani))]
 pub use runtime::pre_params::{
     clear_scheduled_root_relation_memory, commit_pre_params_after_event,
     commit_pre_params_after_event_at, update_slot, write_pre_params_from_sources,

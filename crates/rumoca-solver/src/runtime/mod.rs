@@ -18,6 +18,8 @@ pub mod jacobian;
 #[cfg(not(kani))]
 pub mod mass_matrix;
 #[cfg(not(kani))]
+pub mod output_budget;
+#[cfg(not(kani))]
 pub mod pre_params;
 #[cfg(not(kani))]
 pub(crate) mod projection;

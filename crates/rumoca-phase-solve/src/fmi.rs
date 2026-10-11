@@ -78,6 +78,19 @@ pub fn fmi_component_wire<'wire>(
     })
 }
 
+/// Encode a checked runtime component through the canonical construction wire.
+pub fn runtime_fmi_component_wire(
+    component: &FmiComponent,
+) -> Result<FmiComponentWireRef<'_>, FmiLoweringError> {
+    let solve_model = crate::solve_model_wire(component.runtime_view().model())
+        .map_err(|error| FmiLoweringError::Wire(error.to_string()))?;
+    Ok(FmiComponentWireRef {
+        schema_version: FMI_COMPONENT_SCHEMA_VERSION,
+        solve_model,
+        variables: component.construction_inputs().to_vec(),
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FmiComponentWire {

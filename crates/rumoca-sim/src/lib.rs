@@ -15,7 +15,7 @@ pub use rumoca_eval_solve::nan_trace;
 use rumoca_ir_dae as dae;
 pub use rumoca_phase_solve::{
     deserialize_solve_model,
-    fmi::{deserialize_fmi_component, fmi_component_wire},
+    fmi::{deserialize_fmi_component, fmi_component_wire, runtime_fmi_component_wire},
     lower_solve_artifacts, lower_solve_problem, solve_model_wire,
 };
 pub use rumoca_solver::{
@@ -138,6 +138,16 @@ pub fn simulate_with_diagnostics(
 
 #[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
 pub use simulate_with_diagnostics as simulate_dae_with_diagnostics;
+
+/// Prepare one correlated FMI component with the admitted simulation overrides.
+pub fn prepare_fmi_component(
+    dae: &dae::Dae,
+    opts: &SimOptions,
+) -> Result<rumoca_ir_solve::fmi::FmiComponent, SimulationDiagnosticError> {
+    let lowered = lower_correlated_for_simulation_with_overrides(dae, opts)?;
+    rumoca_phase_solve::fmi::finish_fmi_component(lowered)
+        .map_err(|error| SimulationDiagnosticError::Solver(error.to_string()))
+}
 
 /// Simulate one already-constructed correlated FMI component, dispatching by
 /// `opts.solver_mode`.

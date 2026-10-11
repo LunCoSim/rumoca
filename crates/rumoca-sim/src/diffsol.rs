@@ -1,5 +1,5 @@
+use rumoca_core::{maybe_elapsed_seconds, maybe_start_timer};
 use std::cell::RefCell;
-use std::time::Instant;
 
 #[cfg(feature = "scheduled-sim")]
 use indexmap::IndexMap;
@@ -197,18 +197,18 @@ pub fn build_simulation_with_stage_timing_and_lowered_model(
         )
         .map_err(diagnostic_sim_error)?;
     begin_stage("sim_overrides");
-    let override_apply_start = Instant::now();
+    let override_apply_start = maybe_start_timer();
     apply_correlated_simulation_overrides(&mut lowered, dae_model, opts)
         .map_err(diagnostic_sim_error)?;
-    let override_apply_seconds = override_apply_start.elapsed().as_secs_f64();
+    let override_apply_seconds = maybe_elapsed_seconds(override_apply_start);
     observe_lowered_model(&lowered);
     begin_stage("sim_build");
-    let backend_build_start = Instant::now();
+    let backend_build_start = maybe_start_timer();
     let (artifact, execution_backend) =
         finish_runtime_fmi_artifact(lowered, opts).map_err(diagnostic_sim_error)?;
     let prepared = build_simulation_artifact(artifact, opts, execution_backend)
         .map_err(|error| error.at_stage(SimFailureStage::BackendBuild))?;
-    let backend_build_seconds = backend_build_start.elapsed().as_secs_f64();
+    let backend_build_seconds = maybe_elapsed_seconds(backend_build_start);
     Ok((
         prepared,
         BuildSimulationTimings {
@@ -349,7 +349,7 @@ impl SimulationSession {
         execution_backend: Option<rumoca_solver::fmi_me::MeExecutionBackend>,
     ) -> Result<Self, SimulationDiagnosticError> {
         let inner = BackendSimulationSession::new(
-            artifact,
+            artifact.source(),
             &opts,
             execution_backend,
             "diffsol",

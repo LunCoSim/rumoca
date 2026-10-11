@@ -29,11 +29,47 @@ pub fn try_build_output_times(
     t_end: f64,
     dt: f64,
 ) -> Result<Vec<f64>, OutputTimelineError> {
+    let count = visit_output_times(t_start, t_end, dt, MAX_OUTPUT_TIME_COUNT, |_| {})?;
+    let mut times = Vec::new();
+    times
+        .try_reserve_exact(count)
+        .map_err(|_| OutputTimelineError::TooManySamples)?;
+    visit_output_times(t_start, t_end, dt, MAX_OUTPUT_TIME_COUNT, |time| {
+        times.push(time)
+    })?;
+    Ok(times)
+}
+
+/// Validate and count the canonical output grid without allocating it.
+pub fn output_sample_count(
+    t_start: f64,
+    t_end: f64,
+    dt: f64,
+    max_samples: usize,
+) -> Result<usize, crate::RuntimeSolveError> {
+    visit_output_times(t_start, t_end, dt, max_samples, |_| {}).map_err(|error| {
+        crate::RuntimeSolveError::solve_ir(format!(
+            "requested output grid exceeds configured output budget or is invalid: {error}"
+        ))
+    })
+}
+
+fn visit_output_times(
+    t_start: f64,
+    t_end: f64,
+    dt: f64,
+    max_samples: usize,
+    mut emit: impl FnMut(f64),
+) -> Result<usize, OutputTimelineError> {
     if !t_start.is_finite() || !t_end.is_finite() || t_end < t_start {
         return Err(OutputTimelineError::InvalidBounds);
     }
     if t_start == t_end {
-        return Ok(vec![t_start]);
+        if max_samples == 0 {
+            return Err(OutputTimelineError::TooManySamples);
+        }
+        emit(t_start);
+        return Ok(1);
     }
     if !dt.is_finite() || dt <= 0.0 {
         return Err(OutputTimelineError::InvalidInterval);
@@ -52,18 +88,12 @@ pub fn try_build_output_times(
     if grid_count >= MAX_OUTPUT_TIME_COUNT {
         return Err(OutputTimelineError::TooManySamples);
     }
-    let mut times = Vec::new();
-    times
-        .try_reserve_exact(
-            grid_count
-                .checked_add(1)
-                .ok_or(OutputTimelineError::TooManySamples)?,
-        )
-        .map_err(|_| OutputTimelineError::TooManySamples)?;
+    let mut last: Option<f64> = None;
+    let mut count = 0;
     for k in 0..grid_count {
         let t_raw = t_start + (k as f64) * dt;
-        if times
-            .last()
+        if last
+            .as_ref()
             .is_some_and(|previous| t_raw <= *previous && t_raw != t_end)
         {
             return Err(OutputTimelineError::NonAdvancingInterval);
@@ -73,23 +103,27 @@ pub fn try_build_output_times(
         } else {
             t_raw
         };
-        if times.last().is_some_and(|previous| t <= *previous) {
+        if last.as_ref().is_some_and(|previous| t <= *previous) {
             return Err(OutputTimelineError::NonAdvancingInterval);
         }
-        times.push(t);
+        count += 1;
+        if count > max_samples {
+            return Err(OutputTimelineError::TooManySamples);
+        }
+        emit(t);
+        last = Some(t);
         if t == t_end {
-            return Ok(times);
+            return Ok(count);
         }
     }
-    if !times
-        .last()
-        .is_some_and(|last| output_time_match_with_ulp(*last, t_end))
-    {
-        times.push(t_end);
-    } else if let Some(last) = times.last_mut() {
-        *last = t_end;
+    if last != Some(t_end) {
+        count += 1;
+        if count > max_samples {
+            return Err(OutputTimelineError::TooManySamples);
+        }
+        emit(t_end);
     }
-    Ok(times)
+    Ok(count)
 }
 
 fn output_time_match_with_ulp(left: f64, right: f64) -> bool {
@@ -432,6 +466,20 @@ mod tests {
             rumoca_core::ClockLattice::from_seconds(period, phase).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn admitted_output_count_matches_exact_grid_and_rejects_invalid_requests() {
+        for (start, end, dt) in [(0.0, 1.0, 0.1), (2.0, 2.5, 0.3), (4.0, 4.0, 0.1)] {
+            let grid = try_build_output_times(start, end, dt).unwrap();
+            assert_eq!(
+                output_sample_count(start, end, dt, grid.len()).unwrap(),
+                grid.len()
+            );
+            assert!(output_sample_count(start, end, dt, grid.len() - 1).is_err());
+        }
+        assert!(output_sample_count(0.0, 1.0, 0.0, 10).is_err());
+        assert!(output_sample_count(f64::NAN, 1.0, 0.1, 10).is_err());
     }
 
     #[test]
