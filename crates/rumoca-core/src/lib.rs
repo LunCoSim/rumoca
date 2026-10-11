@@ -276,6 +276,42 @@ mod solver_name_tests {
     }
 }
 
+/// Borrow the dotted segments of a Modelica name, preserving quoted identifiers
+/// and bracketed subscripts. This only identifies boundaries; syntax validity
+/// remains the canonical parser's responsibility.
+pub fn qualified_name_segments(name: &str) -> impl Iterator<Item = &str> {
+    let mut remaining = Some(name);
+    std::iter::from_fn(move || {
+        let segment = remaining.take()?;
+        let mut quote = None;
+        let mut escaped = false;
+        let mut brackets = 0usize;
+        for (index, byte) in segment.bytes().enumerate() {
+            if let Some(delimiter) = quote {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == delimiter {
+                    quote = None;
+                }
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'[' => brackets += 1,
+                b']' => brackets = brackets.saturating_sub(1),
+                b'.' if brackets == 0 => {
+                    remaining = Some(&segment[index + 1..]);
+                    return Some(&segment[..index]);
+                }
+                _ => {}
+            }
+        }
+        Some(segment)
+    })
+}
+
 /// Split a dotted path while preserving dots inside bracket expressions.
 ///
 /// For `bus[data.medium].pin.v`, returns `["bus[data.medium]", "pin", "v"]`.
@@ -288,75 +324,37 @@ pub fn split_path_with_indices(path: &str) -> Vec<&str> {
 /// Visit non-empty top-level dotted path segments while preserving dots inside
 /// bracket expressions.
 pub fn visit_top_level_path_segments<'a>(path: &'a str, mut visit: impl FnMut(&'a str)) {
-    let mut start = 0;
-    let mut bracket_depth = 0usize;
-    for (idx, byte) in path.bytes().enumerate() {
-        match byte {
-            b'[' => bracket_depth += 1,
-            b']' => bracket_depth = bracket_depth.saturating_sub(1),
-            b'.' if bracket_depth == 0 => {
-                if start < idx {
-                    visit(&path[start..idx]);
-                }
-                start = idx + 1;
-            }
-            _ => {}
-        }
-    }
-    if start < path.len() {
-        visit(&path[start..]);
+    for segment in qualified_name_segments(path).filter(|segment| !segment.is_empty()) {
+        visit(segment);
     }
 }
 
 /// Return the byte index of the last top-level `.` in `path`.
 ///
-/// Dots inside bracketed subscripts (e.g. `a[b.c]`) are ignored.
+/// Dots inside quoted identifiers and bracketed subscripts are ignored.
 pub fn find_last_top_level_dot(path: &str) -> Option<usize> {
-    let bytes = path.as_bytes();
-    let mut idx = bytes.len();
-    while idx > 0 {
-        idx -= 1;
-        match bytes[idx] {
-            b'.' => return Some(idx),
-            b']' => break,
-            _ => {}
-        }
-    }
-    if idx == 0 && bytes.first().copied() != Some(b']') {
-        return None;
-    }
-
-    let mut bracket_depth = 0usize;
-    for (idx, byte) in path.bytes().enumerate().rev() {
-        match byte {
-            b']' => bracket_depth += 1,
-            b'[' => bracket_depth = bracket_depth.saturating_sub(1),
-            b'.' if bracket_depth == 0 => return Some(idx),
-            _ => {}
-        }
-    }
-    None
+    let mut offset = 0usize;
+    qualified_name_segments(path)
+        .map(|segment| {
+            let dot = offset.checked_sub(1);
+            offset += segment.len() + 1;
+            dot
+        })
+        .last()
+        .flatten()
 }
 
 /// Return the byte index of the first top-level `.` in `path`.
 ///
-/// Dots inside bracketed subscripts (e.g. `a[b.c]`) are ignored.
+/// Dots inside quoted identifiers and bracketed subscripts are ignored.
 pub fn find_first_top_level_dot(path: &str) -> Option<usize> {
-    let mut bracket_depth = 0usize;
-    for (idx, byte) in path.bytes().enumerate() {
-        match byte {
-            b'[' => bracket_depth += 1,
-            b']' => bracket_depth = bracket_depth.saturating_sub(1),
-            b'.' if bracket_depth == 0 => return Some(idx),
-            _ => {}
-        }
-    }
-    None
+    let first = qualified_name_segments(path).next()?;
+    (first.len() < path.len()).then_some(first.len())
 }
 
 /// True when `path` has at least one top-level `.`.
 pub fn has_top_level_dot(path: &str) -> bool {
-    find_last_top_level_dot(path).is_some()
+    find_first_top_level_dot(path).is_some()
 }
 
 /// Return the final top-level segment of `path`.
@@ -1596,5 +1594,54 @@ mod short_phase_error_code_tests {
         assert_eq!(short_phase_error_code(""), "");
         // A trailing separator has no bare code to extract; keep the input.
         assert_eq!(short_phase_error_code("rumoca::todae::"), "rumoca::todae::");
+    }
+}
+
+#[cfg(test)]
+mod qualified_name_boundary_tests {
+    use super::*;
+    #[test]
+    fn qualified_name_boundaries_preserve_quoted_dots_escapes_and_subscripts() {
+        for (name, expected) in [
+            ("Root.Part", vec!["Root", "Part"]),
+            ("Root.'Part.Name'.Leaf", vec!["Root", "'Part.Name'", "Leaf"]),
+            (
+                r"Root.'Part\'.Name'.Leaf",
+                vec!["Root", r"'Part\'.Name'", "Leaf"],
+            ),
+            ("Root.'A[B].C'.Leaf", vec!["Root", "'A[B].C'", "Leaf"]),
+            (
+                "Root.bus[data.medium].pin",
+                vec!["Root", "bus[data.medium]", "pin"],
+            ),
+            (
+                r#"Root.bus[lookup("a]b.c")].pin"#,
+                vec!["Root", r#"bus[lookup("a]b.c")]"#, "pin"],
+            ),
+            ("'Part.Name'", vec!["'Part.Name'"]),
+        ] {
+            assert_eq!(qualified_name_segments(name).collect::<Vec<_>>(), expected);
+        }
+        assert_eq!(parent_scope("Root.'Part.Name'"), Some("Root"));
+        assert_eq!(parent_scope("'Part.Name'"), None);
+    }
+
+    #[test]
+    fn qualified_name_boundaries_keep_empty_segments_and_quoted_identity() {
+        assert_eq!(
+            qualified_name_segments("Root..Child.").collect::<Vec<_>>(),
+            ["Root", "", "Child", ""]
+        );
+        assert_eq!(
+            split_first_top_level("'Root.Name'.'Child.Name'"),
+            Some(("'Root.Name'", "'Child.Name'"))
+        );
+        assert_eq!(
+            split_last_top_level("'Root.Name'.'Child.Name'"),
+            Some(("'Root.Name'", "'Child.Name'"))
+        );
+        assert_eq!(parent_scope("'Root.Name'"), None);
+        assert!(!has_top_level_dot("'Root.Name'"));
+        assert_eq!(top_level_last_segment("Root.'Child.Name'"), "'Child.Name'");
     }
 }

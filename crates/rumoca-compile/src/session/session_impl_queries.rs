@@ -1132,6 +1132,35 @@ impl Session {
         )
     }
 
+    /// Resolve inheritance-merged declarations with their authored component
+    /// facts and declaring class. Unresolved bases or cyclic inheritance return
+    /// `None`; a valid class with no components returns `Some(Vec::new())`.
+    pub fn class_component_declarations_query(
+        &mut self,
+        class_name: &str,
+    ) -> Option<Vec<(String, String, ast::Component)>> {
+        let target = self.lookup_query_class_target(class_name)?;
+        let mut members = IndexMap::new();
+        self.collect_query_class_component_members(
+            &target.uri,
+            &target.qualified_name,
+            &mut members,
+            &mut std::collections::HashSet::new(),
+            &mut SummarySignature::new(),
+        )?;
+        members
+            .into_iter()
+            .map(|(name, (declaring, type_name))| {
+                let component = self
+                    .class_definition_query(&declaring)?
+                    .components
+                    .get(&name)?
+                    .clone();
+                Some((declaring, type_name, component))
+            })
+            .collect()
+    }
+
     /// Resolve local completion entries for one class scope from the class-interface layer.
     pub fn class_local_completion_items_query(
         &mut self,
@@ -1198,6 +1227,15 @@ impl Session {
         None
     }
 
+    /// Borrow the declaration selected by the session's indexed class lookup.
+    /// Missing or ambiguous targets return `None`; the reference belongs to the
+    /// current parsed document or installed source-set revision.
+    pub fn class_definition_query(&mut self, class_name: &str) -> Option<&ast::ClassDef> {
+        let target = self.lookup_query_class_target(class_name)?;
+        self.parsed_file_query(&target.uri)?
+            .get_class_by_qualified_name(&target.qualified_name)
+    }
+
     /// Resolve a class name to one unique declared class in the parsed query layer.
     ///
     /// Qualified names match exactly. Unqualified names require a unique suffix
@@ -1218,9 +1256,10 @@ impl Session {
     /// Collect component members from the parsed query layer.
     ///
     /// This follows local components and `extends` edges, applying `break`
-    /// exclusions after each base expansion. If the query layer cannot resolve
-    /// the class uniquely, returns an empty vector and callers may fall back to
-    /// resolved-tree caches.
+    /// exclusions after each base expansion. Incomplete source, unresolved
+    /// bases, cyclic inheritance, or an ambiguous target yield no completion
+    /// members. Consumers requiring a distinction from an empty valid class use
+    /// `class_component_declarations_query`.
     pub fn class_component_members_query(&mut self, class_name: &str) -> Vec<(String, String)> {
         let Some(target) = self.lookup_query_class_target(class_name) else {
             return Vec::new();
@@ -1229,18 +1268,25 @@ impl Session {
             return members;
         }
 
-        let mut members = IndexMap::<String, String>::new();
+        let mut members = IndexMap::<String, (String, String)>::new();
         let mut visiting = std::collections::HashSet::<String>::new();
         let mut signature = SummarySignature::new();
-        self.collect_query_class_component_members(
-            &target.uri,
-            &target.qualified_name,
-            &mut members,
-            &mut visiting,
-            &mut signature,
-        );
-
-        let members = members.into_iter().collect::<Vec<_>>();
+        if self
+            .collect_query_class_component_members(
+                &target.uri,
+                &target.qualified_name,
+                &mut members,
+                &mut visiting,
+                &mut signature,
+            )
+            .is_none()
+        {
+            return Vec::new();
+        }
+        let members = members
+            .into_iter()
+            .map(|(name, (_declaring, type_name))| (name, type_name))
+            .collect::<Vec<_>>();
         self.insert_query_class_component_members(
             target.qualified_name,
             signature,
@@ -1444,40 +1490,45 @@ impl Session {
         &mut self,
         uri: &str,
         qualified_name: &str,
-        members: &mut IndexMap<String, String>,
+        members: &mut IndexMap<String, (String, String)>,
         visiting: &mut std::collections::HashSet<String>,
         signature: &mut SummarySignature,
-    ) {
+    ) -> Option<()> {
         if !visiting.insert(qualified_name.to_string()) {
-            return;
+            return None;
         }
-
         self.record_query_dependency_signature(uri, signature);
-
-        let Some(class_interface) = self.class_interface_query(uri, qualified_name) else {
-            visiting.remove(qualified_name);
-            return;
-        };
+        let class_interface = self.class_interface_query(uri, qualified_name)?;
         for extend in class_interface.extends() {
             let base_candidates =
                 class_interface.type_resolution_candidates(qualified_name, extend.base_name());
-            if let Some(base_target) = self.lookup_query_extends_target(&base_candidates) {
-                self.collect_query_class_component_members(
-                    &base_target.uri,
-                    &base_target.qualified_name,
-                    members,
-                    visiting,
-                    signature,
-                );
-                apply_break_exclusions(members, extend.break_names());
-            }
+            let Some(base_target) = self.lookup_query_extends_target(&base_candidates) else {
+                // Primitive types have no named component declarations.
+                if rumoca_core::is_builtin_type(extend.base_name()) {
+                    continue;
+                }
+                return None;
+            };
+            self.collect_query_class_component_members(
+                &base_target.uri,
+                &base_target.qualified_name,
+                members,
+                visiting,
+                signature,
+            )?;
+            apply_break_exclusions(members, extend.break_names());
         }
-
         for (name, component_interface) in class_interface.component_interfaces() {
-            members.insert(name.clone(), component_interface.type_name().to_string());
+            members.insert(
+                name.clone(),
+                (
+                    qualified_name.to_string(),
+                    component_interface.type_name().to_string(),
+                ),
+            );
         }
-
         visiting.remove(qualified_name);
+        Some(())
     }
 
     fn record_query_dependency_signature(&self, uri: &str, signature: &mut SummarySignature) {
@@ -1946,20 +1997,5 @@ fn parsed_class_by_qualified_name<'a>(
     definition: &'a ast::StoredDefinition,
     qualified_name: &str,
 ) -> Option<&'a ast::ClassDef> {
-    let within_prefix = definition
-        .within
-        .as_ref()
-        .map(ToString::to_string)
-        .filter(|prefix| !prefix.is_empty());
-    let relative_name = within_prefix
-        .as_ref()
-        .and_then(|prefix| qualified_name.strip_prefix(&format!("{prefix}.")))
-        .unwrap_or(qualified_name);
-    let mut parts = rumoca_core::split_path_with_indices(relative_name).into_iter();
-    let first = parts.next()?;
-    let mut class = definition.classes.get(first)?;
-    for part in parts {
-        class = class.classes.get(part)?;
-    }
-    Some(class)
+    definition.get_class_by_qualified_name(qualified_name)
 }

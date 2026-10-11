@@ -25,10 +25,7 @@ pub(crate) fn class_name_matches_query_target(
             || rumoca_core::top_level_path_ends_with(qualified_name, suffix)
     })
 }
-pub(crate) fn apply_break_exclusions(
-    members: &mut IndexMap<String, String>,
-    break_names: &[String],
-) {
+pub(crate) fn apply_break_exclusions<V>(members: &mut IndexMap<String, V>, break_names: &[String]) {
     for break_name in break_names {
         members.shift_remove(break_name);
     }

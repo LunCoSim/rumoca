@@ -115,3 +115,183 @@ fn typed_model_query_cache_is_reused_by_compile_and_diagnostics() {
     let rebuilt_diagnostics = session.compile_model_diagnostics("Target");
     assert_diagnostics_lack_code(&rebuilt_diagnostics, "TTEST");
 }
+
+#[test]
+fn class_definition_query_preserves_exact_within_and_quoted_identity() {
+    let mut session = Session::default();
+    session
+        .add_document(
+            "within.mo",
+            "within Space; package Root model 'A.B' Real marker; end 'A.B'; end Root;",
+        )
+        .expect("valid source");
+    let selected = session
+        .class_definition_query("Space.Root.'A.B'")
+        .expect("exact qualified declaration");
+    assert_eq!(selected.name.text.as_ref(), "'A.B'");
+    assert!(selected.components.contains_key("marker"));
+    let selected_ptr = selected as *const ast::ClassDef;
+    let parsed = session
+        .parsed_file_query("within.mo")
+        .expect("parsed document");
+    assert_eq!(
+        selected_ptr,
+        parsed
+            .get_class_by_qualified_name("Space.Root.'A.B'")
+            .expect("same declaration") as *const ast::ClassDef
+    );
+    assert!(parsed.get_class_by_qualified_name("Root.'A.B'").is_some());
+    for invalid in [
+        "Other.Space.Root.'A.B'",
+        "Space.Root..'A.B'",
+        "Space.Root.'A.B'.",
+        "Space.Root.A.B",
+    ] {
+        assert!(
+            session.class_definition_query(invalid).is_none(),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn class_definition_query_rejects_ambiguous_bare_targets_and_tracks_revision() {
+    let mut session = Session::default();
+    session.add_document("roots.mo", "package A model Shared Real first; end Shared; end A; package B model Shared Real second; end Shared; end B;").expect("valid source");
+    assert!(session.class_definition_query("Shared").is_none());
+    assert!(
+        session
+            .class_definition_query("A.Shared")
+            .expect("A")
+            .components
+            .contains_key("first")
+    );
+    assert!(
+        session
+            .class_definition_query("B.Shared")
+            .expect("B")
+            .components
+            .contains_key("second")
+    );
+    assert!(
+        session
+            .update_document(
+                "roots.mo",
+                "package B model Shared Real edited; end Shared; end B;"
+            )
+            .is_none()
+    );
+    assert!(session.class_definition_query("A.Shared").is_none());
+    assert!(
+        session
+            .class_definition_query("Shared")
+            .expect("unique current declaration")
+            .components
+            .contains_key("edited")
+    );
+    session.remove_document("roots.mo");
+    assert!(session.class_definition_query("B.Shared").is_none());
+}
+
+#[test]
+fn class_definition_query_tracks_preparsed_source_set_replacement() {
+    let mut session = Session::default();
+    session.replace_in_memory_source_set(
+        "library",
+        SourceRootKind::DurableExternal,
+        vec![parse_source_document(
+            "within Library; package P model Leaf Real original; end Leaf; end P;",
+            "library.mo",
+        )],
+        None,
+    );
+    assert!(
+        session
+            .class_definition_query("Library.P.Leaf")
+            .expect("installed parsed source")
+            .components
+            .contains_key("original")
+    );
+    session.replace_in_memory_source_set(
+        "library",
+        SourceRootKind::DurableExternal,
+        vec![parse_source_document(
+            "within Library; package P model Leaf Real replacement; end Leaf; end P;",
+            "library.mo",
+        )],
+        None,
+    );
+    let current = session
+        .class_definition_query("Library.P.Leaf")
+        .expect("replacement declaration");
+    assert!(current.components.contains_key("replacement"));
+    assert!(!current.components.contains_key("original"));
+}
+
+#[test]
+fn class_definition_query_component_declarations_are_typed_and_complete() {
+    let mut session = Session::default();
+    session.add_document("members.mo", "within Space; package P model Base parameter Real k=2; input Real u; end Base; model Derived extends Base; output Real y; end Derived; model Broken extends Missing; Real local; end Broken; model Cyclic extends Cyclic; end Cyclic; model Empty end Empty; type Scalar = Real; connector ScalarInput = input Scalar; end P;").expect("valid source");
+    let members = session
+        .class_component_declarations_query("Space.P.Derived")
+        .expect("resolved declarations");
+    assert_eq!(members.len(), 3);
+    let (origin, _, parameter) = members
+        .iter()
+        .find(|(_, _, c)| c.name == "k")
+        .expect("inherited parameter");
+    assert_eq!(origin, "Space.P.Base");
+    assert!(matches!(
+        parameter.variability,
+        rumoca_core::Variability::Parameter(_)
+    ));
+    assert_eq!(
+        parameter
+            .binding
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("2")
+    );
+    let (_, _, input) = members
+        .iter()
+        .find(|(_, _, c)| c.name == "u")
+        .expect("inherited input");
+    assert!(matches!(input.causality, rumoca_core::Causality::Input(_)));
+    for invalid in ["Space.P.Broken", "Space.P.Cyclic", "Space.P.Unknown"] {
+        assert!(
+            session
+                .class_component_declarations_query(invalid)
+                .is_none(),
+            "{invalid}"
+        );
+    }
+    assert!(
+        session
+            .class_component_declarations_query("Space.P.Empty")
+            .expect("valid empty class")
+            .is_empty()
+    );
+    for primitive in ["Space.P.Scalar", "Space.P.ScalarInput"] {
+        assert!(
+            session
+                .class_component_declarations_query(primitive)
+                .expect("primitive-derived declaration has no named members")
+                .is_empty()
+        );
+    }
+    let mut parsed = session
+        .parsed_file_query("members.mo")
+        .expect("parsed file")
+        .clone();
+    parsed
+        .get_class_by_qualified_name_mut("Space.P.Base")
+        .expect("exact mutable declaration")
+        .components
+        .clear();
+    assert!(
+        parsed
+            .get_class_by_qualified_name_mut("Other.Space.P.Base")
+            .is_none()
+    );
+}

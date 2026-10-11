@@ -53,7 +53,7 @@ pub mod visitor;
 use indexmap::{IndexMap, IndexSet};
 use rumoca_core::{
     BUILTIN_TYPES, Causality, ClassType, ComponentPath, DefId, Location, OpBinary, OpUnary,
-    ScopeId, Span, StateSelect, Token, TypeId, Variability, visit_top_level_path_segments,
+    ScopeId, Span, StateSelect, Token, TypeId, Variability,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -199,20 +199,48 @@ impl ClassTree {
     ///
     /// Navigates the nested class structure following the dotted path.
     pub fn get_class_by_qualified_name(&self, qualified_name: &str) -> Option<&ClassDef> {
-        let mut current: Option<&ClassDef> = None;
-        let mut failed = false;
-        visit_top_level_path_segments(qualified_name, |segment| {
-            if failed {
-                return;
-            }
-            current = match current {
-                Some(class_def) => class_def.classes.get(segment),
-                None => self.definitions.classes.get(segment),
-            };
-            failed = current.is_none();
-        });
+        self.definitions.get_class_by_qualified_name(qualified_name)
+    }
+}
 
-        current.filter(|_| !failed)
+impl StoredDefinition {
+    /// Normalize only this definition's authored package prefix.
+    pub fn relative_class_name<'a>(&self, qualified_name: &'a str) -> &'a str {
+        let Some(within) = self.within.as_ref() else {
+            return qualified_name;
+        };
+        let prefix = within.to_string();
+        if prefix.is_empty() {
+            return qualified_name;
+        }
+        qualified_name
+            .strip_prefix(&prefix)
+            .and_then(|tail| tail.strip_prefix('.'))
+            .unwrap_or(qualified_name)
+    }
+
+    /// Borrow an exact qualified or document-relative class declaration.
+    /// Quoted identifiers retain their dots; empty path segments do not resolve.
+    pub fn get_class_by_qualified_name(&self, qualified_name: &str) -> Option<&ClassDef> {
+        let mut parts =
+            rumoca_core::qualified_name_segments(self.relative_class_name(qualified_name));
+        let first = parts.next()?;
+        let mut class = self.classes.get(first)?;
+        for part in parts {
+            class = class.classes.get(part)?;
+        }
+        Some(class)
+    }
+
+    /// Mutably borrow an exact class declaration, using the same source-relative
+    /// and authored `within` paths as the read query.
+    pub fn get_class_by_qualified_name_mut(&mut self, name: &str) -> Option<&mut ClassDef> {
+        let mut segments = rumoca_core::qualified_name_segments(self.relative_class_name(name));
+        let mut current = self.classes.get_mut(segments.next()?)?;
+        for segment in segments {
+            current = current.classes.get_mut(segment)?;
+        }
+        Some(current)
     }
 }
 
