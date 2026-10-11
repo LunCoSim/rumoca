@@ -101,3 +101,31 @@ state-selection comparisons. Direct comparison of the twelve before/after
 Rumoca trace state metadata sets found them all unchanged. Timings came from
 concurrent builds and the live application; they do not establish a performance
 improvement.
+
+## Original UTF-8 source ownership
+
+`rumoca-phase-parse` admits a single file-prefix UTF-8 BOM through its grammar
+(MLS 13.4, SPEC_0022 LEX-014). Parser tokens, recovery and diagnostics address
+the original bytes (SPEC_0008). The grammar rejects misplaced or repeated marks;
+marks in strings/comments are source content. CR, CRLF and LF preserve source
+coordinates. Hosts pass the unmodified UTF-8 text to strict and recovery APIs.
+
+The scanner uses `scnr2` 0.5.3 with the matched `parol` 4.7.0 and
+`parol_runtime` 4.5.0. The scanner maintainer's Unicode literal fix is the
+producer correction; no host rewrite is part of parsing or editor paste.
+
+The baseline failed two focused encoding assertions, and LunCoSim's production
+batch compiler rejected a valid BOM-prefixed document with EP001. Five encoding
+checks, all 61 remaining Modelica parser tests and 25 GALEC parser tests passed
+with the corrected dependency and grammar. Verification used the same four-job
+repository toolchain and regular sccache.
+
+The unchanged twenty-target MSL canary parsed/flattened all targets, admitted
+14 checked DAE models and simulated 12. All twenty per-model agreement bands
+and exit-reason classifications match the source-class-query evidence commit
+`e773472180ded10dc6aab0e3f84f99330f8398ae`; twelve retain strict-high agreement.
+The six DAE refusals and two EL005 solver refusals remain visible. Results live
+under `target/msl/source-encoding-current`, with the same fixed canary SHA-256
+`536004933ce502f7a8a4317e5dd6de2b700a6b176e84d2d6e7bbe0dcdf61eafa`.
+This is bounded canary evidence; cached OMC references do not provide fresh
+initialization XML or a new state-selection comparison.

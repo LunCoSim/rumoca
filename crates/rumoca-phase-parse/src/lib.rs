@@ -1757,3 +1757,6 @@ end Real;
         );
     }
 }
+
+#[cfg(test)]
+mod source_encoding_tests;

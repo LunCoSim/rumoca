@@ -305,6 +305,15 @@ impl TryFrom<&modelica_grammar_trait::StoredDefinition> for rumoca_ir_ast::Store
     fn try_from(
         ast: &modelica_grammar_trait::StoredDefinition,
     ) -> std::result::Result<Self, Self::Error> {
+        if let Some(mark) = &ast.source_encoding_mark.source_encoding_mark_opt {
+            let token = &mark.utf8_bom.utf8_bom;
+            if token.location.start != 0 {
+                return Err(semantic_error_from_token(
+                    "UTF-8 byte-order mark is only permitted at the start of a file",
+                    token,
+                ));
+            }
+        }
         let mut def = rumoca_ir_ast::StoredDefinition {
             classes: IndexMap::default(),
             ..Default::default()

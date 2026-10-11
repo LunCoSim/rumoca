@@ -317,7 +317,16 @@ unsigned_real
 //✅    [ within [ name ] ";" ]
 //✅    { [ final ] class-definition ";" }
 stored_definition
-    : [ within [ name ] ';'^ ] { [ final ] class_definition ';'^ }
+    : source_encoding_mark [ within [ name ] ';'^ ] { [ final ] class_definition ';'^ }
+    ;
+
+// MLS 13.4: UTF-8 file metadata, retained in lexer byte coordinates.
+source_encoding_mark
+    : [ utf8_bom ]
+    ;
+
+utf8_bom
+    : /\u{FEFF}/
     ;
 
 //=============================================================================

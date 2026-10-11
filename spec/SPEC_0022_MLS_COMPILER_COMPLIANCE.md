@@ -19,27 +19,27 @@ This document catalogs the implicit and explicit contracts from the Modelica Lan
 | §1. Key Definitions | 46–57 | MLS terminology (component, element, flattening, etc.) |
 | §2. Compilation Pipeline | 58–73 | Source → Class Tree → Instance Tree → Flat → DAE → Simulation |
 | §3. Data Structures | 74–331 | Class tree, instance tree, modification env, connection set, DAE, type attributes, variability, class types, prefixes, arrays, state machines |
-| §4.1 LEX contracts | 332–351 | Contract catalog heading + lexical rules (13 contracts) |
-| §4.2 DECL contracts | 352–393 | Declaration rules (37 contracts) |
-| §4.3 INST contracts | 394–456 | Instantiation rules (58 contracts) |
-| §4.4 EXPR contracts | 457–502 | Expression/operator rules (41 contracts) |
-| §4.5 EQN contracts | 503–547 | Equation rules (40 contracts) |
-| §4.6 ALG contracts | 548–569 | Algorithm rules (18 contracts) |
-| §4.7 CONN contracts | 570–604 | Connection rules (30 contracts) |
-| §4.8 FUNC contracts | 605–649 | Function rules (40 contracts) |
-| §4.9 TYPE contracts | 650–690 | Type/interface rules (36 contracts) |
-| §4.10 ARR contracts | 691–739 | Array rules (44 contracts) |
-| §4.11 PKG contracts | 740–756 | Package/import rules (12 contracts) |
-| §4.12 OPREC contracts | 757–772 | Operator record rules (11 contracts) |
-| §4.13 SIM contracts | 773–787 | Simulation rules (10 contracts) |
-| §4.14 CLK contracts | 788–812 | Clock/synchronous rules (20 contracts) |
-| §4.15 STRM contracts | 813–830 | Stream connector rules (13 contracts) |
-| §4.16 SM contracts | 831–927 | State machine rules (8 contracts) + §4.16.1 Rumoca Phase 5 scope note |
-| §4.17 ANN contracts | 928–949 | Annotation rules (17 contracts) |
-| §4.18 UNIT contracts | 950–965 | Unit expression rules (9 contracts) |
-| §5. Contract Summary | 966–991 | Category counts and totals |
-| §6. Compiler Phases | 992–1041 | Phase input/output mapping |
-| §7. MLS Chapter Index | 1042–1069 | MLS chapter → contract category mapping |
+| §4.1 LEX contracts | 332–353 | Contract catalog heading + lexical rules (14 contracts) |
+| §4.2 DECL contracts | 354–395 | Declaration rules (37 contracts) |
+| §4.3 INST contracts | 396–458 | Instantiation rules (58 contracts) |
+| §4.4 EXPR contracts | 459–504 | Expression/operator rules (41 contracts) |
+| §4.5 EQN contracts | 505–549 | Equation rules (40 contracts) |
+| §4.6 ALG contracts | 550–571 | Algorithm rules (18 contracts) |
+| §4.7 CONN contracts | 572–606 | Connection rules (30 contracts) |
+| §4.8 FUNC contracts | 607–651 | Function rules (40 contracts) |
+| §4.9 TYPE contracts | 652–692 | Type/interface rules (36 contracts) |
+| §4.10 ARR contracts | 693–741 | Array rules (44 contracts) |
+| §4.11 PKG contracts | 742–758 | Package/import rules (12 contracts) |
+| §4.12 OPREC contracts | 759–774 | Operator record rules (11 contracts) |
+| §4.13 SIM contracts | 775–789 | Simulation rules (10 contracts) |
+| §4.14 CLK contracts | 790–814 | Clock/synchronous rules (20 contracts) |
+| §4.15 STRM contracts | 815–832 | Stream connector rules (13 contracts) |
+| §4.16 SM contracts | 833–929 | State machine rules (8 contracts) + §4.16.1 Rumoca Phase 5 scope note |
+| §4.17 ANN contracts | 930–951 | Annotation rules (17 contracts) |
+| §4.18 UNIT contracts | 952–967 | Unit expression rules (9 contracts) |
+| §5. Contract Summary | 968–993 | Category counts and totals |
+| §6. Compiler Phases | 994–1043 | Phase input/output mapping |
+| §7. MLS Chapter Index | 1044–1071 | MLS chapter → contract category mapping |
 
 ---
 
@@ -348,6 +348,8 @@ Defines state-to-state transitions with priority and timing control.
 | LEX-011 | Integer range minimum | §2.4.2 | "Range at least  enough to represent largest positive IntegerType value" |
 | LEX-012 | Boolean literals only | §2.4.3 | "Only true and false permitted as Boolean literals" |
 | LEX-013 | String escapes required | §2.4.4 | "Backslash escape sequences required for quote, backslash, newline, tab, etc."
+
+| LEX-014 | UTF-8 file metadata | §13.4 | A single leading UTF-8 BOM is admitted as file metadata. Parser tokens and diagnostics retain offsets in the original source; a BOM outside the file prefix is not an encoding mark. |
 
 ### 4.2 Declaration Contracts (DECL)
 
