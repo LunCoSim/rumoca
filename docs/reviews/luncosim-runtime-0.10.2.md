@@ -41,3 +41,17 @@ checked DAE construction. Two more reported typed solve-IR failures:
 singular and `Modelica.Electrical.Polyphase.Examples.TransformerYD` had a
 non-numeric affine derivative coefficient. No new failure was introduced.
 This is a focused canary delta, not a full-cohort parity measurement.
+
+## Static variability inside input components
+
+Checked DAE role construction gives constant and parameter variability precedence
+over inherited input causality. A nested parameter remains a static coordinate;
+its enclosing input component cannot turn it into an external runtime slot.
+The focused checked-preparation test evaluates a declaration default depending
+on that nested parameter, a function default argument, and an array input.
+
+After the static-variability correction, the same fixed canary again parsed all
+2555 sources, compiled fourteen targets and initialized/simulated twelve. The
+compared model identities and agreement bands remained identical to official
+v0.10.2. The only feature-specific build warning was corrected by gating the ME
+artifact import on its actual RK45 consumer.

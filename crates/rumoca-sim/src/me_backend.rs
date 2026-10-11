@@ -1,7 +1,7 @@
 //! Solver-neutral composition of a numerical ME plugin with the common host.
 
 use indexmap::IndexMap;
-#[cfg(feature = "solver-diffsol")]
+#[cfg(feature = "solver-rk45")]
 use rumoca_solver::fmi_me::MeModelArtifact;
 use rumoca_solver::{
     SimOptions,

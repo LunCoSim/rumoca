@@ -1383,3 +1383,38 @@ fn an_algebraic_reading_initialization_row_cannot_certify_against_a_stale_seed()
         "expected settled initial x=5, got {initial_x}"
     );
 }
+
+#[test]
+fn checked_prepared_component_keeps_scoped_input_defaults() {
+    let dae = compile(
+        r#"model Defaults
+function scale input Real x=2.0; output Real y; algorithm y:=x*3.0; end scale;
+model Expression parameter Real offset=3.0; input Real value=offset*2.0+scale()-6.0; output Real y; equation y=value; end Expression;
+input Expression expression;
+input Real gains[2]={3.0,4.0};
+output Real y; Real x(start=0.0,fixed=true);
+equation y=expression.y+sum(gains); der(x)=y;
+end Defaults;"#,
+        "Defaults",
+    );
+    dae.inspect(|view| {
+        let (_, offset) = view
+            .variables()
+            .find(|(_, variable)| variable.name().as_str() == "expression.offset")
+            .expect("nested parameter");
+        assert_eq!(offset.role(), rumoca_ir_dae::VariableRole::Parameter);
+    });
+    let options = SimOptions::default();
+    let component = crate::prepare_fmi_component(&dae, &options)
+        .expect("checked preparation retains nested input defaults");
+    let model = component.runtime_view().model();
+    let slot = model
+        .problem
+        .layout
+        .binding("expression.value")
+        .expect("qualified input layout");
+    let rumoca_ir_solve::ScalarSlot::P { index, .. } = slot else {
+        panic!("input is a parameter slot");
+    };
+    assert_eq!(model.parameters[index as usize], 6.0);
+}
