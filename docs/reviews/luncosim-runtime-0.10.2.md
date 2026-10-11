@@ -129,3 +129,29 @@ under `target/msl/source-encoding-current`, with the same fixed canary SHA-256
 `536004933ce502f7a8a4317e5dd6de2b700a6b176e84d2d6e7bbe0dcdf61eafa`.
 This is bounded canary evidence; cached OMC references do not provide fresh
 initialization XML or a new state-selection comparison.
+
+## Canonical source declaration queries
+
+`StoredDefinition` owns structural declaration lookup, canonical names and
+declaration enumeration (SPEC_0029 section 3; SPEC_0041; MLS 13.4.3). Exact
+qualified or document-relative paths preserve nested and quoted identifiers.
+Unknown paths have no canonical declaration. Source-tree enumeration includes
+the authored `within` prefix and all declaration kinds without resolving imports
+or inherited members. Session qualification and completion consume these readers.
+
+Three parser-owned source-query checks and two session-consumer checks passed
+through `cargo test --locked -p rumoca-phase-parse -p rumoca-compile --lib source_class_query -j4`.
+These are focused structural-query checks, not a solver-cohort claim.
+
+The fixed twenty-target canary in `target/msl/source-admission-current` parsed
+and flattened all twenty, admitted fourteen checked DAE models and simulated
+twelve. All twenty model identities, agreement bands and exit classifications
+match `target/msl/source-encoding-current` at `b349ebff0fc47225dd070a8020158688b4318ed2`:
+twelve strict-high traces, six DAE refusals and two solver refusals remain
+visible. The canary working-tree digest is
+`ae8d95a365068915887bd00af268fc29308dc60a51ff07af529674d6cdf46e69`.
+The target SHA-256 is
+`536004933ce502f7a8a4317e5dd6de2b700a6b176e84d2d6e7bbe0dcdf61eafa`.
+Cached OMC references do not provide fresh initialization XML or a new
+state-selection comparison. This is Tier 1 canary evidence, not a full-cohort
+or performance claim.

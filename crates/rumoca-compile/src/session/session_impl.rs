@@ -325,38 +325,15 @@ impl Session {
         self.get_document(uri).map(source_map_content_for_doc)
     }
 
-    /// Qualify a bare model name against a document's `within` prefix: a name
-    /// that is already dotted is returned unchanged; a bare top-level class
-    /// declared in a file with `within P;` resolves to `P.<name>`; anything
-    /// the document does not declare is returned unchanged. Falls back to the
-    /// recovered parse so partial input still resolves.
-    ///
-    /// This is the single home for the `within`-qualification rule the WASM
-    /// bindings need (each loads one in-memory document); the Modelica and
-    /// GALEC binding crates call this instead of keeping their own copies.
+    /// Qualify an exact document declaration using its authored `within`.
+    /// Nested paths and quoted identifiers retain their identity. Names not
+    /// declared by this document remain the caller's requested compile target;
+    /// the compiler owns their resolution and diagnostics.
     #[must_use]
     pub fn qualify_model_name(&self, document_uri: &str, model_name: &str) -> String {
-        if model_name.contains('.') {
-            return model_name.to_string();
-        }
-        let Some(parsed) = self
-            .get_document(document_uri)
-            .and_then(|doc| doc.parsed().or_else(|| doc.recovered()))
-        else {
-            return model_name.to_string();
-        };
-        if !parsed.classes.contains_key(model_name) {
-            return model_name.to_string();
-        }
-        parsed
-            .within
-            .as_ref()
-            .map(ToString::to_string)
-            .filter(|prefix| !prefix.is_empty())
-            .map_or_else(
-                || model_name.to_string(),
-                |prefix| format!("{prefix}.{model_name}"),
-            )
+        self.get_document(document_uri)
+            .and_then(|doc| doc.best_effort().qualified_class_name(model_name))
+            .unwrap_or_else(|| model_name.to_owned())
     }
 
     /// Return structured parse diagnostics and a source map for one document.
@@ -673,7 +650,7 @@ impl Session {
     pub fn all_class_names(&mut self) -> Result<Vec<String>> {
         self.build_resolved()?;
         let resolved = self.ensure_resolved()?;
-        Ok(collect_qualified_class_names(&resolved.inner().definitions))
+        Ok(resolved.inner().definitions.declared_class_names())
     }
 
     /// Get all qualified class names from the resolution planning tree.
@@ -685,7 +662,7 @@ impl Session {
         let (plan, _) = self
             .build_resolution_plan_for_strict_compile()
             .map_err(|diags| diagnostics_to_anyhow(&diags))?;
-        Ok(collect_qualified_class_names(&plan.tree().definitions))
+        Ok(plan.tree().definitions.declared_class_names())
     }
 
     /// Get all qualified class names from indexed source-sets.

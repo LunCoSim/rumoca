@@ -23,6 +23,7 @@ mod package_def_map_tests;
 mod persisted_summary_tests;
 mod record_forwarding_tests;
 mod semantic_diagnostics_tests;
+mod source_class_query_tests;
 mod source_root_tests;
 mod typed_model_query_tests;
 mod workspace_symbol_snapshot_tests;
