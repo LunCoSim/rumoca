@@ -182,3 +182,15 @@ The fixed target SHA-256 is
 This is Tier 1 canary evidence. Cached OMC references do not establish fresh
 initialization XML or state-selection parity, and concurrent timings do not
 establish a performance improvement.
+
+## Enclosing package imports
+
+`within_import_resolves_enclosing_package_alias_in_both_compile_paths` passes
+for `Session::compile_model` and `Session::compile_model_strict`, with parent
+and child documents admitted in both orders. A child declared with `within`
+resolves a type alias imported by its enclosing package through Rumoca's normal
+lexical scope. Hosts must retain the admitted parent source in the compiler
+session used by that child.
+
+The focused command was
+`cargo test --locked -p rumoca-compile --lib within_import -j4`.

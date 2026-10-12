@@ -26,6 +26,7 @@ mod semantic_diagnostics_tests;
 mod source_class_query_tests;
 mod source_root_tests;
 mod typed_model_query_tests;
+mod within_import_tests;
 mod workspace_symbol_snapshot_tests;
 
 mod semantic_cache_tests;
