@@ -4,6 +4,21 @@ use crate::generated::modelica_grammar_trait;
 use rumoca_core::Span;
 use std::sync::Arc;
 
+/// Cover grammar tokens from one authored declaration, retaining byte and
+/// line/column coordinates at the original endpoints (SPEC_0008).
+pub(crate) fn cover_location(location: &mut rumoca_core::Location, part: &rumoca_core::Location) {
+    if part.start < location.start {
+        location.start = part.start;
+        location.start_line = part.start_line;
+        location.start_column = part.start_column;
+    }
+    if part.end > location.end {
+        location.end = part.end;
+        location.end_line = part.end_line;
+        location.end_column = part.end_column;
+    }
+}
+
 /// Helper to format location info from a token for error messages.
 ///
 /// SPEC_0008 requires source-backed diagnostics to carry their origin. These

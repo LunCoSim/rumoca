@@ -6809,7 +6809,7 @@ pub const PRODUCTIONS: &[Production; 523] = &[
         lhs: 277,
         production: &[ParseType::N(278), ParseType::N(279), ParseType::N(270)],
     },
-    // 68 - stored_definitionList: stored_definitionOpt0 /* Option */ class_definition : rumoca_ir_ast::ClassDef  ';'^ /* Clipped */ stored_definitionList;
+    // 68 - stored_definitionList: stored_definitionOpt0 /* Option */ class_definition : rumoca_ir_ast::ClassDef  ';' stored_definitionList;
     Production {
         lhs: 278,
         production: &[
@@ -7357,7 +7357,7 @@ pub const PRODUCTIONS: &[Production; 523] = &[
         lhs: 106,
         production: &[ParseType::N(107)],
     },
-    // 164 - element_listList: element ';'^ /* Clipped */ element_listList;
+    // 164 - element_listList: element ';' element_listList;
     Production {
         lhs: 107,
         production: &[ParseType::N(107), ParseType::T(72), ParseType::N(97)],

@@ -603,6 +603,9 @@ fn parse_error_key(error: &ParseError) -> String {
 mod source_class_query_tests;
 
 #[cfg(test)]
+mod class_source_span_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rumoca_ir_ast as ast;

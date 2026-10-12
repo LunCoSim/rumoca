@@ -155,3 +155,30 @@ The target SHA-256 is
 Cached OMC references do not provide fresh initialization XML or a new
 state-selection comparison. This is Tier 1 canary evidence, not a full-cohort
 or performance claim.
+
+## Complete authored class extents
+
+The parser retains declaration semicolons and combines their locations with
+class and element qualifier tokens (SPEC_0008; MLS Annex A.2.1/A.2.2).
+`ClassDef.location` is the complete declaration, including a constraining
+clause for a replaceable element. Name-token spans preserve their separate
+rename contract. Autodiff inserts generated functions at that exact endpoint.
+
+Four focused class-span checks failed before the producer correction. The
+corrected parser passed all 73 parser checks. All 64 autodiff checks, including
+generation after a comment before a declaration semicolon, and all fourteen
+dependency-fingerprint checks passed. Seven focused session navigation/body
+consumer checks also passed, preserving separate identifier locations.
+Verification used four jobs and threads.
+
+The fixed twenty-target canary in `target/msl/class-source-span-current`
+retained all twenty agreement-band rows and phase/failure classifications from
+`target/msl/source-admission-current`: fourteen checked DAE models and twelve
+strict-high simulated traces. Six DAE refusals and two solver refusals remain
+visible. The working-tree digest is
+`a22ec14983e2c8a5ce0faf34894866c02a334febe681cdf9364fd471e7763eff`.
+The fixed target SHA-256 is
+`536004933ce502f7a8a4317e5dd6de2b700a6b176e84d2d6e7bbe0dcdf61eafa`.
+This is Tier 1 canary evidence. Cached OMC references do not establish fresh
+initialization XML or state-selection parity, and concurrent timings do not
+establish a performance improvement.

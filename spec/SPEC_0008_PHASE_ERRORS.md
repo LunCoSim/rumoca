@@ -39,6 +39,13 @@ nearest honest owner span, such as the rewritten expression, owning equation,
 assignment, statement, declaration, or subscript span. Source-backed diagnostics
 must carry the original span through AST -> Flat -> DAE -> Solve.
 
+Parsed `ClassDef.location` covers the complete authored declaration from its
+first qualifier or class keyword through its terminating semicolon. Nested
+element declarations include their constraining clause. The parser derives
+these endpoints from retained grammar tokens, including delimiters; consumers
+must not scan surrounding source to repair a declaration range. Name and
+end-name token locations remain separate exact identifier spans.
+
 ### Fail-Fast Error Semantics
 
 | Rule | Owner/Where | Brief Justification |

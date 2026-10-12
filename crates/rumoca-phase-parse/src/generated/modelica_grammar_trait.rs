@@ -3481,6 +3481,7 @@ pub struct ElementList {
 #[derive(Debug, Clone)]
 pub struct ElementListList {
     pub element: Element,
+    pub semicolon: crate::ParserToken, /* ; */
 }
 
 ///
@@ -5154,6 +5155,7 @@ pub struct StoredDefinition {
 pub struct StoredDefinitionList {
     pub stored_definition_opt0: Option<StoredDefinitionOpt0>,
     pub class_definition: rumoca_ir_ast::ClassDef,
+    pub semicolon: crate::ParserToken, /* ; */
 }
 
 ///
@@ -7203,24 +7205,29 @@ impl<'t, 'u> ModelicaGrammarAuto<'t, 'u> {
 
     /// Semantic action for production 68:
     ///
-    /// `stored_definitionList /* Vec<T>::Push */: stored_definitionOpt0 /* Option */ class_definition ';'^ /* Clipped */ stored_definitionList;`
+    /// `stored_definitionList /* Vec<T>::Push */: stored_definitionOpt0 /* Option */ class_definition ';' stored_definitionList;`
     ///
     #[parol_runtime::function_name::named]
     fn stored_definition_list_0(
         &mut self,
         _stored_definition_opt0: &ParseTreeType<'t>,
         _class_definition: &ParseTreeType<'t>,
-        _semicolon: &ParseTreeType<'t>,
+        semicolon: &ParseTreeType<'t>,
         _stored_definition_list: &ParseTreeType<'t>,
     ) -> Result<()> {
         let context = function_name!();
         trace!("{}", self.trace_item_stack(context));
+        let semicolon = semicolon
+            .token()?
+            .try_into()
+            .map_err(parol_runtime::ParolError::UserError)?;
         let mut stored_definition_list =
             pop_item!(self, stored_definition_list, StoredDefinitionList, context);
         let class_definition = pop_item!(self, class_definition, ClassDefinition, context);
         let stored_definition_opt0 =
             pop_item!(self, stored_definition_opt0, StoredDefinitionOpt0, context);
         let stored_definition_list_0_built = StoredDefinitionList {
+            semicolon,
             class_definition: (&class_definition)
                 .try_into()
                 .map_err(parol_runtime::ParolError::UserError)?,
@@ -9269,20 +9276,24 @@ impl<'t, 'u> ModelicaGrammarAuto<'t, 'u> {
 
     /// Semantic action for production 164:
     ///
-    /// `element_listList /* Vec<T>::Push */: element ';'^ /* Clipped */ element_listList;`
+    /// `element_listList /* Vec<T>::Push */: element ';' element_listList;`
     ///
     #[parol_runtime::function_name::named]
     fn element_list_list_0(
         &mut self,
         _element: &ParseTreeType<'t>,
-        _semicolon: &ParseTreeType<'t>,
+        semicolon: &ParseTreeType<'t>,
         _element_list_list: &ParseTreeType<'t>,
     ) -> Result<()> {
         let context = function_name!();
         trace!("{}", self.trace_item_stack(context));
+        let semicolon = semicolon
+            .token()?
+            .try_into()
+            .map_err(parol_runtime::ParolError::UserError)?;
         let mut element_list_list = pop_item!(self, element_list_list, ElementListList, context);
         let element = pop_item!(self, element, Element, context);
-        let element_list_list_0_built = ElementListList { element };
+        let element_list_list_0_built = ElementListList { semicolon, element };
         // Add an element to the vector
         element_list_list.push(element_list_list_0_built);
         self.push(ASTType::ElementListList(element_list_list), context);
