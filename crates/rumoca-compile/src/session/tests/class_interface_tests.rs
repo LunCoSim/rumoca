@@ -109,26 +109,26 @@ end Outer;
 
     assert_eq!(
         session.class_type_resolution_candidates_query("input.mo", "Demo.Outer", "Alias"),
-        vec![
-            "Lib.Helper".to_string(),
-            "Lib.Components.Alias".to_string(),
-            "Alias".to_string(),
-        ],
-        "simple type candidates should preserve imports and raw-name fallback order"
+        vec!["Demo.Outer.Alias".to_string(), "Lib.Helper".to_string(),],
+        "type candidates follow local, imported, enclosing, and global scopes"
     );
     assert_eq!(
         session.class_type_resolution_candidates_query("input.mo", "Demo.Outer", "Gain"),
-        vec!["Lib.Components.Gain".to_string(), "Gain".to_string(),],
-        "simple type candidates should include imported class names before the raw name"
+        vec![
+            "Demo.Outer.Gain".to_string(),
+            "Lib.Components.Gain".to_string(),
+        ],
+        "imported names precede outer and global scope names"
     );
     assert_eq!(
         session.class_type_resolution_candidates_query("input.mo", "Demo.Outer", "Inner"),
         vec![
             "Demo.Outer.Inner".to_string(),
             "Lib.Components.Inner".to_string(),
+            "Demo.Inner".to_string(),
             "Inner".to_string(),
         ],
-        "simple type candidates should keep nested classes ahead of wildcard imports and raw fallback"
+        "local declarations precede wildcard imports and enclosing scopes"
     );
     assert_eq!(
         session.class_type_resolution_candidates_query(
@@ -146,12 +146,12 @@ end Outer;
     assert_eq!(
         session.class_type_resolution_candidates_query("input.mo", "Demo.Outer", "Continuous.PID"),
         vec![
-            "Lib.Components.Continuous.PID".to_string(),
             "Demo.Outer.Continuous.PID".to_string(),
+            "Lib.Components.Continuous.PID".to_string(),
             "Demo.Continuous.PID".to_string(),
             "Continuous.PID".to_string(),
         ],
-        "wildcard imports should resolve the first segment of a dotted reference before suffix fallback"
+        "qualified names retain local, imported, enclosing, and global scope order"
     );
     assert_eq!(
         session.class_type_resolution_candidates_query(

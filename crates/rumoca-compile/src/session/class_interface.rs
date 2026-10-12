@@ -169,6 +169,7 @@ impl ExtendInterface {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ClassInterface {
     class_type: rumoca_core::ClassType,
+    encapsulated: bool,
     import_map: ImportMap,
     components: IndexMap<String, ComponentInterface>,
     nested_classes: Vec<NestedClassInterface>,
@@ -216,19 +217,6 @@ impl ClassInterface {
         &self.extends
     }
 
-    pub(crate) fn type_resolution_candidates(
-        &self,
-        enclosing_qualified_name: &str,
-        raw_type_name: &str,
-    ) -> Vec<String> {
-        ClassNameScope {
-            enclosing_qualified_name,
-            imports: &self.import_map,
-            nested_classes: &self.nested_classes,
-        }
-        .type_resolution_candidates(raw_type_name)
-    }
-
     pub(crate) fn local_completion_items(&self) -> Vec<ClassLocalCompletionItem> {
         let mut items = Vec::new();
 
@@ -257,62 +245,150 @@ impl ClassInterface {
     }
 }
 
-struct ClassNameScope<'a> {
-    enclosing_qualified_name: &'a str,
-    imports: &'a ImportMap,
-    nested_classes: &'a [NestedClassInterface],
+/// Ordered lexical/import candidates shared by mutable and snapshot readers.
+/// The lookup supplies exact declared class scopes, including across files.
+pub(crate) fn type_resolution_candidates(
+    enclosing: &str,
+    raw_name: &str,
+    mut scope_interface: impl FnMut(&str) -> Option<ClassInterface>,
+) -> Vec<String> {
+    collect_type_candidates(
+        enclosing,
+        raw_name,
+        &mut scope_interface,
+        &mut IndexSet::new(),
+    )
 }
 
-impl ClassNameScope<'_> {
-    fn type_resolution_candidates(&self, raw_type_name: &str) -> Vec<String> {
-        if raw_type_name.is_empty() {
-            return Vec::new();
-        }
-
-        let mut seen = IndexSet::new();
-        let mut candidates = Vec::new();
-        let mut push = |candidate: String| {
-            if !candidate.is_empty() && seen.insert(candidate.clone()) {
-                candidates.push(candidate);
-            }
-        };
-
-        if raw_type_name.starts_with('.') {
-            push(raw_type_name.trim_start_matches('.').to_string());
-            return candidates;
-        }
-
-        self.push_nested_class_candidate(raw_type_name, &mut push);
-        for candidate in self.imports.resolve_candidates(raw_type_name) {
-            push(candidate);
-        }
-        if rumoca_core::parent_scope(raw_type_name).is_some() {
-            self.push_enclosing_scope_candidates(raw_type_name, &mut push);
-        }
-        push(raw_type_name.to_string());
-        candidates
+fn collect_type_candidates(
+    enclosing: &str,
+    raw_name: &str,
+    lookup: &mut impl FnMut(&str) -> Option<ClassInterface>,
+    visiting: &mut IndexSet<(String, String)>,
+) -> Vec<String> {
+    if raw_name.is_empty() {
+        return Vec::new();
     }
-
-    fn push_nested_class_candidate(&self, raw_type_name: &str, push: &mut impl FnMut(String)) {
-        if self
-            .nested_classes
-            .iter()
-            .any(|nested_class| nested_class.name == raw_type_name)
+    if raw_name.starts_with('.') {
+        return vec![raw_name.trim_start_matches('.').to_owned()];
+    }
+    let key = (enclosing.to_owned(), raw_name.to_owned());
+    if !visiting.insert(key.clone()) {
+        return Vec::new();
+    }
+    let mut candidates = IndexSet::new();
+    let mut scope = Some(enclosing);
+    let mut allow_global = true;
+    while let Some(current) = scope {
+        candidates.insert(if current.is_empty() {
+            raw_name.to_owned()
+        } else {
+            format!("{current}.{raw_name}")
+        });
+        // A qualified reference may enter a package alias. Its inherited
+        // classes keep the defining package identity in the query result.
+        if let Some((head, tail)) = rumoca_core::split_first_top_level(raw_name)
+            && !tail.is_empty()
         {
-            push(format!(
-                "{}.{}",
-                self.enclosing_qualified_name, raw_type_name
-            ));
+            let head_class = if current.is_empty() {
+                head.to_owned()
+            } else {
+                format!("{current}.{head}")
+            };
+            let bound_head = lookup(&head_class).is_some();
+            collect_inherited_type_candidates(&head_class, tail, lookup, visiting, &mut candidates);
+            if bound_head {
+                allow_global = false;
+                break;
+            }
         }
+        if let Some(interface) = lookup(current) {
+            for base in &interface.extends {
+                let base_target =
+                    collect_type_candidates(current, base.base_name(), lookup, visiting)
+                        .into_iter()
+                        .find(|candidate| lookup(candidate).is_some());
+                if let Some(base_target) = base_target {
+                    collect_inherited_type_candidates(
+                        &base_target,
+                        raw_name,
+                        lookup,
+                        visiting,
+                        &mut candidates,
+                    );
+                }
+            }
+            let (head, tail) =
+                rumoca_core::split_first_top_level(raw_name).unwrap_or((raw_name, ""));
+            let explicit = interface
+                .import_map
+                .explicit_bindings
+                .iter()
+                .filter(|(local, _)| local == head)
+                .collect::<Vec<_>>();
+            if !explicit.is_empty() {
+                for (_, target) in explicit {
+                    let imported = if tail.is_empty() {
+                        target.clone()
+                    } else {
+                        format!("{target}.{tail}")
+                    };
+                    candidates.insert(imported);
+                    if !tail.is_empty() {
+                        collect_inherited_type_candidates(
+                            target,
+                            tail,
+                            lookup,
+                            visiting,
+                            &mut candidates,
+                        );
+                    }
+                }
+                allow_global = false;
+                break;
+            }
+            candidates.extend(interface.import_map.resolve_candidates(raw_name));
+            if interface.encapsulated {
+                break;
+            }
+        }
+        scope = if current.is_empty() {
+            None
+        } else {
+            Some(rumoca_core::parent_scope(current).unwrap_or(""))
+        };
     }
+    if allow_global {
+        candidates.insert(raw_name.to_owned());
+    }
+    visiting.shift_remove(&key);
+    candidates.into_iter().collect()
+}
 
-    fn push_enclosing_scope_candidates(&self, raw_type_name: &str, push: &mut impl FnMut(String)) {
-        let mut scope = Some(self.enclosing_qualified_name);
-        while let Some(current_scope) = scope {
-            push(format!("{current_scope}.{raw_type_name}"));
-            scope = rumoca_core::parent_scope(current_scope);
+fn collect_inherited_type_candidates(
+    class_name: &str,
+    raw_name: &str,
+    lookup: &mut impl FnMut(&str) -> Option<ClassInterface>,
+    visiting: &mut IndexSet<(String, String)>,
+    candidates: &mut IndexSet<String>,
+) {
+    let Some(interface) = lookup(class_name) else {
+        return;
+    };
+    let key = (class_name.to_owned(), format!("inherited:{raw_name}"));
+    if !visiting.insert(key.clone()) {
+        return;
+    }
+    candidates.insert(format!("{class_name}.{raw_name}"));
+    for base in &interface.extends {
+        let target = collect_type_candidates(class_name, base.base_name(), lookup, visiting)
+            .into_iter()
+            .find(|candidate| lookup(candidate).is_some());
+        if let Some(target) = target {
+            collect_inherited_type_candidates(&target, raw_name, lookup, visiting, candidates);
         }
     }
+    visiting.shift_remove(&key);
 }
 
 #[derive(Debug, Clone, Default)]
@@ -351,6 +427,7 @@ impl ClassInterface {
     fn from_summary(class: &super::file_summary::ClassSummary) -> Self {
         Self {
             class_type: class.class_type.clone(),
+            encapsulated: class.encapsulated,
             import_map: import_map_from_summary(class),
             components: class
                 .components

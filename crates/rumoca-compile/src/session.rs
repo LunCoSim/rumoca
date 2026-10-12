@@ -29,6 +29,24 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+#[derive(Debug, Clone)]
+struct ComponentDeclarationsCacheEntry {
+    revision: u64,
+    declarations: Option<Arc<Vec<ClassComponentDeclaration>>>,
+}
+
+/// Inheritance-merged declaration and scoped type-prefix facts for authoring.
+/// The component retains its authored expressions and source coordinates.
+#[derive(Debug, Clone)]
+pub struct ClassComponentDeclaration {
+    pub declaring_class: String,
+    pub type_name: String,
+    pub component: ast::Component,
+    pub effective_causality: rumoca_core::Causality,
+    pub scalar_type: Option<rumoca_core::PredefinedComponentType>,
+    pub has_type_dimensions: bool,
+}
+
 mod lru_cache;
 mod parsed_source_document;
 mod session_impl;
@@ -1309,6 +1327,7 @@ struct AstQueryState {
     file_class_body_cache: IndexMap<FileId, FileClassBodyQueryCache>,
     class_body_semantics_cache: IndexMap<FileId, ClassBodySemanticsQueryCache>,
     class_component_members_query_cache: IndexMap<String, ClassComponentMembersQueryCache>,
+    class_component_declarations_query_cache: IndexMap<String, ComponentDeclarationsCacheEntry>,
     file_outline_cache: IndexMap<FileId, FileOutlineQueryCache>,
     workspace_symbol_query_cache: Option<WorkspaceSymbolQueryCache>,
 }

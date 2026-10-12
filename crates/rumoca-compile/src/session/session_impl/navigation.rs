@@ -102,17 +102,26 @@ impl<'a> NavigationReadContext<'a> {
         qualified_name: &str,
         raw_name: &str,
     ) -> Vec<String> {
-        self.class_interface_query(uri, qualified_name)
-            .map(|class_interface| {
-                class_interface.type_resolution_candidates(qualified_name, raw_name)
-            })
-            .unwrap_or_else(|| {
-                if raw_name.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![raw_name.to_string()]
+        crate::session::class_interface::type_resolution_candidates(
+            qualified_name,
+            raw_name,
+            |scope| {
+                if scope == qualified_name {
+                    return self.class_interface_query(uri, scope).cloned();
                 }
-            })
+                let map = &self
+                    .session
+                    .query_state
+                    .ast
+                    .package_def_map
+                    .session_cache
+                    .as_ref()?
+                    .def_map;
+                let entry = map.declared_class(scope)?;
+                let parent_uri = self.session.file_uris.get(&entry.item_key.file_id())?;
+                self.class_interface_query(parent_uri, scope).cloned()
+            },
+        )
     }
 
     fn class_interface_query(&self, uri: &str, qualified_name: &str) -> Option<&ClassInterface> {

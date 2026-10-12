@@ -26,6 +26,13 @@ pub(crate) struct QueryClassNavigationTarget {
     pub(crate) location: rumoca_core::Location,
 }
 
+#[derive(Clone)]
+struct QueryTypePrefixes {
+    causality: rumoca_core::Causality,
+    scalar_type: Option<rumoca_core::PredefinedComponentType>,
+    has_dimensions: bool,
+}
+
 struct NavigationTargetSearch<'a> {
     uri: &'a str,
     file_id: FileId,
@@ -1062,17 +1069,17 @@ impl Session {
         qualified_name: &str,
         raw_name: &str,
     ) -> Vec<String> {
-        self.class_interface_query(uri, qualified_name)
-            .map(|class_interface| {
-                class_interface.type_resolution_candidates(qualified_name, raw_name)
-            })
-            .unwrap_or_else(|| {
-                if raw_name.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![raw_name.to_string()]
-                }
-            })
+        super::class_interface::type_resolution_candidates(qualified_name, raw_name, |scope| {
+            if scope == qualified_name {
+                return self.class_interface_query(uri, scope);
+            }
+            let entry = self
+                .session_package_def_map_query()?
+                .declared_class(scope)?
+                .clone();
+            let parent_uri = self.file_uris.get(&entry.item_key.file_id())?.clone();
+            self.class_interface_query(&parent_uri, scope)
+        })
     }
 
     /// Resolve type candidates using one class scope from the class-interface layer.
@@ -1082,23 +1089,9 @@ impl Session {
         raw_name: &str,
     ) -> Vec<String> {
         let Some(target) = self.lookup_query_class_target(class_name) else {
-            return if raw_name.is_empty() {
-                Vec::new()
-            } else {
-                vec![raw_name.to_string()]
-            };
+            return Vec::new();
         };
-        self.class_interface_query(&target.uri, &target.qualified_name)
-            .map(|class_interface| {
-                class_interface.type_resolution_candidates(&target.qualified_name, raw_name)
-            })
-            .unwrap_or_else(|| {
-                if raw_name.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![raw_name.to_string()]
-                }
-            })
+        self.class_type_resolution_candidates_query(&target.uri, &target.qualified_name, raw_name)
     }
 
     /// Resolve one local component type for a class scope using cached parsed AST.
@@ -1132,13 +1125,58 @@ impl Session {
         )
     }
 
-    /// Resolve inheritance-merged declarations with their authored component
-    /// facts and declaring class. Unresolved bases or cyclic inheritance return
-    /// `None`; a valid class with no components returns `Some(Vec::new())`.
+    /// Resolve inheritance-merged declarations and their scoped type prefixes.
+    /// Authored expressions stay unchanged; causality and primitive/array type
+    /// facts are returned separately. Missing types, bases, or cyclic inheritance
+    /// return `None`; a valid empty class returns `Some(Vec::new())`.
     pub fn class_component_declarations_query(
         &mut self,
         class_name: &str,
-    ) -> Option<Vec<(String, String, ast::Component)>> {
+    ) -> Option<Arc<Vec<ClassComponentDeclaration>>> {
+        let revision = self.revision();
+        if let Some(entry) = self
+            .query_state
+            .ast
+            .class_component_declarations_query_cache
+            .shift_remove(class_name)
+        {
+            let hit = entry.revision == revision;
+            let declarations = entry.declarations.clone();
+            self.query_state
+                .ast
+                .class_component_declarations_query_cache
+                .insert(class_name.to_owned(), entry);
+            if hit {
+                return declarations;
+            }
+        }
+        let declarations = self
+            .class_component_declarations_uncached(class_name)
+            .map(Arc::new);
+        self.query_state
+            .ast
+            .class_component_declarations_query_cache
+            .insert(
+                class_name.to_owned(),
+                ComponentDeclarationsCacheEntry {
+                    revision,
+                    declarations: declarations.clone(),
+                },
+            );
+        Self::trim_lru_cache(
+            &mut self
+                .query_state
+                .ast
+                .class_component_declarations_query_cache,
+            MAX_SESSION_SEMANTIC_NAVIGATION_CACHE_ENTRIES,
+        );
+        declarations
+    }
+
+    fn class_component_declarations_uncached(
+        &mut self,
+        class_name: &str,
+    ) -> Option<Vec<ClassComponentDeclaration>> {
         let target = self.lookup_query_class_target(class_name)?;
         let mut members = IndexMap::new();
         self.collect_query_class_component_members(
@@ -1148,6 +1186,7 @@ impl Session {
             &mut std::collections::HashSet::new(),
             &mut SummarySignature::new(),
         )?;
+        let mut type_prefixes = std::collections::HashMap::new();
         members
             .into_iter()
             .map(|(name, (declaring, type_name))| {
@@ -1156,9 +1195,106 @@ impl Session {
                     .components
                     .get(&name)?
                     .clone();
-                Some((declaring, type_name, component))
+                let prefixes = self.query_type_prefixes_in_scope(
+                    &declaring,
+                    &component.type_name.to_string(),
+                    &mut std::collections::HashSet::new(),
+                    &mut type_prefixes,
+                )?;
+                let effective_causality =
+                    if matches!(component.causality, rumoca_core::Causality::Empty) {
+                        prefixes.causality
+                    } else {
+                        component.causality.clone()
+                    };
+                Some(ClassComponentDeclaration {
+                    declaring_class: declaring,
+                    type_name,
+                    component,
+                    effective_causality,
+                    scalar_type: prefixes.scalar_type,
+                    has_type_dimensions: prefixes.has_dimensions,
+                })
             })
             .collect()
+    }
+
+    fn query_type_prefixes_in_scope(
+        &mut self,
+        scope: &str,
+        name: &str,
+        visiting: &mut std::collections::HashSet<String>,
+        cache: &mut std::collections::HashMap<String, QueryTypePrefixes>,
+    ) -> Option<QueryTypePrefixes> {
+        if rumoca_core::is_builtin_type(name) {
+            return Some(QueryTypePrefixes {
+                causality: rumoca_core::Causality::Empty,
+                scalar_type: rumoca_core::PredefinedComponentType::from_name(name),
+                has_dimensions: false,
+            });
+        }
+        let candidates = self.class_type_resolution_candidates_in_class_query(scope, name);
+        // Member references require an exact lexical/import candidate. The
+        // user-facing unique-suffix class selector is not a type resolver.
+        let qualified = candidates.into_iter().find(|candidate| {
+            self.session_package_def_map_query()
+                .is_some_and(|map| map.declared_class(candidate).is_some())
+        })?;
+        if let Some(prefixes) = cache.get(&qualified) {
+            return Some(prefixes.clone());
+        }
+        if !visiting.insert(qualified.clone()) {
+            return None;
+        }
+        let (causality, has_dimensions, bases, primitive_alias) = {
+            let class = self.class_definition_query(&qualified)?;
+            (
+                class.causality.clone(),
+                !class.array_subscripts.is_empty(),
+                class
+                    .extends
+                    .iter()
+                    .map(|base| base.base_name.to_string())
+                    .collect::<Vec<_>>(),
+                class.components.is_empty()
+                    && matches!(
+                        class.class_type,
+                        rumoca_core::ClassType::Type
+                            | rumoca_core::ClassType::Connector
+                            | rumoca_core::ClassType::Class
+                    ),
+            )
+        };
+        let mut prefixes = QueryTypePrefixes {
+            causality,
+            has_dimensions,
+            scalar_type: None,
+        };
+        for base in bases {
+            let inherited =
+                self.query_type_prefixes_in_scope(&qualified, &base, visiting, cache)?;
+            prefixes.has_dimensions |= inherited.has_dimensions;
+            if primitive_alias {
+                if prefixes.scalar_type.is_some()
+                    && inherited.scalar_type.is_some()
+                    && prefixes.scalar_type != inherited.scalar_type
+                {
+                    return None;
+                }
+                prefixes.scalar_type = prefixes.scalar_type.or(inherited.scalar_type);
+            }
+            if matches!(prefixes.causality, rumoca_core::Causality::Empty) {
+                prefixes.causality = inherited.causality;
+            } else if !matches!(inherited.causality, rumoca_core::Causality::Empty)
+                && std::mem::discriminant(&prefixes.causality)
+                    != std::mem::discriminant(&inherited.causality)
+            {
+                return None;
+            }
+        }
+        visiting.remove(&qualified);
+        cache.insert(qualified, prefixes.clone());
+        Some(prefixes)
     }
 
     /// Resolve local completion entries for one class scope from the class-interface layer.
@@ -1500,8 +1636,11 @@ impl Session {
         self.record_query_dependency_signature(uri, signature);
         let class_interface = self.class_interface_query(uri, qualified_name)?;
         for extend in class_interface.extends() {
-            let base_candidates =
-                class_interface.type_resolution_candidates(qualified_name, extend.base_name());
+            let base_candidates = self.class_type_resolution_candidates_query(
+                uri,
+                qualified_name,
+                extend.base_name(),
+            );
             let Some(base_target) = self.lookup_query_extends_target(&base_candidates) else {
                 // Primitive types have no named component declarations.
                 if rumoca_core::is_builtin_type(extend.base_name()) {
@@ -1553,8 +1692,12 @@ impl Session {
         base_candidates: &[String],
     ) -> Option<QueryClassLookup> {
         for candidate in base_candidates {
-            if let Some(target) = self.lookup_query_class_target(candidate) {
-                return Some(target);
+            if self
+                .session_package_def_map_query()?
+                .declared_class(candidate)
+                .is_some()
+            {
+                return self.lookup_query_class_target(candidate);
             }
         }
         None

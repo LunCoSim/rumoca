@@ -194,3 +194,19 @@ session used by that child.
 
 The focused command was
 `cargo test --locked -p rumoca-compile --lib within_import -j4`.
+
+## Scoped declaration type facts
+
+`Session::class_component_declarations_query` returns immutable
+`ClassComponentDeclaration` records with authored components kept separate from
+effective causality, primitive type, and type-dimension facts. Aliases use the
+shared lexical/import candidate query, including inherited nested classes and
+package aliases. Encapsulation stops outward scope lookup; an unrelated unique
+suffix cannot satisfy a type reference. The declaration result is cached by
+session revision under the existing semantic-navigation cache bound.
+
+`cargo test --locked -p rumoca-compile --lib class_ -j4` passed 51 checks,
+including alias chains, records with signal-looking names, alias dimensions,
+parent imports, encapsulation, inherited types, package aliases, negative
+missing/cyclic types, lexical/import head shadowing, shared result reuse,
+and source-revision invalidation.

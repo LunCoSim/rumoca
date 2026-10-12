@@ -311,7 +311,7 @@ end M;
     );
     assert_eq!(
         snapshot.class_type_resolution_candidates_query("input.mo", "M", "Alias"),
-        vec!["Lib.Helper".to_string(), "Alias".to_string()],
+        vec!["M.Alias".to_string(), "Lib.Helper".to_string(),],
         "prewarmed snapshots should preserve exact import resolution"
     );
     assert_eq!(
@@ -358,7 +358,7 @@ end Test2;
     );
     assert_eq!(
         snapshot.class_type_resolution_candidates_in_class_query("Test2", "Pose"),
-        vec!["SE2".to_string(), "Pose".to_string()],
+        vec!["Test2.Pose".to_string(), "SE2".to_string(),],
         "type resolution should honor class-local import aliases"
     );
 }
@@ -414,7 +414,7 @@ end Test2;
     );
     assert_eq!(
         snapshot.class_type_resolution_candidates_query("input.mo", "Test2", "SE2"),
-        vec!["SE2".to_string()],
+        vec!["Test2.SE2".to_string(), "SE2".to_string()],
         "recoverable body edits should keep type-resolution candidates stable"
     );
     assert_eq!(

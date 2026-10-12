@@ -236,28 +236,32 @@ fn class_definition_query_component_declarations_are_typed_and_complete() {
         .class_component_declarations_query("Space.P.Derived")
         .expect("resolved declarations");
     assert_eq!(members.len(), 3);
-    let (origin, _, parameter) = members
+    let parameter = members
         .iter()
-        .find(|(_, _, c)| c.name == "k")
+        .find(|member| member.component.name == "k")
         .expect("inherited parameter");
-    assert_eq!(origin, "Space.P.Base");
+    assert_eq!(parameter.declaring_class, "Space.P.Base");
     assert!(matches!(
-        parameter.variability,
+        parameter.component.variability,
         rumoca_core::Variability::Parameter(_)
     ));
     assert_eq!(
         parameter
+            .component
             .binding
             .as_ref()
             .map(ToString::to_string)
             .as_deref(),
         Some("2")
     );
-    let (_, _, input) = members
+    let input = members
         .iter()
-        .find(|(_, _, c)| c.name == "u")
+        .find(|member| member.component.name == "u")
         .expect("inherited input");
-    assert!(matches!(input.causality, rumoca_core::Causality::Input(_)));
+    assert!(matches!(
+        input.effective_causality,
+        rumoca_core::Causality::Input(_)
+    ));
     for invalid in ["Space.P.Broken", "Space.P.Cyclic", "Space.P.Unknown"] {
         assert!(
             session
@@ -292,6 +296,166 @@ fn class_definition_query_component_declarations_are_typed_and_complete() {
     assert!(
         parsed
             .get_class_by_qualified_name_mut("Other.Space.P.Base")
+            .is_none()
+    );
+}
+
+#[test]
+fn class_component_declarations_resolve_type_prefixes_and_alias_dimensions() {
+    let mut session = Session::default();
+    session.add_document("prefix.mo", "package Facts connector Receiver=input Real; connector Sender=output Real; connector Again=Receiver; type Vector=Real[2]; type Caption=String; record FauxInput Real pressure; end FauxInput; model Probe Receiver u; Again u2; Sender y; FauxInput internal; parameter Vector values={1,2}; parameter Caption label=\"label\"; end Probe; connector CycleA=CycleB; connector CycleB=CycleA; model Cyclic CycleA x; end Cyclic; model Missing Absent x; end Missing; end Facts;").expect("valid source");
+    let members = session
+        .class_component_declarations_query("Facts.Probe")
+        .expect("resolved types");
+    for name in ["u", "u2"] {
+        let member = members
+            .iter()
+            .find(|member| member.component.name == name)
+            .unwrap();
+        assert!(matches!(
+            member.effective_causality,
+            rumoca_core::Causality::Input(_)
+        ));
+        assert_eq!(
+            member.scalar_type,
+            Some(rumoca_core::PredefinedComponentType::Real)
+        );
+        assert!(matches!(
+            member.component.causality,
+            rumoca_core::Causality::Empty
+        ));
+    }
+    let output = members
+        .iter()
+        .find(|member| member.component.name == "y")
+        .unwrap();
+    assert!(matches!(
+        output.effective_causality,
+        rumoca_core::Causality::Output(_)
+    ));
+    let internal = members
+        .iter()
+        .find(|member| member.component.name == "internal")
+        .unwrap();
+    assert!(matches!(
+        internal.effective_causality,
+        rumoca_core::Causality::Empty
+    ));
+    assert_eq!(internal.scalar_type, None);
+    let vector = members
+        .iter()
+        .find(|member| member.component.name == "values")
+        .unwrap();
+    assert!(vector.has_type_dimensions);
+    assert!(vector.component.shape_expr.is_empty());
+    let caption = members
+        .iter()
+        .find(|member| member.component.name == "label")
+        .unwrap();
+    assert_eq!(
+        caption.scalar_type,
+        Some(rumoca_core::PredefinedComponentType::String)
+    );
+    for invalid in ["Facts.Missing", "Facts.Cyclic"] {
+        assert!(
+            session
+                .class_component_declarations_query(invalid)
+                .is_none()
+        );
+    }
+    session
+        .add_document(
+            "elsewhere.mo",
+            "package Elsewhere model Absent end Absent; end Elsewhere;",
+        )
+        .unwrap();
+    assert!(
+        session
+            .class_component_declarations_query("Facts.Missing")
+            .is_none(),
+        "a globally unique suffix does not satisfy a lexical type reference"
+    );
+}
+
+#[test]
+fn class_component_declarations_respect_parent_imports_and_encapsulation() {
+    let mut session = Session::default();
+    session
+        .add_document(
+            "external.mo",
+            "package External connector Signal=input Real; end External;",
+        )
+        .unwrap();
+    session.add_document("parent.mo", "package Root import Alias=External.Signal; model Child Alias u; end Child; encapsulated model Isolated Alias u; end Isolated; encapsulated model Explicit import Alias=External.Signal; Alias u; end Explicit; end Root;").unwrap();
+    for target in ["Root.Child", "Root.Explicit"] {
+        let declarations = session
+            .class_component_declarations_query(target)
+            .expect("visible import");
+        assert!(matches!(
+            declarations[0].effective_causality,
+            rumoca_core::Causality::Input(_)
+        ));
+        let hit = session.class_component_declarations_query(target).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&declarations, &hit));
+    }
+    assert!(
+        session
+            .class_component_declarations_query("Root.Isolated")
+            .is_none()
+    );
+    session
+        .add_document(
+            "external.mo",
+            "package External connector Signal=output Real; end External;",
+        )
+        .unwrap();
+    let changed = session
+        .class_component_declarations_query("Root.Child")
+        .unwrap();
+    assert!(matches!(
+        changed[0].effective_causality,
+        rumoca_core::Causality::Output(_)
+    ));
+}
+
+#[test]
+fn class_component_declarations_resolve_inherited_types_and_package_aliases() {
+    let mut session = Session::default();
+    session.add_document("inherited-types.mo", "package Types connector Signal=input Real; end Types; package Alias=Types; model Base connector Signal=output Real; end Base; model Derived extends Base; Signal y; end Derived; model ThroughPackage Alias.Signal u; end ThroughPackage;").unwrap();
+    let inherited = session
+        .class_component_declarations_query("Derived")
+        .unwrap();
+    assert!(matches!(
+        inherited[0].effective_causality,
+        rumoca_core::Causality::Output(_)
+    ));
+    let package = session
+        .class_component_declarations_query("ThroughPackage")
+        .unwrap();
+    assert!(matches!(
+        package[0].effective_causality,
+        rumoca_core::Causality::Input(_)
+    ));
+}
+
+#[test]
+fn class_component_declarations_do_not_replace_a_bound_qualified_head() {
+    let mut session = Session::default();
+    session.add_document("shadow.mo", "package P connector Signal=input Real; end P; package Local package P connector Different=output Real; end P; model Missing P.Signal u; end Missing; end Local;").unwrap();
+    assert!(
+        session
+            .class_component_declarations_query("Local.Missing")
+            .is_none()
+    );
+}
+
+#[test]
+fn class_component_declarations_do_not_replace_an_explicit_import_head() {
+    let mut session = Session::default();
+    session.add_document("import-shadow.mo", "package P connector Signal=input Real; end P; package Source connector Different=output Real; end Source; model Missing import P=Source; P.Signal u; end Missing;").unwrap();
+    assert!(
+        session
+            .class_component_declarations_query("Missing")
             .is_none()
     );
 }
