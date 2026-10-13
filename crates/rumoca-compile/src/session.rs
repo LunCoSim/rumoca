@@ -1027,6 +1027,7 @@ struct OrphanPackageDefMapQueryCache {
 
 #[derive(Debug, Clone)]
 struct SessionPackageDefMapQueryCache {
+    validated_revision: Option<u64>,
     signature: SessionQuerySignature,
     def_map: PackageDefMap,
 }
@@ -1063,7 +1064,9 @@ impl PackageDefMapState {
             self.orphan_cache = Some(orphan_cache.clone());
         }
         if let Some(session_cache) = &other.session_cache {
-            self.session_cache = Some(session_cache.clone());
+            let mut cache = session_cache.clone();
+            cache.validated_revision = None;
+            self.session_cache = Some(cache);
         }
     }
 }

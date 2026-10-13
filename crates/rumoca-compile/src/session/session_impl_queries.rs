@@ -1471,6 +1471,23 @@ impl Session {
     }
 
     fn session_package_def_map_query(&mut self) -> Option<&PackageDefMap> {
+        let revision = self.revision();
+        if self
+            .query_state
+            .ast
+            .package_def_map
+            .session_cache
+            .as_ref()
+            .is_some_and(|entry| entry.validated_revision == Some(revision))
+        {
+            return self
+                .query_state
+                .ast
+                .package_def_map
+                .session_cache
+                .as_ref()
+                .map(|entry| &entry.def_map);
+        }
         let signature = self.session_query_signature();
         if self
             .query_state
@@ -1480,13 +1497,14 @@ impl Session {
             .as_ref()
             .is_some_and(|entry| entry.signature == signature)
         {
-            return self
+            let entry = self
                 .query_state
                 .ast
                 .package_def_map
                 .session_cache
-                .as_ref()
-                .map(|entry| &entry.def_map);
+                .as_mut()?;
+            entry.validated_revision = Some(revision);
+            return Some(&entry.def_map);
         }
 
         let mut def_map = PackageDefMap::default();
@@ -1510,8 +1528,11 @@ impl Session {
             def_map.extend_from_package_def_map(orphan_def_map);
         }
 
-        self.query_state.ast.package_def_map.session_cache =
-            Some(SessionPackageDefMapQueryCache { signature, def_map });
+        self.query_state.ast.package_def_map.session_cache = Some(SessionPackageDefMapQueryCache {
+            validated_revision: Some(self.revision()),
+            signature,
+            def_map,
+        });
         self.query_state
             .ast
             .package_def_map

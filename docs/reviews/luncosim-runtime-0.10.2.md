@@ -231,3 +231,14 @@ identity resolved back to itself. Cold queries, including lazy source hydration,
 took 116.141 seconds; repeated cached queries took 20.748 microseconds. This is
 query coverage and a bounded cache observation, not a numerical canary delta or
 an uncontended performance claim. The temporary canary probe was removed.
+
+## Namespace membership cache
+
+Qualified declaration lookup reuses a package membership map validated at the
+current session revision. It computes the full source-set signature when the
+revision changes. Cache adoption from another session clears the local
+validation stamp, so equal revision numbers cannot authorize foreign membership.
+Source-root invalidation retains its existing cache retirement boundary.
+
+Focused namespace, package-membership, and source-root cache checks cover
+edits, removals, split packages, source-set revisions, and foreign-cache adoption.
