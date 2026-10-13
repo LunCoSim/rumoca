@@ -226,7 +226,7 @@ pub mod compile {
         StrictCompilation, StrictCompileFailure, StrictCompileReport, StructuralOverride,
         WorkspaceSymbol, WorkspaceSymbolKind, WorkspaceSymbolSnapshotTiming,
         compile_phase_timing_stats, install_compile_phase_observer,
-        reset_compile_phase_timing_stats,
+        reset_compile_phase_timing_stats, source_root_dependencies,
     };
 }
 

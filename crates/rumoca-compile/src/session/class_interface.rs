@@ -257,6 +257,23 @@ pub(crate) fn type_resolution_candidates(
         raw_name,
         &mut scope_interface,
         &mut IndexSet::new(),
+        true,
+    )
+}
+
+/// Global/import candidates from the same lexical lookup, excluding speculative
+/// scope-prefixed paths that cannot request an external namespace.
+pub(crate) fn external_type_resolution_candidates(
+    enclosing: &str,
+    raw_name: &str,
+    mut scope_interface: impl FnMut(&str) -> Option<ClassInterface>,
+) -> Vec<String> {
+    collect_type_candidates(
+        enclosing,
+        raw_name,
+        &mut scope_interface,
+        &mut IndexSet::new(),
+        false,
     )
 }
 
@@ -265,6 +282,7 @@ fn collect_type_candidates(
     raw_name: &str,
     lookup: &mut impl FnMut(&str) -> Option<ClassInterface>,
     visiting: &mut IndexSet<(String, String)>,
+    include_lexical: bool,
 ) -> Vec<String> {
     if raw_name.is_empty() {
         return Vec::new();
@@ -280,11 +298,13 @@ fn collect_type_candidates(
     let mut scope = Some(enclosing);
     let mut allow_global = true;
     while let Some(current) = scope {
-        candidates.insert(if current.is_empty() {
-            raw_name.to_owned()
-        } else {
-            format!("{current}.{raw_name}")
-        });
+        if include_lexical {
+            candidates.insert(if current.is_empty() {
+                raw_name.to_owned()
+            } else {
+                format!("{current}.{raw_name}")
+            });
+        }
         // A qualified reference may enter a package alias. Its inherited
         // classes keep the defining package identity in the query result.
         if let Some((head, tail)) = rumoca_core::split_first_top_level(raw_name)
@@ -296,7 +316,15 @@ fn collect_type_candidates(
                 format!("{current}.{head}")
             };
             let bound_head = lookup(&head_class).is_some();
-            collect_inherited_type_candidates(&head_class, tail, lookup, visiting, &mut candidates);
+            if include_lexical {
+                collect_inherited_type_candidates(
+                    &head_class,
+                    tail,
+                    lookup,
+                    visiting,
+                    &mut candidates,
+                );
+            }
             if bound_head {
                 allow_global = false;
                 break;
@@ -305,10 +333,12 @@ fn collect_type_candidates(
         if let Some(interface) = lookup(current) {
             for base in &interface.extends {
                 let base_target =
-                    collect_type_candidates(current, base.base_name(), lookup, visiting)
+                    collect_type_candidates(current, base.base_name(), lookup, visiting, true)
                         .into_iter()
                         .find(|candidate| lookup(candidate).is_some());
-                if let Some(base_target) = base_target {
+                if let Some(base_target) = base_target
+                    && include_lexical
+                {
                     collect_inherited_type_candidates(
                         &base_target,
                         raw_name,
@@ -334,7 +364,7 @@ fn collect_type_candidates(
                         format!("{target}.{tail}")
                     };
                     candidates.insert(imported);
-                    if !tail.is_empty() {
+                    if !tail.is_empty() && include_lexical {
                         collect_inherited_type_candidates(
                             target,
                             tail,
@@ -381,7 +411,7 @@ fn collect_inherited_type_candidates(
     }
     candidates.insert(format!("{class_name}.{raw_name}"));
     for base in &interface.extends {
-        let target = collect_type_candidates(class_name, base.base_name(), lookup, visiting)
+        let target = collect_type_candidates(class_name, base.base_name(), lookup, visiting, true)
             .into_iter()
             .find(|candidate| lookup(candidate).is_some());
         if let Some(target) = target {
