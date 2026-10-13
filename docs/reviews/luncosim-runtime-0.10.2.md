@@ -210,3 +210,24 @@ including alias chains, records with signal-looking names, alias dimensions,
 parent imports, encapsulation, inherited types, package aliases, negative
 missing/cyclic types, lexical/import head shadowing, shared result reuse,
 and source-revision invalidation.
+
+## Qualified declaration identities
+
+MLS 5.3 and SPEC_0002 govern type lookup. `ClassComponentDeclaration.type_name`
+now publishes the exact identity selected by the scoped type-prefix query.
+`component.type_name` retains the authored spelling. Built-in types retain their
+primitive names. This changes source-query output only; checked compilation and
+solver execution do not consume this presentation field.
+
+`cargo test --locked -p rumoca-compile --lib typed_model_query_tests -j 4`
+passed all 11 focused tests with the standard four-thread budgets. Coverage
+includes an import alias, inherited members, two different packages declaring
+`Port`, exact declaring scope, and unchanged authored spelling.
+
+A declaration-query canary used the fixed `infra/verification/msl-canary-20.json`
+roster and MSL 4.1.0. All twenty queries resolved; 125 declarations published a
+qualified identity different from their authored spelling. Every non-builtin
+identity resolved back to itself. Cold queries, including lazy source hydration,
+took 116.141 seconds; repeated cached queries took 20.748 microseconds. This is
+query coverage and a bounded cache observation, not a numerical canary delta or
+an uncontended performance claim. The temporary canary probe was removed.

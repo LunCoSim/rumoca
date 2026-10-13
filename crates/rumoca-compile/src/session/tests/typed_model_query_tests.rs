@@ -459,3 +459,39 @@ fn class_component_declarations_do_not_replace_an_explicit_import_head() {
             .is_none()
     );
 }
+
+#[test]
+fn declaration_types_preserve_exact_scoped_identity() {
+    let mut session = Session::default();
+    session
+        .add_document(
+            "scope.mo",
+            r#"
+package A
+  connector Port Real potential; flow Real transfer; end Port;
+  model Base Port inlet; end Base;
+  model Derived extends Base; end Derived;
+end A;
+package B
+  connector Port = input Real;
+end B;
+model Root
+  import Selected = A.Derived;
+  Selected child;
+end Root;
+"#,
+        )
+        .unwrap();
+    let root = session.class_component_declarations_query("Root").unwrap();
+    assert_eq!(root[0].type_name, "A.Derived");
+    assert_eq!(root[0].component.type_name.to_string(), "Selected");
+    let derived = session
+        .class_component_declarations_query("A.Derived")
+        .unwrap();
+    assert_eq!(derived[0].type_name, "A.Port");
+    assert_eq!(derived[0].declaring_class, "A.Base");
+    let flows = session
+        .class_component_declarations_query("A.Port")
+        .unwrap();
+    assert!(flows.iter().all(|member| member.type_name == "Real"));
+}

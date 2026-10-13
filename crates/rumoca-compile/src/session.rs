@@ -40,6 +40,8 @@ struct ComponentDeclarationsCacheEntry {
 #[derive(Debug, Clone)]
 pub struct ClassComponentDeclaration {
     pub declaring_class: String,
+    /// Exact scoped type identity; built-in primitive names stay unqualified.
+    /// The authored type spelling remains in `component.type_name`.
     pub type_name: String,
     pub component: ast::Component,
     pub effective_causality: rumoca_core::Causality,

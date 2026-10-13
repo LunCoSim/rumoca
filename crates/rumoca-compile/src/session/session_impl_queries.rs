@@ -28,6 +28,7 @@ pub(crate) struct QueryClassNavigationTarget {
 
 #[derive(Clone)]
 struct QueryTypePrefixes {
+    qualified_type_name: String,
     causality: rumoca_core::Causality,
     scalar_type: Option<rumoca_core::PredefinedComponentType>,
     has_dimensions: bool,
@@ -1189,7 +1190,7 @@ impl Session {
         let mut type_prefixes = std::collections::HashMap::new();
         members
             .into_iter()
-            .map(|(name, (declaring, type_name))| {
+            .map(|(name, (declaring, _type_name))| {
                 let component = self
                     .class_definition_query(&declaring)?
                     .components
@@ -1209,7 +1210,7 @@ impl Session {
                     };
                 Some(ClassComponentDeclaration {
                     declaring_class: declaring,
-                    type_name,
+                    type_name: prefixes.qualified_type_name,
                     component,
                     effective_causality,
                     scalar_type: prefixes.scalar_type,
@@ -1228,6 +1229,7 @@ impl Session {
     ) -> Option<QueryTypePrefixes> {
         if rumoca_core::is_builtin_type(name) {
             return Some(QueryTypePrefixes {
+                qualified_type_name: name.to_owned(),
                 causality: rumoca_core::Causality::Empty,
                 scalar_type: rumoca_core::PredefinedComponentType::from_name(name),
                 has_dimensions: false,
@@ -1266,6 +1268,7 @@ impl Session {
             )
         };
         let mut prefixes = QueryTypePrefixes {
+            qualified_type_name: qualified.clone(),
             causality,
             has_dimensions,
             scalar_type: None,
