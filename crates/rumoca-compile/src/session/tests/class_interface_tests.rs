@@ -1,6 +1,98 @@
 use super::*;
 
 #[test]
+fn multiple_bases_do_not_recursively_resolve_each_other() {
+    let mut session = Session::default();
+    session
+        .add_document(
+            "lookup.mo",
+            r#"
+package Library
+  type Signal = Real;
+  model B1 end B1;
+  model B2 end B2;
+  model B3 end B3;
+  model B4 end B4;
+  model B5 end B5;
+  model Device
+    extends B1;
+    extends B2;
+    extends B3;
+    extends B4;
+    extends B5;
+    Signal value;
+  end Device;
+  package ContainerBase
+    model ParentBody Real inherited; end ParentBody;
+  end ContainerBase;
+  package Container
+    extends ContainerBase;
+    model Child extends ParentBody; end Child;
+  end Container;
+  model Supplier
+    model Unavailable Real wrong; end Unavailable;
+  end Supplier;
+  model Invalid extends Supplier; extends Unavailable; end Invalid;
+  model Cycle1 extends Cycle2; end Cycle1;
+  model Cycle2 extends Cycle1; end Cycle2;
+end Library;
+"#,
+        )
+        .unwrap();
+    let interfaces: std::collections::HashMap<_, _> = [
+        "Library",
+        "Library.Signal",
+        "Library.B1",
+        "Library.B2",
+        "Library.B3",
+        "Library.B4",
+        "Library.B5",
+        "Library.Device",
+    ]
+    .into_iter()
+    .map(|name| {
+        (
+            name.to_owned(),
+            session.class_interface_query("lookup.mo", name).unwrap(),
+        )
+    })
+    .collect();
+    let mut lookups = 0;
+    let candidates = crate::session::class_interface::type_resolution_candidates(
+        "Library.Device",
+        "Signal",
+        crate::session::class_interface::LookupKind::Type,
+        |name| {
+            lookups += 1;
+            interfaces.get(name).cloned()
+        },
+    );
+    assert_eq!(
+        candidates
+            .iter()
+            .find(|name| interfaces.contains_key(*name)),
+        Some(&"Library.Signal".to_owned())
+    );
+    assert!(
+        lookups < 200,
+        "five independent bases needed {lookups} scope reads"
+    );
+    eprintln!("five independent bases: {lookups} scope reads");
+    let child = session
+        .class_component_declarations_query("Library.Container.Child")
+        .unwrap();
+    assert_eq!(child[0].component.name, "inherited");
+    for invalid in ["Library.Invalid", "Library.Cycle1"] {
+        assert!(
+            session
+                .class_component_declarations_query(invalid)
+                .is_none(),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
 fn class_interface_queries_collect_imports_and_local_members() {
     let mut session = Session::default();
     let source = r#"
@@ -380,6 +472,12 @@ fn class_interface_cache_is_invalidated_per_file() {
 
     let file_a = session.file_id("a.mo").expect("A should have a file id");
     let file_b = session.file_id("b.mo").expect("B should have a file id");
+    let a_before = session.class_interface_query("a.mo", "A").unwrap();
+    let b_before = session.class_interface_query("b.mo", "B").unwrap();
+    assert!(Arc::ptr_eq(
+        &b_before,
+        &session.class_interface_query("b.mo", "B").unwrap()
+    ));
 
     session
         .class_interface_index_query("a.mo")
@@ -435,6 +533,12 @@ fn class_interface_cache_is_invalidated_per_file() {
     session
         .class_interface_index_query("b.mo")
         .expect("B class interface query should rebuild");
+    let a_after = session.class_interface_query("a.mo", "A").unwrap();
+    let b_after = session.class_interface_query("b.mo", "B").unwrap();
+    assert!(Arc::ptr_eq(&a_before, &a_after));
+    assert!(!Arc::ptr_eq(&b_before, &b_after));
+    assert!(b_before.component_type("z").is_none());
+    assert_eq!(b_after.component_type("z"), Some("Real"));
     assert_ne!(
         session
             .query_state

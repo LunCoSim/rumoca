@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 
 use super::FileId;
 use super::class_interface::{
-    FileClassInterfaceIndex, external_type_resolution_candidates, type_resolution_candidates,
+    FileClassInterfaceIndex, LookupKind, external_type_resolution_candidates,
+    type_resolution_candidates,
 };
 use super::file_summary::{FileSummary, ImportSummary};
 use rumoca_ir_ast as ast;
@@ -37,25 +38,54 @@ pub fn source_root_dependencies(definition: &ast::StoredDefinition) -> BTreeSet<
             } else {
                 path
             };
-            collect_roots(&interfaces, &enclosing, path, true, &mut roots);
+            collect_roots(
+                &interfaces,
+                &enclosing,
+                path,
+                LookupKind::Type,
+                true,
+                &mut roots,
+            );
         }
         for base in &class.extends {
-            collect_roots(&interfaces, &enclosing, &base.base_name, false, &mut roots);
+            collect_roots(
+                &interfaces,
+                &enclosing,
+                &base.base_name,
+                LookupKind::BaseClass,
+                false,
+                &mut roots,
+            );
         }
         for component in class.components.values() {
             collect_roots(
                 &interfaces,
                 &enclosing,
                 &component.type_name,
+                LookupKind::Type,
                 false,
                 &mut roots,
             );
             if let Some(constraint) = &component.constrainedby {
-                collect_roots(&interfaces, &enclosing, constraint, false, &mut roots);
+                collect_roots(
+                    &interfaces,
+                    &enclosing,
+                    constraint,
+                    LookupKind::Type,
+                    false,
+                    &mut roots,
+                );
             }
         }
         if let Some(constraint) = &class.constrainedby {
-            collect_roots(&interfaces, &enclosing, constraint, false, &mut roots);
+            collect_roots(
+                &interfaces,
+                &enclosing,
+                constraint,
+                LookupKind::Type,
+                false,
+                &mut roots,
+            );
         }
     }
     roots
@@ -65,6 +95,7 @@ fn collect_roots(
     interfaces: &FileClassInterfaceIndex,
     enclosing: &str,
     name: &str,
+    kind: LookupKind,
     include_unqualified: bool,
     roots: &mut BTreeSet<String>,
 ) {
@@ -72,13 +103,13 @@ fn collect_roots(
         return;
     }
     let lookup = |candidate: &str| interfaces.class_interface(candidate).cloned();
-    if type_resolution_candidates(enclosing, name, lookup)
+    if type_resolution_candidates(enclosing, name, kind, lookup)
         .iter()
         .any(|candidate| interfaces.class_interface(candidate).is_some())
     {
         return;
     }
-    for candidate in external_type_resolution_candidates(enclosing, name, lookup) {
+    for candidate in external_type_resolution_candidates(enclosing, name, kind, lookup) {
         let mut segments = rumoca_core::qualified_name_segments(&candidate);
         if let Some(root) = segments.next()
             && (include_unqualified || segments.next().is_some())

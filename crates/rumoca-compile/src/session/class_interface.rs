@@ -3,6 +3,7 @@ use super::file_summary::{FileSummary, ImportSummary};
 use super::{ClassLocalCompletionItem, ClassLocalCompletionKind, LocalComponentInfo};
 use indexmap::{IndexMap, IndexSet};
 use rumoca_ir_ast as ast;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ImportMap {
@@ -245,16 +246,31 @@ impl ClassInterface {
     }
 }
 
+/// Whether current-class inheritance participates in name lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum LookupKind {
+    Type,
+    BaseClass,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum VisitKind {
+    Lookup(LookupKind),
+    Inherited,
+}
+
 /// Ordered lexical/import candidates shared by mutable and snapshot readers.
 /// The lookup supplies exact declared class scopes, including across files.
 pub(crate) fn type_resolution_candidates(
     enclosing: &str,
     raw_name: &str,
-    mut scope_interface: impl FnMut(&str) -> Option<ClassInterface>,
+    kind: LookupKind,
+    mut scope_interface: impl FnMut(&str) -> Option<Arc<ClassInterface>>,
 ) -> Vec<String> {
     collect_type_candidates(
         enclosing,
         raw_name,
+        kind,
         &mut scope_interface,
         &mut IndexSet::new(),
         true,
@@ -266,11 +282,13 @@ pub(crate) fn type_resolution_candidates(
 pub(crate) fn external_type_resolution_candidates(
     enclosing: &str,
     raw_name: &str,
-    mut scope_interface: impl FnMut(&str) -> Option<ClassInterface>,
+    kind: LookupKind,
+    mut scope_interface: impl FnMut(&str) -> Option<Arc<ClassInterface>>,
 ) -> Vec<String> {
     collect_type_candidates(
         enclosing,
         raw_name,
+        kind,
         &mut scope_interface,
         &mut IndexSet::new(),
         false,
@@ -280,8 +298,9 @@ pub(crate) fn external_type_resolution_candidates(
 fn collect_type_candidates(
     enclosing: &str,
     raw_name: &str,
-    lookup: &mut impl FnMut(&str) -> Option<ClassInterface>,
-    visiting: &mut IndexSet<(String, String)>,
+    kind: LookupKind,
+    lookup: &mut impl FnMut(&str) -> Option<Arc<ClassInterface>>,
+    visiting: &mut IndexSet<(String, String, VisitKind)>,
     include_lexical: bool,
 ) -> Vec<String> {
     if raw_name.is_empty() {
@@ -290,7 +309,11 @@ fn collect_type_candidates(
     if raw_name.starts_with('.') {
         return vec![raw_name.trim_start_matches('.').to_owned()];
     }
-    let key = (enclosing.to_owned(), raw_name.to_owned());
+    let key = (
+        enclosing.to_owned(),
+        raw_name.to_owned(),
+        VisitKind::Lookup(kind),
+    );
     if !visiting.insert(key.clone()) {
         return Vec::new();
     }
@@ -331,11 +354,24 @@ fn collect_type_candidates(
             }
         }
         if let Some(interface) = lookup(current) {
-            for base in &interface.extends {
-                let base_target =
-                    collect_type_candidates(current, base.base_name(), lookup, visiting, true)
-                        .into_iter()
-                        .find(|candidate| lookup(candidate).is_some());
+            // MLS 5.6.1.4: base names are looked up before installing the
+            // current class's inherited contents. Enclosing scopes still
+            // expose their inherited classes normally.
+            for base in interface
+                .extends
+                .iter()
+                .filter(|_| kind != LookupKind::BaseClass || current != enclosing)
+            {
+                let base_target = collect_type_candidates(
+                    current,
+                    base.base_name(),
+                    LookupKind::BaseClass,
+                    lookup,
+                    visiting,
+                    true,
+                )
+                .into_iter()
+                .find(|candidate| lookup(candidate).is_some());
                 if let Some(base_target) = base_target
                     && include_lexical
                 {
@@ -398,22 +434,33 @@ fn collect_type_candidates(
 fn collect_inherited_type_candidates(
     class_name: &str,
     raw_name: &str,
-    lookup: &mut impl FnMut(&str) -> Option<ClassInterface>,
-    visiting: &mut IndexSet<(String, String)>,
+    lookup: &mut impl FnMut(&str) -> Option<Arc<ClassInterface>>,
+    visiting: &mut IndexSet<(String, String, VisitKind)>,
     candidates: &mut IndexSet<String>,
 ) {
     let Some(interface) = lookup(class_name) else {
         return;
     };
-    let key = (class_name.to_owned(), format!("inherited:{raw_name}"));
+    let key = (
+        class_name.to_owned(),
+        raw_name.to_owned(),
+        VisitKind::Inherited,
+    );
     if !visiting.insert(key.clone()) {
         return;
     }
     candidates.insert(format!("{class_name}.{raw_name}"));
     for base in &interface.extends {
-        let target = collect_type_candidates(class_name, base.base_name(), lookup, visiting, true)
-            .into_iter()
-            .find(|candidate| lookup(candidate).is_some());
+        let target = collect_type_candidates(
+            class_name,
+            base.base_name(),
+            LookupKind::BaseClass,
+            lookup,
+            visiting,
+            true,
+        )
+        .into_iter()
+        .find(|candidate| lookup(candidate).is_some());
         if let Some(target) = target {
             collect_inherited_type_candidates(&target, raw_name, lookup, visiting, candidates);
         }
@@ -424,7 +471,7 @@ fn collect_inherited_type_candidates(
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FileClassInterfaceIndex {
     item_keys_by_name: IndexMap<String, ItemKey>,
-    interfaces: IndexMap<ItemKey, ClassInterface>,
+    interfaces: IndexMap<ItemKey, Arc<ClassInterface>>,
 }
 
 impl FileClassInterfaceIndex {
@@ -436,14 +483,15 @@ impl FileClassInterfaceIndex {
                 .item_keys_by_name
                 .entry(qualified_name)
                 .or_insert_with(|| item_key.clone());
-            index
-                .interfaces
-                .insert(item_key.clone(), ClassInterface::from_summary(class));
+            index.interfaces.insert(
+                item_key.clone(),
+                Arc::new(ClassInterface::from_summary(class)),
+            );
         }
         index
     }
 
-    pub(crate) fn class_interface(&self, qualified_name: &str) -> Option<&ClassInterface> {
+    pub(crate) fn class_interface(&self, qualified_name: &str) -> Option<&Arc<ClassInterface>> {
         let item_key = self.item_keys_by_name.get(qualified_name)?;
         self.interfaces.get(item_key)
     }

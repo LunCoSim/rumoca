@@ -105,6 +105,7 @@ impl<'a> NavigationReadContext<'a> {
         crate::session::class_interface::type_resolution_candidates(
             qualified_name,
             raw_name,
+            crate::session::class_interface::LookupKind::Type,
             |scope| {
                 if scope == qualified_name {
                     return self.class_interface_query(uri, scope).cloned();
@@ -124,7 +125,11 @@ impl<'a> NavigationReadContext<'a> {
         )
     }
 
-    fn class_interface_query(&self, uri: &str, qualified_name: &str) -> Option<&ClassInterface> {
+    fn class_interface_query(
+        &self,
+        uri: &str,
+        qualified_name: &str,
+    ) -> Option<&Arc<ClassInterface>> {
         let file_id = self.session.file_id_for_uri(uri)?;
         self.session
             .query_state

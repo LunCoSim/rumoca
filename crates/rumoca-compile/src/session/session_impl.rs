@@ -1,5 +1,4 @@
 use super::session_impl_diagnostics::resolve_diagnostic_in_target_files;
-use super::session_impl_symbols::*;
 mod navigation;
 pub(crate) use navigation::*;
 

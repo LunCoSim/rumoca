@@ -1057,7 +1057,7 @@ impl Session {
         &mut self,
         uri: &str,
         qualified_name: &str,
-    ) -> Option<ClassInterface> {
+    ) -> Option<Arc<ClassInterface>> {
         self.class_interface_index_query(uri)?
             .class_interface(qualified_name)
             .cloned()
@@ -1070,17 +1070,37 @@ impl Session {
         qualified_name: &str,
         raw_name: &str,
     ) -> Vec<String> {
-        super::class_interface::type_resolution_candidates(qualified_name, raw_name, |scope| {
-            if scope == qualified_name {
-                return self.class_interface_query(uri, scope);
-            }
-            let entry = self
-                .session_package_def_map_query()?
-                .declared_class(scope)?
-                .clone();
-            let parent_uri = self.file_uris.get(&entry.item_key.file_id())?.clone();
-            self.class_interface_query(&parent_uri, scope)
-        })
+        self.class_name_resolution_candidates_query(
+            uri,
+            qualified_name,
+            raw_name,
+            super::class_interface::LookupKind::Type,
+        )
+    }
+
+    fn class_name_resolution_candidates_query(
+        &mut self,
+        uri: &str,
+        qualified_name: &str,
+        raw_name: &str,
+        kind: super::class_interface::LookupKind,
+    ) -> Vec<String> {
+        super::class_interface::type_resolution_candidates(
+            qualified_name,
+            raw_name,
+            kind,
+            |scope| {
+                if scope == qualified_name {
+                    return self.class_interface_query(uri, scope);
+                }
+                let entry = self
+                    .session_package_def_map_query()?
+                    .declared_class(scope)?
+                    .clone();
+                let parent_uri = self.file_uris.get(&entry.item_key.file_id())?.clone();
+                self.class_interface_query(&parent_uri, scope)
+            },
+        )
     }
 
     /// Resolve type candidates using one class scope from the class-interface layer.
@@ -1093,6 +1113,22 @@ impl Session {
             return Vec::new();
         };
         self.class_type_resolution_candidates_query(&target.uri, &target.qualified_name, raw_name)
+    }
+
+    fn class_base_resolution_candidates_in_class_query(
+        &mut self,
+        class_name: &str,
+        raw_name: &str,
+    ) -> Vec<String> {
+        let Some(target) = self.lookup_query_class_target(class_name) else {
+            return Vec::new();
+        };
+        self.class_name_resolution_candidates_query(
+            &target.uri,
+            &target.qualified_name,
+            raw_name,
+            super::class_interface::LookupKind::BaseClass,
+        )
     }
 
     /// Resolve one local component type for a class scope using cached parsed AST.
@@ -1199,6 +1235,7 @@ impl Session {
                 let prefixes = self.query_type_prefixes_in_scope(
                     &declaring,
                     &component.type_name.to_string(),
+                    super::class_interface::LookupKind::Type,
                     &mut std::collections::HashSet::new(),
                     &mut type_prefixes,
                 )?;
@@ -1224,6 +1261,7 @@ impl Session {
         &mut self,
         scope: &str,
         name: &str,
+        kind: super::class_interface::LookupKind,
         visiting: &mut std::collections::HashSet<String>,
         cache: &mut std::collections::HashMap<String, QueryTypePrefixes>,
     ) -> Option<QueryTypePrefixes> {
@@ -1235,7 +1273,14 @@ impl Session {
                 has_dimensions: false,
             });
         }
-        let candidates = self.class_type_resolution_candidates_in_class_query(scope, name);
+        let candidates = match kind {
+            super::class_interface::LookupKind::BaseClass => {
+                self.class_base_resolution_candidates_in_class_query(scope, name)
+            }
+            super::class_interface::LookupKind::Type => {
+                self.class_type_resolution_candidates_in_class_query(scope, name)
+            }
+        };
         // Member references require an exact lexical/import candidate. The
         // user-facing unique-suffix class selector is not a type resolver.
         let qualified = candidates.into_iter().find(|candidate| {
@@ -1274,8 +1319,13 @@ impl Session {
             scalar_type: None,
         };
         for base in bases {
-            let inherited =
-                self.query_type_prefixes_in_scope(&qualified, &base, visiting, cache)?;
+            let inherited = self.query_type_prefixes_in_scope(
+                &qualified,
+                &base,
+                super::class_interface::LookupKind::BaseClass,
+                visiting,
+                cache,
+            )?;
             prefixes.has_dimensions |= inherited.has_dimensions;
             if primitive_alias {
                 if prefixes.scalar_type.is_some()
@@ -1604,7 +1654,7 @@ impl Session {
 
         for ext in class_interface.extends() {
             let base_candidates = self
-                .class_type_resolution_candidates_in_class_query(qualified_name, ext.base_name());
+                .class_base_resolution_candidates_in_class_query(qualified_name, ext.base_name());
             if let Some(info) = self.class_component_member_info_in_base_candidates(
                 &base_candidates,
                 component_name,
@@ -1660,10 +1710,11 @@ impl Session {
         self.record_query_dependency_signature(uri, signature);
         let class_interface = self.class_interface_query(uri, qualified_name)?;
         for extend in class_interface.extends() {
-            let base_candidates = self.class_type_resolution_candidates_query(
+            let base_candidates = self.class_name_resolution_candidates_query(
                 uri,
                 qualified_name,
                 extend.base_name(),
+                super::class_interface::LookupKind::BaseClass,
             );
             let Some(base_target) = self.lookup_query_extends_target(&base_candidates) else {
                 // Primitive types have no named component declarations.
