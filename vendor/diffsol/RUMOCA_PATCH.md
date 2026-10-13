@@ -81,10 +81,10 @@ with persistent failures. Upstream commit
 `crates/diffsol/src/ode_solver/bdf.rs`. A per-step convergence-failure budget is
 also the documented [CVODE recovery contract](https://sundials.readthedocs.io/en/v7.5.0/cvode/Usage/).
 
-The workspace patch makes local, CI, native, and Wasm builds use the same
-corrected source. A registry-published Rumoca crate cannot rely on a workspace
-`[patch]`: registry publication still requires an upstream release containing
-these fixes, or publication of an explicitly maintained patched dependency.
-These patches have not been submitted upstream. Replace this directory with a
-released dependency only after all direct numerical and source-level
-regressions pass against that release and the complete MSL comparison passes.
+The solver backend directly depends on this corrected source. Git consumers
+therefore receive the same BDF and Newton implementation as local and CI builds.
+Registry publication requires an upstream release containing these corrections
+or a published maintained dependency; Cargo removes path dependencies when
+normalizing published manifests. These corrections have not been submitted
+upstream. Remove the retained source only after the direct numerical and
+source-level checks and complete MSL comparison pass against its replacement.

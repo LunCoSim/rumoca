@@ -242,3 +242,10 @@ Source-root invalidation retains its existing cache retirement boundary.
 
 Focused namespace, package-membership, and source-root cache checks cover
 edits, removals, split packages, source-set revisions, and foreign-cache adoption.
+
+## Git dependency numerical closure
+
+The Diffsol backend directly pins the corrected source retained in this repository.
+Cargo ignores dependency-workspace patches in a downstream application, so the
+backend manifest owns this dependency edge. Git consumers now execute the same
+accepted-state and Newton corrections as native workspace validation.

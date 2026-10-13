@@ -11,7 +11,7 @@ homepage.workspace = true
 # The backend implements only rumoca-solver's FMI ME numerical-plugin
 # interface; simulation orchestration and model construction live upstream.
 rumoca-solver = { workspace = true }
-diffsol = { version = "0.13" }
+diffsol = { version = "0.13", path = "../../vendor/diffsol" }
 self_cell = { workspace = true }
 
 [lints]
