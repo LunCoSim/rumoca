@@ -249,3 +249,39 @@ The Diffsol backend directly pins the corrected source retained in this reposito
 Cargo ignores dependency-workspace patches in a downstream application, so the
 backend manifest owns this dependency edge. Git consumers now execute the same
 accepted-state and Newton corrections as native workspace validation.
+
+## Structured-equation array comprehensions
+
+The DAE construction analyzer consumes the shared `ModelExpressionOwnerVisitor`
+equation traversal, including both continuous and initial structured templates.
+Construction therefore receives the exact comprehension occurrence certificate
+for reductions nested inside a `for` equation (MLS 10.4.1; SPEC_0007 and
+SPEC_0032). The change retains the existing domain analyzer and function-scope
+specialization. It adds no public API or separate owner enumeration.
+
+`comprehension_inside_structured_equation_is_analyzed_before_construction`
+reproduced a construction panic before the change and passes afterward.
+The occurrence-identity check
+`distinct_flat_occurrences_may_specialize_one_source_span` also passes.
+Commands used the repository toolchain and four jobs:
+
+- `cargo test -p rumoca-compile --lib comprehension_inside_structured_equation_is_analyzed_before_construction -j 4`
+- `cargo test -p rumoca-phase-dae distinct_flat_occurrences_may_specialize_one_source_span -j 4`
+- `CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 RAYON_NUM_THREADS=4 cargo xtask verify msl-parity --sim-targets-file infra/verification/msl-canary-20.json`
+
+The fixed canary passed with MSL v4.1.0 and OpenModelica
+1.27.1~2-g6db4671: 20 parsed/flattened targets, 14 checked DAE/solve models,
+12 initialized and simulated targets, and 12 strict-high trace comparisons.
+Skipped and missing-trace comparisons were both zero; six DAE refusals and two
+typed solve-IR failures remain failures. The counts equal the recorded numerical
+canary baseline above: aggregate delta zero for each boundary. This run did not
+retain a previous per-model band table for an automatic identity delta.
+Results are in `target/msl/results`; their recorded base Git revision is
+`e0ac51cf94f4687b7a7ab1ae3613c4b7ed21fd74` with this working-tree patch.
+This is Tier 1 evidence, not a full-cohort or performance claim.
+
+LunCoSim's production consumer compiled and advanced all nine Griffin Modelica
+participants with nineteen active native joints, no pending admissions and no
+runtime fault. Its consistent feedback and inconsistent-initial-equation
+production scenes both passed. Full CI/coverage landing gates and an approving
+upstream review remain required before merging this dependency branch.

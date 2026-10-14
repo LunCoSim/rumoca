@@ -123,3 +123,28 @@ fn compile_cache_shares_one_checked_dae_root() {
         "cache hits must share the canonical checked DAE instead of copying its arenas"
     );
 }
+
+#[test]
+fn comprehension_inside_structured_equation_is_analyzed_before_construction() {
+    let mut session = Session::default();
+    session
+        .add_document(
+            "StructuredReduction.mo",
+            r#"
+model StructuredReduction
+  parameter Integer n = 3;
+  input Real u[n] = {1, 2, 3};
+  output Real y[n];
+equation
+  for i in 1:n loop
+    y[i] = sum(u[j] * i for j in 1:n);
+  end for;
+end StructuredReduction;
+"#,
+        )
+        .expect("source parses");
+    let result = session
+        .compile_model_phases("StructuredReduction")
+        .expect("compilation returns a phase result");
+    assert!(matches!(result, PhaseResult::Success(_)), "{result:?}");
+}

@@ -1,4 +1,6 @@
 use super::*;
+use rumoca_core::FallibleExpressionVisitor;
+use rumoca_ir_flat::FallibleStatementVisitor;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(in crate::construction) struct ComprehensionPlan {
@@ -98,15 +100,32 @@ impl ComprehensionPlans {
     }
 }
 
-pub(super) fn analyze_comprehensions<'expression>(
-    expressions: impl IntoIterator<Item = &'expression Expression>,
+pub(super) fn analyze_comprehensions(
+    flat: &flat::Model,
     constants: &EvalContext,
 ) -> Result<ComprehensionPlans, ToDaeError> {
-    let mut plans = ComprehensionPlans::default();
-    for expression in expressions {
-        analyze_expression(expression, constants, &mut plans)?;
+    let mut analyzer = ComprehensionAnalyzer {
+        constants,
+        plans: ComprehensionPlans::default(),
+    };
+    analyzer.visit_equation_owners(flat)?;
+    Ok(analyzer.plans)
+}
+
+struct ComprehensionAnalyzer<'model> {
+    constants: &'model EvalContext,
+    plans: ComprehensionPlans,
+}
+
+impl ModelExpressionOwnerVisitor for ComprehensionAnalyzer<'_> {}
+impl FallibleStatementVisitor for ComprehensionAnalyzer<'_> {}
+
+impl FallibleExpressionVisitor for ComprehensionAnalyzer<'_> {
+    type Error = ToDaeError;
+
+    fn visit_expression(&mut self, expression: &Expression) -> Result<(), Self::Error> {
+        analyze_expression(expression, self.constants, &mut self.plans)
     }
-    Ok(plans)
 }
 
 fn analyze_expression(
@@ -420,8 +439,11 @@ mod tests {
         let extent_two = comprehension(2, span);
         let extent_three = comprehension(3, span);
 
-        let plans = analyze_comprehensions([&extent_two, &extent_three], &EvalContext::new())
-            .expect("distinct exact occurrences may retain distinct compact domains");
+        let mut plans = ComprehensionPlans::default();
+        for expression in [&extent_two, &extent_three] {
+            analyze_expression(expression, &EvalContext::new(), &mut plans)
+                .expect("distinct exact occurrences may retain distinct compact domains");
+        }
 
         assert_eq!(plans.len(), 2);
     }

@@ -745,7 +745,7 @@ fn analyze_expression_support(
     constants: &EvalContext,
 ) -> Result<ExpressionSupportPlans, ToDaeError> {
     Ok(ExpressionSupportPlans {
-        comprehensions: analyze_comprehensions(all_model_expressions(flat), constants)?,
+        comprehensions: analyze_comprehensions(flat, constants)?,
         delays: analyze_delays(flat, constants)?,
     })
 }
