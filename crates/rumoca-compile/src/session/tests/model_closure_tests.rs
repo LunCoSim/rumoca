@@ -1,5 +1,35 @@
 use super::*;
 
+#[test]
+fn strict_dae_source_closure_records_only_participating_documents() {
+    let mut session = Session::default();
+    for (uri, source) in [
+        ("base.mo", "model Base Real x; equation x = 1.0; end Base;"),
+        ("target.mo", "model Target extends Base; end Target;"),
+        (
+            "unrelated.mo",
+            "model Unrelated Real y; equation y = 2.0; end Unrelated;",
+        ),
+    ] {
+        session.add_document(uri, source).expect("valid source");
+    }
+    let result = session
+        .compile_model_dae_strict_reachable_uncached_with_recovery("Target")
+        .expect("balanced strict DAE compile");
+    let closure = result
+        .source_closure
+        .expect("strict compile records its closure");
+    assert_eq!(closure.target, "Target");
+    assert_eq!(
+        closure
+            .files
+            .iter()
+            .map(|file| file.uri.as_str())
+            .collect::<Vec<_>>(),
+        vec!["target.mo", "base.mo"],
+    );
+}
+
 fn write_source_root_file(path: &std::path::Path, contents: &str) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("mkdirs");

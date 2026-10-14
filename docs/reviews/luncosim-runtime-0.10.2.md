@@ -283,5 +283,32 @@ This is Tier 1 evidence, not a full-cohort or performance claim.
 LunCoSim's production consumer compiled and advanced all nine Griffin Modelica
 participants with nineteen active native joints, no pending admissions and no
 runtime fault. Its consistent feedback and inconsistent-initial-equation
-production scenes both passed. Full CI/coverage landing gates and an approving
-upstream review remain required before merging this dependency branch.
+production scenes both passed. This evidence does not include a full workspace/coverage gate.
+
+## Main integration contract
+
+Main consumes the checked v0.10.2 compiler and FMI ME runtime. The integration
+retains the numerical and public observation contracts through their current
+owners:
+
+| Contract | Current owner and verification |
+|---|---|
+| Constant dependencies survive nonlinear projection; dependent outputs observe the solved feedback state | `rumoca-solver::runtime::solve_runtime`, checked refresh stages; `main_runtime_contracts` |
+| Nonlinear projection stays in its real domain and retains the nearby root with mixed output magnitudes | `rumoca-solver::runtime::projection`, scaled/backtracking solves; `main_runtime_contracts` |
+| Runtime function loops consume current arguments and updated local bounds | checked function lowering; `main_runtime_contracts` |
+| Derivative outputs retain a numerical producer | checked DAE structural transformation and ME observation; `main_runtime_contracts` |
+| Singleton array aliases preserve scalar matrix projections | checked structural transformation; `singleton_projected_alias_regression` |
+| Hierarchical, N-way, shared-source and flow-direction stream observations | `rumoca-phase-flatten::connections::stream_operators`; `strm_contracts` |
+| External input defaults initialize qualified slots; internal bindings remain equations | DAE role/variable construction; LunCoSim scoped-default and coupled-initialization production gates |
+| Cancellation is scoped and cooperative | `rumoca-eval-solve::cancellation`, consumed by FMI ME sessions |
+| Retained output growth and output grids are bounded | `rumoca-solver::runtime::output_budget` and `timeline`, consumed by ME recording |
+| Successful strict compilation retains only participating source contributions | `rumoca-compile::Session`; source-closure regression |
+
+Five `main_runtime_contracts` tests and the singleton projection test passed
+through the current `rumoca` integration binary. All 31 stream contract tests
+passed, including the four retained hierarchical/mixing regressions. The source
+closure regression also passed through the focused compiler library test. Production compiler
+and solver sources remain the tested v0.10.2 owners plus the structured-equation
+comprehension correction; the integration adds source-language regression cases.
+The fixed canary result above remains applicable to those unchanged owners.
+These focused checks do not represent a full workspace/coverage gate.
