@@ -312,3 +312,24 @@ and solver sources remain the tested v0.10.2 owners plus the structured-equation
 comprehension correction; the integration adds source-language regression cases.
 The fixed canary result above remains applicable to those unchanged owners.
 These focused checks do not represent a full workspace/coverage gate.
+
+## Native execution for zero-state components
+
+The shared sim-side native admission gate admits algebraic and discrete
+components independently of their continuous-state count. The execution backend
+belongs to the FMI component and its algebraic/output/event programs; the
+zero-state time-only integrator remains unchanged. Explicit Interpreter policy
+still withholds native execution.
+
+The production Griffin allocator has 842 visible variables and no continuous
+states. A native Tracy capture attributed 74.758 seconds to collecting outputs,
+0.612 seconds to integration and 0.017 seconds to input admission across 324
+transactions. The component was being excluded from native execution by its
+zero-state count. These diagnostic timings include profiler and concurrent build
+costs; they are attribution evidence, not realtime acceptance.
+
+The admission regression failed before removing that restriction and passed
+afterward. Native policy tests cover execution counters, release of component
+ownership and explicit Interpreter selection. The fixed 20-model canary retained
+12 compared strict-high traces with zero deviations, skips, missing traces or
+band changes; six DAE refusals and two solve failures remain unchanged.

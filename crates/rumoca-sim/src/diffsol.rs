@@ -1260,48 +1260,27 @@ mod native_policy_tests {
         );
     }
 
-    /// Discriminator (e-rk45, composition half): the rk-like path constructs
-    /// NO backend for a zero-state model. All three rk45 composition call
-    /// sites (the rk45 batch path, the stage-timing session build, and
-    /// `rk45::SimulationSession::from_artifact`) route through the ONE
-    /// shared admission gate asserted here, which withholds — returning
-    /// `None` before any backend is built — when `state_scalar_count() == 0`,
-    /// so a pure-discrete request never pays Cranelift composition cost it
-    /// cannot use. The state-carrying assertion keeps the check non-vacuous,
-    /// and the full rk-like zero-state run proves the withheld path still
-    /// completes.
+    /// Both state-carrying and algebraic/discrete components admit their
+    /// native evaluator. Only an explicit Interpreter policy withholds it.
     #[cfg(feature = "solver-rk45")]
     #[test]
-    fn rk45_zero_state_composition_constructs_no_backend() {
+    fn rk45_native_composition_is_independent_of_continuous_state_count() {
         let opts = sim_opts(SimExecutionPolicy::Auto);
         let zero_model = zero_state_discrete_fixture(&opts);
-        assert_eq!(
-            zero_model.state_scalar_count(),
-            0,
-            "fixture must be zero-state"
-        );
-        assert!(
-            admitted_native_execution_backend(&opts, &zero_model).is_none(),
-            "the shared admission gate must withhold the backend for a zero-state model \
-             under Auto — no backend may even be constructed"
-        );
+        assert_eq!(zero_model.state_scalar_count(), 0);
+        let handle = admitted_native_execution_backend(&opts, &zero_model)
+            .expect("the zero-state component admits its native evaluator");
         let state_model = state_fixture(&opts);
-        assert!(
-            admitted_native_execution_backend(&opts, &state_model).is_some(),
-            "the same gate must compose a backend for a state-carrying model under Auto, \
-             or the zero-state assertion above is vacuous"
-        );
-        // Building through the real rk45 composition call site proves the
-        // automatically withheld path still completes.
-        crate::rk45::SimulationSession::from_artifact(zero_model.artifact(), opts, None)
-            .expect("the rk-like zero-state session builds with the backend withheld");
+        assert!(admitted_native_execution_backend(&opts, &state_model).is_some());
+        let interpreter = sim_opts(SimExecutionPolicy::Interpreter);
+        assert!(admitted_native_execution_backend(&interpreter, &zero_model).is_none());
+        assert!(admitted_native_execution_backend(&interpreter, &state_model).is_none());
+        crate::rk45::SimulationSession::from_artifact(zero_model.artifact(), opts, Some(handle))
+            .expect("the rk-like zero-state session builds with its native evaluator");
     }
 
-    /// An explicitly supplied execution backend is a component evaluator, not
-    /// a numerical integrator. A zero-state component may therefore use it for
-    /// discrete/algebraic programs even though the automatic composition gate
-    /// correctly constructs no backend. Both public rk45 entries must honor
-    /// the supplied handle and release it with ME ownership.
+    /// Supplied component evaluators execute discrete/algebraic programs and
+    /// are released with ME ownership by both public rk45 entries.
     #[cfg(feature = "solver-rk45")]
     #[test]
     fn rk45_zero_state_force_supplied_handle_is_honored_and_released() {
@@ -1619,18 +1598,16 @@ mod native_policy_tests {
         );
     }
 
-    /// The automatic composition gate never constructs a compiled evaluator
-    /// for a zero-state model. An explicitly supplied evaluator is nonetheless
-    /// honored by the common component for its discrete/algebraic programs and
-    /// released when the run ends.
+    /// Zero-state components use compiled discrete/algebraic programs and
+    /// release the execution backend when the run ends.
     #[test]
-    fn zero_state_force_supplied_backend_is_honored_and_released() {
+    fn zero_state_native_backend_is_admitted_honored_and_released() {
         let opts = sim_opts(SimExecutionPolicy::Auto);
         let model = zero_state_fixture(&opts);
         assert_eq!(model.state_scalar_count(), 0, "fixture must be zero-state");
         assert!(
-            admitted_native_execution_backend(&opts, &model).is_none(),
-            "a zero-state model must not pay for a native backend it cannot use"
+            admitted_native_execution_backend(&opts, &model).is_some(),
+            "zero continuous states must not disable the component's algebraic evaluator"
         );
         let (backend, counters, handle) = counting_handle(&model);
         let result = simulate_artifact(model.artifact(), &opts, Some(handle))
