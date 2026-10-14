@@ -1,6 +1,7 @@
 mod array_update;
 mod literal_bindings;
 mod scalar_selection;
+mod static_selection;
 #[cfg(test)]
 mod tests;
 mod zero_coefficients;
@@ -1650,6 +1651,10 @@ impl<'dae> Projection<'_, 'dae> {
                 let lhs = self.integer(lhs, scalar_index)?;
                 let rhs = self.integer(rhs, scalar_index)?;
                 integer_binary(operator, lhs, rhs, span)
+            }
+            dae::ExpressionOperation::Conditional(operands) => {
+                let selected = self.static_selected_branch(operands)?;
+                self.integer(selected, scalar_index)
             }
             dae::ExpressionOperation::Call {
                 function,

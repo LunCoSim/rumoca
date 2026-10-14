@@ -25,6 +25,75 @@ end Pend;
 "#;
 
 #[test]
+fn statically_selected_sweep_indices_preserve_causal_structure() {
+    let dae = compile(
+        r#"
+model OrderedSweep
+  Real q[3,5];
+  output Real y[3];
+equation
+  for i in 1:3 loop q[i,1] = 0; end for;
+  for k in 1:4 loop
+    for i in 1:3 loop
+      q[i,k+1] = q[i,k] + i +
+        sum(q[j, if j<i then k+1 else k] for j in 1:3);
+    end for;
+  end for;
+  for i in 1:3 loop y[i] = q[i,5]; end for;
+end OrderedSweep;
+"#,
+        "OrderedSweep",
+    );
+    let report = structural_report_for_dae(&dae, &SimOptions::default()).unwrap();
+    assert!(
+        report.blocks.iter().all(|block| !block.is_coupled()),
+        "each sweep reads only earlier coordinates, so no coupled solve is required"
+    );
+    for policy in [
+        rumoca_solver::SimExecutionPolicy::Auto,
+        rumoca_solver::SimExecutionPolicy::Interpreter,
+    ] {
+        let result = simulate_dae(
+            &dae,
+            &SimOptions {
+                t_end: 0.1,
+                dt: Some(0.05),
+                execution_policy: policy,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (name, expected) in [("y[1]", 917.0), ("y[2]", 1838.0), ("y[3]", 3680.0)] {
+            let index = result.names.iter().position(|item| item == name).unwrap();
+            assert!(result.data[index].iter().all(|value| *value == expected));
+        }
+    }
+}
+
+#[test]
+fn runtime_selected_indices_retain_potential_coupled_dependencies() {
+    let dae = compile(
+        r#"
+model RuntimeSelection
+  input Real choose = 0;
+  Real q[2,2];
+equation
+  for i in 1:2 loop
+    q[i,1] = 0;
+    q[i,2] = i + sum(q[j, if choose<0 then 2 else 1] for j in 1:2);
+  end for;
+end RuntimeSelection;
+"#,
+        "RuntimeSelection",
+    );
+    let report = structural_report_for_dae(&dae, &SimOptions::default()).unwrap();
+    assert!(
+        report.blocks.iter().any(BlockReport::is_coupled),
+        "an input-dependent index must retain every potentially selected coordinate"
+    );
+}
+
+#[test]
 fn index_three_inspection_agrees_with_simulation_preparation() {
     let dae = compile(PENDULUM, "Pend");
     let options = SimOptions {

@@ -333,3 +333,24 @@ afterward. Native policy tests cover execution counters, release of component
 ownership and explicit Interpreter selection. The fixed 20-model canary retained
 12 compared strict-high traces with zero deviations, skips, missing traces or
 band changes; six DAE refusals and two solve failures remain unchanged.
+
+## Conditional structural indices
+
+`rumoca-eval-dae` owns the scalar coordinate projection used by structural
+incidence. It selects an Integer if-expression's branch when its guard is
+provable from exact Integer bindings at the current structured domain point.
+Integer arithmetic stays checked i64; this proof does not pass through f64.
+Unknown runtime guards retain the existing all-potential-coordinate incidence.
+This follows MLS 3.6.5 if-expression selection and SPEC_0007/SPEC_0032's checked
+DAE scalar-view ownership without expanding the retained tensor representation.
+
+The Griffin allocator's source-ordered 12-by-64 coordinate sweeps were reported
+as a 768-variable coupled block because the conditional column subscript was
+classified as dynamic. The focused OrderedSweep regression reproduced this
+false coupling before the correction. It now has no coupled blocks and gives
+exact outputs 917, 1838 and 3680 under both Auto and Interpreter execution.
+The RuntimeSelection negative case retains its genuinely input-dependent
+coupled dependencies. All eight structural-report tests passed.
+The fixed twenty-model canary retained the same twelve compared strict-high
+traces, zero deviations/skips/missing traces and zero band changes; the six DAE
+refusals and two solve failures remain. This is focused evidence only.
