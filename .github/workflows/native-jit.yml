@@ -1,0 +1,36 @@
+name: Native JIT
+
+on:
+  push:
+    paths:
+      - 'crates/rumoca-exec-cranelift/**'
+      - '.github/workflows/native-jit.yml'
+  pull_request:
+    paths:
+      - 'crates/rumoca-exec-cranelift/**'
+      - '.github/workflows/native-jit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-jit:
+    name: Native JIT (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    env:
+      CARGO_BUILD_JOBS: 4
+      RUST_TEST_THREADS: 4
+      RAYON_NUM_THREADS: 4
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-jit
+      - name: Test native emission, cache relocation and fresh-stack execution
+        run: cargo test --locked -p rumoca-exec-cranelift --lib -j 4 -- --nocapture

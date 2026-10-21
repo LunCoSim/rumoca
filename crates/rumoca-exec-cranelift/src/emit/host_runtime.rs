@@ -8,6 +8,9 @@ use std::cell::Cell;
 
 use super::{CompileError, to_backend_err};
 
+#[cfg(test)]
+mod tests;
+
 /// Whether Cranelift's IR verifier runs on every function a JIT module
 /// defines. The verifier checks IR well-formedness and never changes the
 /// emitted code; debug builds (and so the test suite) run it on every
@@ -21,7 +24,14 @@ const JIT_VERIFIER: &str = if cfg!(debug_assertions) {
 /// The single JIT configuration for every module this crate emits.
 pub(super) fn host_jit_builder() -> Result<JITBuilder, CompileError> {
     JITBuilder::with_flags(
-        &[("opt_level", "speed"), ("enable_verifier", JIT_VERIFIER)],
+        &[
+            ("opt_level", "speed"),
+            ("enable_verifier", JIT_VERIFIER),
+            // Large generated frames must touch each guard page before use.
+            // Inline probes keep JIT code independent of platform probe symbols.
+            ("enable_probestack", "true"),
+            ("probestack_strategy", "inline"),
+        ],
         cranelift_module::default_libcall_names(),
     )
     .map_err(to_backend_err)
