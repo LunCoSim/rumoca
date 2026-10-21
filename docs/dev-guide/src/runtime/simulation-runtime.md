@@ -33,6 +33,16 @@ If two solvers need the same code, it moves into the shared layer. Solver
 backends implement the integration method and consume resolved input
 values — they must not know about keyboards, gamepads, or transports.
 
+## Native projection preparation
+
+`rumoca-exec-cranelift` emits each construction-issued colored projection in
+the compiled source's shared JIT module. Operation reuse storage belongs to
+that application: allocate it only for selected source programs, once across
+all colors, and release it after emission. Unselected programs must not incur
+per-operation retention allocations. Program identities and color order come
+from the checked application; the lookup table never chooses execution order.
+Retained native values remain local to emission and are never simulation state.
+
 ## Events at Runtime
 
 The DAE hands the runtime explicit metadata: relations (event condition

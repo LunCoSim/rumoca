@@ -11,6 +11,11 @@ use rumoca_ir_solve::{FunctionConditionalOwnerId, ProjectionJacobianApplication}
 #[cfg(test)]
 mod shared_module_tests;
 
+#[cfg(test)]
+thread_local! {
+    static RETAINED_OPERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Lazily created JIT module shared by the projection applications of one
 /// compiled Jacobian source.
 #[derive(Default)]
@@ -199,16 +204,14 @@ impl CraneliftEmitter {
         let params = builder.block_params(entry).to_vec();
         let mut loaded_y = HashMap::new();
         let mut loaded_p = HashMap::new();
-        let mut retained: Vec<Vec<Option<RetainedResult>>> = application
-            .source()
-            .programs()
-            .iter()
-            .map(|row| vec![None; row.len()])
-            .collect();
+        let mut retained = HashMap::new();
         for color in application.colors() {
             set_seeds(&mut builder, params[3], color.seed_indices(), 1.0)?;
             for program in color.outputs().programs() {
                 let row = &application.source().programs()[program.program()];
+                let retained = retained
+                    .entry(program.program())
+                    .or_insert_with(|| program_retention(row.len()));
                 self.lower_projection_program(
                     &mut builder,
                     &params,
@@ -217,7 +220,7 @@ impl CraneliftEmitter {
                     (&mut loaded_y, &mut loaded_p),
                     ProgramReuse {
                         issued: application.invariant_operations(program.program()),
-                        retained: &mut retained[program.program()],
+                        retained,
                     },
                 )?;
             }
@@ -328,6 +331,12 @@ fn set_seeds(
 struct ProgramReuse<'a> {
     issued: &'a [bool],
     retained: &'a mut [Option<RetainedResult>],
+}
+
+fn program_retention(operations: usize) -> Vec<Option<RetainedResult>> {
+    #[cfg(test)]
+    RETAINED_OPERATIONS.with(|count| count.set(count.get() + operations));
+    vec![None; operations]
 }
 
 #[derive(Clone)]
