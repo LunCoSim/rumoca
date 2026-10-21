@@ -146,6 +146,7 @@ rumoca-bind-python = { path = "crates/rumoca-bind-python" }
 rumoca-test-msl = { path = "crates/rumoca-test-msl" }
 
 # External dependencies
+cranelift-codegen = { version = "0.125", features = ["incremental-cache"] }
 anyhow = "1.0"
 mimalloc = "0.1"
 libmimalloc-sys = "0.1"

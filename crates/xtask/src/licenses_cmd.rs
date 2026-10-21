@@ -88,8 +88,9 @@ pub(crate) fn render(root: &Path) -> Result<String> {
 
 /// The repository carries no em dash (U+2014); the rendered notices use one only
 /// as a separator line, which a hyphen reproduces.
+/// Canonical LF line endings keep generated text identical after Git checkout.
 pub(crate) fn repository_typography(text: &str) -> String {
-    text.replace('\u{2014}', "-")
+    text.replace('\u{2014}', "-").replace("\r\n", "\n")
 }
 
 /// Write or check the notices `render` produces for `root`.
@@ -141,7 +142,7 @@ mod tests {
     #[test]
     fn the_notices_are_written_and_checked_against_a_fresh_rendering() {
         let root = tempfile::tempdir().unwrap();
-        let mut render = |_: &Path| -> Result<String> { Ok("a\n\u{2014}\n".to_string()) };
+        let mut render = |_: &Path| -> Result<String> { Ok("a\r\n\u{2014}\r\n".to_string()) };
         run(root.path(), &LicensesArgs { check: true }, &mut render)
             .expect_err("a missing file is stale");
         run(root.path(), &LicensesArgs { check: false }, &mut render).unwrap();

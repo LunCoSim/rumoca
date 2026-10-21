@@ -43,6 +43,19 @@ per-operation retention allocations. Program identities and color order come
 from the checked application; the lookup table never chooses execution order.
 Retained native values remain local to emission and are never simulation state.
 
+Native hosts can wrap synchronous construction in
+`rumoca_sim::native_code_cache::with_native_code_cache`. The host supplies a
+bounded `CacheKvStore` containing trusted Cranelift artifacts and owns storage
+and persistence. The scope restores on return or unwinding and stays on its
+calling thread. Cranelift's incremental cache owns stencil/version/ISA/flag
+identity; each new JIT module applies its current relocations through the
+maintained module API. Executable arenas and FMI state retain their ordinary
+session lifetimes. The result includes attempts, hits, compilations and rejected
+entries; rejections are included in compilations. Hosts must report rejections
+and continue with the newly compiled result rather than conceal invalid cache
+data. Calls without an installed scope compile normally. The adapter does not
+change Modelica equations, compiler flags, solver selection or tolerances.
+
 ## Events at Runtime
 
 The DAE hands the runtime explicit metadata: relations (event condition

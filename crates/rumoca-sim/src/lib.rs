@@ -52,6 +52,15 @@ mod diffsol;
     any(feature = "solver-rk45", feature = "solver-diffsol")
 ))]
 mod native_execution;
+
+/// Host-owned native artifact storage and scoped construction accounting.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod native_code_cache {
+    pub use cranelift_codegen::incremental_cache::CacheKvStore;
+    pub use rumoca_exec_cranelift::native_code_cache::{
+        NativeCodeCacheUsage, with_native_code_cache,
+    };
+}
 /// Wasm builds carry no compiled native backend at all; the one shared
 /// admission gate uniformly withholds so every caller composes through the
 /// same name on every target.

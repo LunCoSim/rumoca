@@ -17,6 +17,14 @@ impl OwnedJitModule {
     pub(super) fn new(module: JITModule) -> Self {
         Self(Some(module))
     }
+
+    pub(super) fn define_function(
+        &mut self,
+        id: FuncId,
+        context: &mut cranelift_codegen::Context,
+    ) -> Result<(), Box<cranelift_module::ModuleError>> {
+        crate::native_code_cache::define_function(self, id, context)
+    }
 }
 
 /// Import `func_id` into `func` as a callee that is reached through its full

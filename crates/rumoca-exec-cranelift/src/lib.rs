@@ -6,6 +6,7 @@
 //! it must not own Modelica semantics, DAE lowering, or structural rewrites.
 
 mod emit;
+pub mod native_code_cache;
 
 use rumoca_core::ExternalTableData;
 use rumoca_ir_solve::{LinearOp, ScalarProgramBlock};
