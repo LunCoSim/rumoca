@@ -214,6 +214,60 @@ fn product_plus(a: usize, b: usize, k: f64) -> Vec<LinearOp> {
     ]
 }
 
+#[test]
+fn shared_value_proof_preserves_constant_bits_and_normalizes_destinations() {
+    for (bits, changed_bits) in [
+        (0, 1_u64 << 63),
+        (1.0_f64.to_bits(), 2.0_f64.to_bits()),
+        (0x7ff8_0000_0000_0001, 0x7ff8_0000_0000_0002),
+    ] {
+        let rows = [7, 100].map(|dst| {
+            (
+                vec![
+                    LinearOp::Const {
+                        dst,
+                        value: f64::from_bits(bits),
+                    },
+                    LinearOp::StoreOutput { src: dst },
+                ],
+                vec![dst as usize],
+            )
+        });
+        let programs = programs(&rows);
+        let mut shared = SharedValueSegments::derive(&programs);
+        shared.check(&programs).unwrap();
+        assert_eq!(count(shared.segments[0].ops(), "Const"), 1);
+        for op in &mut shared.segments[0].ops {
+            if let LinearOp::Const { value, .. } = op {
+                *value = f64::from_bits(changed_bits);
+            }
+        }
+        assert_eq!(
+            shared.check(&programs),
+            Err(SharedValueError::Output { index: 0 })
+        );
+    }
+}
+
+#[test]
+fn shared_scalar_value_proof_benchmark() {
+    let rows = (0..256)
+        .map(|index| (product_plus(0, 1, (index % 4) as f64), vec![index + 16]))
+        .collect::<Vec<_>>();
+    let programs = programs(&rows);
+    let start = std::time::Instant::now();
+    for _ in 0..8 {
+        let shared = SharedValueSegments::derive(std::hint::black_box(&programs));
+        shared.check(&programs).unwrap();
+        assert!(shared.shared > 256);
+        std::hint::black_box(shared);
+    }
+    println!(
+        "SHARED_SCALAR_VALUE_PROOF_BENCH elapsed_ns={} derivations_and_checks=8 programs=256",
+        start.elapsed().as_nanos()
+    );
+}
+
 fn programs<'a>(rows: &'a [(Vec<LinearOp>, Vec<usize>)]) -> Vec<AssignmentProgram<'a>> {
     rows.iter()
         .map(|(ops, targets)| AssignmentProgram { ops, targets })

@@ -16,13 +16,13 @@ homepage.workspace = true
 pattern-fixtures = []
 
 [dependencies]
+bincode = { workspace = true }
 rumoca-core = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-bincode = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]

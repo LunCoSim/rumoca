@@ -12,6 +12,7 @@
 //! and final slot terms.
 
 mod registers;
+mod shape;
 mod symbolic;
 #[cfg(test)]
 mod tests;
@@ -19,7 +20,8 @@ mod tests;
 use std::collections::{HashMap, HashSet};
 
 use registers::{Role, read_registers, renamable, visit_registers};
-use symbolic::{SymbolicSlots, Term, Terms, ValueKey, ValueShape, value_shape};
+use shape::{ShapeKey, ValueShape, value_shape};
+use symbolic::{SymbolicSlots, Term, Terms, ValueKey};
 
 use super::*;
 
@@ -505,7 +507,7 @@ impl ProgramBuilder<'_, '_> {
             return;
         }
         let term = self.builder.slots.slot(&mut self.builder.terms, index);
-        let key = self.builder.terms.key("Slot", vec![(0, term)]);
+        let key = self.builder.terms.key(&ShapeKey::Slot, vec![(0, term)]);
         if let Some(registers) = self.builder.segment.values.get(&key).cloned() {
             return self.reuse(dst, &registers);
         }
@@ -532,10 +534,10 @@ impl ProgramBuilder<'_, '_> {
                 },
             )
             .collect::<Vec<_>>();
-        let key = self
-            .builder
-            .terms
-            .key("Slots", terms.iter().copied().enumerate().collect());
+        let key = self.builder.terms.key(
+            &ShapeKey::Slots,
+            terms.iter().copied().enumerate().collect(),
+        );
         if let Some(registers) = self.builder.segment.values.get(&key).cloned() {
             return self.reuse(dst, &registers);
         }
