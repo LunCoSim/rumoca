@@ -1,5 +1,113 @@
 use super::*;
 
+#[test]
+fn shared_read_collection_is_exact_and_rejects_invalid_ranges() {
+    let op = LinearOp::DotProduct {
+        dst: 0,
+        lhs_start: 1_000_000,
+        rhs_start: 2_000_000,
+        count: 3,
+        lhs_stride: 2,
+        rhs_stride: 0,
+    };
+    assert_eq!(
+        read_registers(&op),
+        Some(vec![1_000_000, 1_000_002, 1_000_004, 2_000_000])
+    );
+    for op in [
+        LinearOp::DotProduct {
+            dst: 0,
+            lhs_start: 0,
+            rhs_start: 0,
+            count: 0,
+            lhs_stride: 1,
+            rhs_stride: 1,
+        },
+        LinearOp::DotProduct {
+            dst: 0,
+            lhs_start: Reg::MAX,
+            rhs_start: 0,
+            count: 2,
+            lhs_stride: 1,
+            rhs_stride: 1,
+        },
+        LinearOp::LoadFoldCarried { dst: 0, index: 0 },
+    ] {
+        assert_eq!(read_registers(&op), None);
+    }
+}
+
+#[test]
+fn shared_read_collection_range_benchmark() {
+    let op = LinearOp::DotProduct {
+        dst: 0,
+        lhs_start: 0,
+        rhs_start: 32_000,
+        count: 512,
+        lhs_stride: 1,
+        rhs_stride: 1,
+    };
+    let start = std::time::Instant::now();
+    for _ in 0..64 {
+        let reads = read_registers(std::hint::black_box(&op)).unwrap();
+        assert_eq!(reads.len(), 1024);
+        std::hint::black_box(reads);
+    }
+    println!(
+        "SHARED_READ_COLLECTION_BENCH elapsed_ns={} operations=64 reads_per_operation=1024",
+        start.elapsed().as_nanos()
+    );
+}
+
+#[test]
+fn shared_read_collection_preserves_scalar_and_tensor_operands() {
+    for (op, expected) in [
+        (
+            LinearOp::Select {
+                dst: 0,
+                cond: 3,
+                if_true: 7,
+                if_false: 3,
+            },
+            vec![3, 7],
+        ),
+        (
+            LinearOp::StoreOutputRange {
+                start: 4,
+                count: 3,
+                stride: 2,
+            },
+            vec![4, 6, 8],
+        ),
+        (
+            LinearOp::MatrixMultiply {
+                dst_start: 100,
+                lhs_start: 9,
+                rhs_start: 20,
+                rows: 2,
+                inner: 2,
+                columns: 3,
+                lanes: 1,
+            },
+            vec![9, 10, 11, 12, 20, 21, 22, 23, 24, 25],
+        ),
+        (
+            LinearOp::TensorTranspose {
+                dst_start: 0,
+                src_start: 30,
+                rows: 2,
+                columns: 3,
+                element_width: 2,
+                lanes: 1,
+            },
+            (30..42).collect(),
+        ),
+        (LinearOp::LoadP { dst: 99, index: 12 }, vec![]),
+    ] {
+        assert_eq!(read_registers(&op), Some(expected), "{}", op.kind_name());
+    }
+}
+
 /// `y[target] = y[a] * y[b] + k`, the product computed at the program's own
 /// registers.
 fn product_plus(a: usize, b: usize, k: f64) -> Vec<LinearOp> {

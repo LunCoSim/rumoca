@@ -161,29 +161,23 @@ fn pure_value_call(site: &SolvePureCallSite) -> bool {
         .all(|output| output.kind() == crate::SolvePureCallOutputKind::Result)
 }
 
-/// Every register `op` reads, ascending, as its register-flow validation
-/// proves them; `None` when `op` cannot be validated at the top level.
+/// Every register `op` reads, ascending and unique. The source owner's structural
+/// checks run once; whole-program validation separately proves dominance.
+/// `None` means this operation is invalid outside its enclosing context.
 pub(super) fn read_registers(op: &LinearOp) -> Option<Vec<Reg>> {
-    let mut defined = Vec::new();
-    let mut reads = Vec::new();
+    let reads = RefCell::new(Vec::new());
     let mut validation = ScalarProgramValidationCache::default();
-    loop {
-        match validate_op_sources(op, 0, &defined, None, None, &mut validation) {
-            Ok(_) => break,
-            Err(ScalarProgramRegisterError::UndefinedRegister { register, .. }) => {
-                let index = register as usize;
-                if defined.len() <= index {
-                    defined.resize(index + 1, false);
-                }
-                if defined[index] {
-                    return None;
-                }
-                defined[index] = true;
-                reads.push(register);
-            }
-            Err(_) => return None,
-        }
-    }
+    let cx = OpSources {
+        op,
+        op_index: 0,
+        registers: SourceRegisters::Collect(&reads),
+        fold_context: None,
+        conditional_capture_count: None,
+        max_lanes: validation.max_tensor_lanes(),
+    };
+    check_op_sources(cx, &mut validation).ok()?;
+    let mut reads = reads.into_inner();
     reads.sort_unstable();
+    reads.dedup();
     Some(reads)
 }

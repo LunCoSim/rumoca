@@ -4,6 +4,7 @@
 
 use rumoca_core::StructuredIndexDomain;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -1573,16 +1574,19 @@ fn mark_register_range_initialized(initialized: &mut Vec<bool>, dst: Reg, count:
     }
 }
 
-/// Read-only context for one operation's source-register proof.
-///
-/// Every extracted check needs the same row context, so bundling it keeps the
-/// per-operation helpers below the workspace argument budget and keeps one
-/// operation-name spelling (`LinearOp::kind_name`) in every diagnostic.
+/// The same structural checks either enforce dominance or collect isolated reads.
+#[derive(Clone, Copy)]
+enum SourceRegisters<'a> {
+    Initialized(&'a [bool]),
+    Collect(&'a RefCell<Vec<Reg>>),
+}
+
+/// Read-only row context shared by all operation-specific source checks.
 #[derive(Clone, Copy)]
 struct OpSources<'a> {
     op: &'a LinearOp,
     op_index: usize,
-    initialized: &'a [bool],
+    registers: SourceRegisters<'a>,
     fold_context: Option<(usize, usize, usize)>,
     conditional_capture_count: Option<usize>,
     max_lanes: usize,
@@ -1594,20 +1598,14 @@ impl OpSources<'_> {
         self.op.kind_name()
     }
 
-    /// Prove one scalar source register is dominated by an earlier write.
+    /// Check or collect one scalar source through the selected register context.
     fn require(self, register: Reg) -> Result<(), ScalarProgramRegisterError> {
-        require_register(self.op_index, self.operation(), register, self.initialized)
+        require_register(self.op_index, self.operation(), register, self.registers)
     }
 
-    /// Prove one compact consecutive source range and return its last register.
+    /// Check one compact consecutive source range and return its last register.
     fn require_range(self, start: Reg, len: usize) -> Result<Reg, ScalarProgramRegisterError> {
-        require_register_range(
-            self.op_index,
-            self.operation(),
-            start,
-            len,
-            self.initialized,
-        )
+        require_register_range(self.op_index, self.operation(), start, len, self.registers)
     }
 
     /// Last register of one compact consecutive range.
@@ -1678,19 +1676,7 @@ impl FoldSlot {
     }
 }
 
-/// Source-register proof for one checked [`LinearOp`].
-///
-/// This is the sole dispatch table of the proof: every arm names its variant
-/// and delegates to one checked helper, so the table carries the operation
-/// vocabulary and no validation logic. The match stays exhaustive with no
-/// catch-all arm, so a new `LinearOp` variant cannot reach an evaluator until
-/// its sources are proved here.
-///
-/// The table is laid out by hand (`rustfmt::skip`) so one arm reads as one
-/// entry. Automatic formatting expands every multi-field pattern to one field
-/// per line, which triples the table without telling a reader anything the
-/// single-line form does not.
-#[rustfmt::skip]
+/// Validate one operation's sources against the preceding initialized registers.
 fn validate_op_sources(
     op: &LinearOp,
     op_index: usize,
@@ -1700,7 +1686,26 @@ fn validate_op_sources(
     validation: &mut ScalarProgramValidationCache,
 ) -> Result<Option<Reg>, ScalarProgramRegisterError> {
     let max_lanes = validation.max_tensor_lanes();
-    let cx = OpSources { op, op_index, initialized, fold_context, conditional_capture_count, max_lanes };
+    let cx = OpSources {
+        op,
+        op_index,
+        registers: SourceRegisters::Initialized(initialized),
+        fold_context,
+        conditional_capture_count,
+        max_lanes,
+    };
+    check_op_sources(cx, validation)
+}
+
+/// One exhaustive structural operand check shared by dominance validation and
+/// isolated-operation read discovery. Every variant delegates to its checked
+/// helper. The hand-laid-out table keeps each entry on one line.
+#[rustfmt::skip]
+fn check_op_sources(
+    cx: OpSources<'_>,
+    validation: &mut ScalarProgramValidationCache,
+) -> Result<Option<Reg>, ScalarProgramRegisterError> {
+    let op = cx.op;
     match *op {
         LinearOp::Const { .. } | LinearOp::LoadTime { .. } | LinearOp::LoadY { .. }
         | LinearOp::LoadP { .. } | LinearOp::LoadSeed { .. } => Ok(None),
@@ -1869,7 +1874,7 @@ fn output_range(
         start,
         count,
         stride,
-        cx.initialized,
+        cx.registers,
     )
     .map(Some)
 }
@@ -2746,7 +2751,7 @@ fn dot_product_sources(
         lhs_start,
         count,
         lhs_stride,
-        cx.initialized,
+        cx.registers,
     )?;
     let rhs_end = require_strided_registers(
         cx.op_index,
@@ -2754,7 +2759,7 @@ fn dot_product_sources(
         rhs_start,
         count,
         rhs_stride,
-        cx.initialized,
+        cx.registers,
     )?;
     Ok(lhs_end.max(rhs_end))
 }
@@ -2765,7 +2770,7 @@ fn require_strided_registers(
     start: Reg,
     count: usize,
     stride: usize,
-    initialized: &[bool],
+    registers: SourceRegisters<'_>,
 ) -> Result<Reg, ScalarProgramRegisterError> {
     let Some(last_term) = count.checked_sub(1) else {
         return Err(ScalarProgramRegisterError::EmptyRegisterRange {
@@ -2785,7 +2790,7 @@ fn require_strided_registers(
         })?;
     for term in 0..count {
         let register = start as usize + term * stride;
-        require_register(op_index, operation, register as Reg, initialized)?;
+        require_register(op_index, operation, register as Reg, registers)?;
     }
     Ok(last)
 }
@@ -2811,10 +2816,18 @@ fn require_register(
     op_index: usize,
     operation: &'static str,
     register: Reg,
-    initialized: &[bool],
+    registers: SourceRegisters<'_>,
 ) -> Result<(), ScalarProgramRegisterError> {
-    if initialized.get(register as usize).copied().unwrap_or(false) {
-        return Ok(());
+    match registers {
+        SourceRegisters::Initialized(initialized) => {
+            if initialized.get(register as usize).copied().unwrap_or(false) {
+                return Ok(());
+            }
+        }
+        SourceRegisters::Collect(reads) => {
+            reads.borrow_mut().push(register);
+            return Ok(());
+        }
     }
     Err(ScalarProgramRegisterError::UndefinedRegister {
         op_index,
@@ -2828,7 +2841,7 @@ fn require_register_range(
     operation: &'static str,
     start: Reg,
     len: usize,
-    initialized: &[bool],
+    registers: SourceRegisters<'_>,
 ) -> Result<Reg, ScalarProgramRegisterError> {
     let Some(last_offset) = len.checked_sub(1) else {
         return Err(ScalarProgramRegisterError::EmptyRegisterRange {
@@ -2853,13 +2866,7 @@ fn require_register_range(
         },
     )?;
     for register in start..=end {
-        if !initialized.get(register as usize).copied().unwrap_or(false) {
-            return Err(ScalarProgramRegisterError::UndefinedRegister {
-                op_index,
-                operation,
-                register,
-            });
-        }
+        require_register(op_index, operation, register, registers)?;
     }
     Ok(end)
 }
@@ -2870,7 +2877,7 @@ fn require_strided_register_range(
     start: Reg,
     count: usize,
     stride: usize,
-    initialized: &[bool],
+    registers: SourceRegisters<'_>,
 ) -> Result<Reg, ScalarProgramRegisterError> {
     let Some(last_ordinal) = count.checked_sub(1) else {
         return Err(ScalarProgramRegisterError::EmptyRegisterRange {
@@ -2910,7 +2917,7 @@ fn require_strided_register_range(
     )?;
     for ordinal in 0..count {
         let register = start + Reg::try_from(ordinal * stride).expect("checked output range");
-        require_register(op_index, operation, register, initialized)?;
+        require_register(op_index, operation, register, registers)?;
     }
     Ok(end)
 }
