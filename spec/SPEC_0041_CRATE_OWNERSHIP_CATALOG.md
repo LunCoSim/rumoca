@@ -69,7 +69,11 @@ import that path.
 
 Runtime hosts borrow the checked `FmiComponent` through the simulation facade;
 `prepare_fmi_component` and `rk45::SimulationSession::from_fmi_component` use
-one correlated kernel and metadata inventory. Runtime persistence emits the
+one correlated kernel and metadata inventory. `rumoca-sim::fmi_execution_backend`
+supplies external ME hosts with an opaque execution handle from that same
+native-admission owner, using only their checked component and simulation
+options. Numerical plugins do not inspect Solve IR or implement a native
+backend. Runtime persistence emits the
 current construction wire, retaining the exact admitted declaration inputs
 (including zero-storage declarations), and decodes through the same constructor.
 Scoped evaluator cancellation and trace output budgets belong to their evaluator

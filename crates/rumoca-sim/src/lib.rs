@@ -76,6 +76,22 @@ mod native_execution {
         None
     }
 }
+
+/// Construct the component's opaque execution backend for an external ME host.
+///
+/// Numerical plugins pass this handle to `MeRetainedComponent::instantiate`;
+/// they do not inspect or compile the component's Solve IR. This uses the same
+/// native admission owner as the built-in numerical solvers. An explicit
+/// interpreter policy, or a Wasm target without native compilation, returns
+/// `None`.
+#[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
+pub fn fmi_execution_backend(
+    component: &rumoca_ir_solve::fmi::FmiComponent,
+    options: &SimOptions,
+) -> Option<rumoca_solver::fmi_me::MeExecutionBackend> {
+    native_execution::admitted_native_execution_backend(options, component.runtime_view().model())
+}
+
 #[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
 mod prepared_vectors;
 mod solve_lowering;

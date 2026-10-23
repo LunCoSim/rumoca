@@ -31,6 +31,23 @@ fn compile(source: &str, model: &str) -> std::sync::Arc<rumoca_ir_dae::Dae> {
         .dae
 }
 
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "solver-rk45", feature = "solver-diffsol")
+))]
+#[test]
+fn fmi_execution_backend_honors_external_host_policy() {
+    let dae = compile(
+        "model NativeHost input Real u=2; output Real y; equation y=u*u; end NativeHost;",
+        "NativeHost",
+    );
+    let mut options = SimOptions::default();
+    let component = crate::prepare_fmi_component(&dae, &options).unwrap();
+    assert!(crate::fmi_execution_backend(&component, &options).is_some());
+    options.execution_policy = rumoca_solver::SimExecutionPolicy::Interpreter;
+    assert!(crate::fmi_execution_backend(&component, &options).is_none());
+}
+
 /// Source-ordered plan of the checked B.1c discrete-value owners: each entry pairs an
 /// owner's target names with the number of `when` branches it retains.
 ///
