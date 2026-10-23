@@ -473,7 +473,7 @@ impl ProgramBuilder<'_, '_> {
 
     /// Emit `op` with its destination at this program's offset, recording the
     /// term of every register it writes.
-    fn emit(&mut self, op: LinearOp, key: &ValueKey, dst: Reg, count: usize) {
+    fn emit(&mut self, op: LinearOp, key: ValueKey, dst: Reg, count: usize) {
         let first = self.base + dst;
         let registers = (0..count)
             .map(|offset| first + offset as Reg)
@@ -484,7 +484,7 @@ impl ProgramBuilder<'_, '_> {
             self.map.insert(dst + offset as Reg, register);
         }
         self.segment().ops.push(op);
-        self.segment().values.insert(key.clone(), registers);
+        self.segment().values.insert(key, registers);
     }
 
     /// Read `dst` from `registers` computed earlier: nothing is emitted.
@@ -580,7 +580,7 @@ impl ProgramBuilder<'_, '_> {
             });
         }
         let renamed = self.renamed(op, shape);
-        self.emit(renamed, &key, dst, count);
+        self.emit(renamed, key, dst, count);
     }
 
     /// `op` in the segment's register file: scalar operands read the register

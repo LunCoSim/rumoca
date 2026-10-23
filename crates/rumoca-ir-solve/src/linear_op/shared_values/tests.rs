@@ -1,5 +1,88 @@
 use super::*;
 
+fn wide_matrix_program() -> Vec<LinearOp> {
+    vec![
+        LinearOp::TensorLoad {
+            dst_start: 0,
+            input: TensorInputKind::Y,
+            input_start: 0,
+            count: 512,
+            seed_start: None,
+            lanes: 1,
+        },
+        LinearOp::MatrixMultiply {
+            dst_start: 512,
+            lhs_start: 0,
+            rhs_start: 256,
+            rows: 16,
+            inner: 16,
+            columns: 16,
+            lanes: 1,
+        },
+        LinearOp::StoreOutputRange {
+            start: 512,
+            count: 256,
+            stride: 1,
+        },
+    ]
+}
+
+#[test]
+fn shared_wide_value_proof_benchmark() {
+    let rows = [
+        (wide_matrix_program(), (512..768).collect()),
+        (wide_matrix_program(), (768..1024).collect()),
+    ];
+    let programs = programs(&rows);
+    let start = std::time::Instant::now();
+    for _ in 0..8 {
+        let shared = SharedValueSegments::derive(std::hint::black_box(&programs));
+        shared.check(&programs).unwrap();
+        assert_eq!(shared.segments.len(), 1);
+        assert_eq!(count(shared.segments[0].ops(), "MatrixMultiply"), 1);
+        std::hint::black_box(shared);
+    }
+    println!(
+        "SHARED_WIDE_VALUE_PROOF_BENCH elapsed_ns={} derivations_and_checks=8 inputs=512 outputs=256",
+        start.elapsed().as_nanos()
+    );
+}
+
+#[test]
+fn shared_wide_value_proof_rejects_changed_operands_and_output_projection() {
+    let rows = [(wide_matrix_program(), (512..768).collect())];
+    let programs = programs(&rows);
+    let mut changed = SharedValueSegments::derive(&programs);
+    for op in &mut changed.segments[0].ops {
+        if let LinearOp::MatrixMultiply {
+            lhs_start,
+            rhs_start,
+            ..
+        } = op
+        {
+            std::mem::swap(lhs_start, rhs_start);
+        }
+    }
+    assert_eq!(
+        changed.check(&programs),
+        Err(SharedValueError::Output { index: 0 })
+    );
+    let mut changed = SharedValueSegments::derive(&programs);
+    let output = changed.segments[0]
+        .ops
+        .iter_mut()
+        .find_map(|op| match op {
+            LinearOp::StoreOutput { src } => Some(src),
+            _ => None,
+        })
+        .expect("segment stores scalar outputs");
+    *output += 1;
+    assert_eq!(
+        changed.check(&programs),
+        Err(SharedValueError::Output { index: 0 })
+    );
+}
+
 #[test]
 fn shared_read_collection_is_exact_and_rejects_invalid_ranges() {
     let op = LinearOp::DotProduct {

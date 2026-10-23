@@ -19,10 +19,15 @@ enum TermKey {
     Value { key: ValueKey, output: usize },
 }
 
-/// The value key of one operation: its interned shape and its operands as
-/// (field or register offset, term).
+/// An operation value interned within one `Terms` table. The builder retains
+/// that table across segment boundaries; a check uses one table for both sides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ValueKey(usize);
+
+/// One operation's complete structural identity, with operands ordered by
+/// field or register offset. Output terms refer to its interned key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct ValueKey {
+struct OperationKey {
     shape: usize,
     operands: Vec<(usize, Term)>,
 }
@@ -33,6 +38,7 @@ pub(super) struct ValueKey {
 pub(super) struct Terms {
     ids: HashMap<TermKey, Term>,
     shapes: BTreeMap<String, usize>,
+    values: HashMap<OperationKey, ValueKey>,
 }
 
 impl Terms {
@@ -48,14 +54,15 @@ impl Terms {
             Some(&id) => id,
             None => *self.shapes.entry(shape.to_string()).or_insert(next),
         };
-        ValueKey { shape, operands }
+        let next = ValueKey(self.values.len());
+        *self
+            .values
+            .entry(OperationKey { shape, operands })
+            .or_insert(next)
     }
 
-    pub(super) fn value(&mut self, key: &ValueKey, output: usize) -> Term {
-        self.intern(TermKey::Value {
-            key: key.clone(),
-            output,
-        })
+    pub(super) fn value(&mut self, key: ValueKey, output: usize) -> Term {
+        self.intern(TermKey::Value { key, output })
     }
 }
 
@@ -90,14 +97,13 @@ pub(super) fn value_shape(op: &LinearOp) -> Option<ValueShape> {
         });
     }
     let (mut scalar, mut ranged) = (Vec::new(), false);
-    let mut probe = op.clone();
-    visit_registers(&mut probe, &mut |role, register| match role {
+    let mut normalized = op.clone();
+    visit_registers(&mut normalized, &mut |role, register| match role {
         Role::Scalar => scalar.push(*register),
         Role::RangeStart => ranged = true,
         Role::Destination => {}
     });
     let lowest = reads.first().copied().unwrap_or(0);
-    let mut normalized = op.clone();
     visit_registers(&mut normalized, &mut |role, register| {
         *register = match role {
             Role::Destination => 0,
@@ -236,11 +242,11 @@ fn value_step(
         _ => 0,
     };
     for ordinal in 0..stored {
-        outputs.push(terms.value(&key, ordinal));
+        outputs.push(terms.value(key, ordinal));
     }
     if let Some(start) = op.dst_register() {
         for offset in 0..op.dst_register_count() {
-            registers.insert(start + offset as Reg, terms.value(&key, offset));
+            registers.insert(start + offset as Reg, terms.value(key, offset));
         }
     }
     Some(())
