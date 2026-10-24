@@ -5,6 +5,86 @@ fn source_span(source: &'static str, start: usize, end: usize) -> Span {
 }
 
 #[test]
+fn sparse_output_lookup_preserves_first_program_and_source_on_replay() {
+    let first = source_span("SparseOutputs.mo", 1, 10);
+    let second = source_span("SparseOutputs.mo", 11, 20);
+    let program = vec![
+        LinearOp::Const { dst: 0, value: 1.0 },
+        LinearOp::Const { dst: 1, value: 2.0 },
+        LinearOp::StoreOutputRange {
+            start: 0,
+            count: 2,
+            stride: 1,
+        },
+    ];
+    let block = ScalarProgramBlock::with_output_indices(
+        vec![program.clone(), program],
+        vec![first, second],
+        vec![usize::MAX, 2, usize::MAX, 17],
+    )
+    .unwrap();
+    let wire = serde_json::to_value(&block).unwrap();
+    assert_eq!(wire.as_object().unwrap().len(), 3);
+    let replay: ScalarProgramBlock = serde_json::from_value(wire).unwrap();
+    let cloned = block.clone();
+    assert!(block.shares_program_owner(&cloned));
+    for owner in [&block, &cloned, &replay] {
+        assert_eq!(owner.stored_output_count(), 4);
+        assert_eq!(owner.program_index_for_output(usize::MAX), Some(0));
+        assert_eq!(owner.program_index_for_output(2), Some(0));
+        assert_eq!(owner.program_index_for_output(17), Some(1));
+        assert_eq!(owner.program_index_for_output(0), None);
+        assert_eq!(owner.span_for_output(usize::MAX), Some(first));
+        assert_eq!(owner.span_for_output(17), Some(second));
+    }
+    let empty = ScalarProgramBlock::default();
+    assert_eq!(empty.stored_output_count(), 0);
+    assert_eq!(empty.program_index_for_output(0), None);
+}
+
+#[test]
+#[ignore = "manual scalar output ownership lookup measurement"]
+fn output_program_index_benchmark() {
+    let span = source_span("OutputIndexBench.mo", 1, 2);
+    let programs = (0..1024)
+        .map(|_| {
+            vec![
+                LinearOp::Const { dst: 0, value: 1.0 },
+                LinearOp::Const { dst: 1, value: 2.0 },
+                LinearOp::Const { dst: 2, value: 3.0 },
+                LinearOp::Const { dst: 3, value: 4.0 },
+                LinearOp::StoreOutputRange {
+                    start: 0,
+                    count: 4,
+                    stride: 1,
+                },
+            ]
+        })
+        .collect();
+    let block = ScalarProgramBlock::with_output_indices(
+        programs,
+        vec![span; 1024],
+        (0..4096).map(|index| index * 3).collect(),
+    )
+    .unwrap();
+    let began = std::time::Instant::now();
+    let mut sum = 0;
+    for _ in 0..32 {
+        for output in block.output_indices() {
+            sum += std::hint::black_box(&block)
+                .program_index_for_output(std::hint::black_box(*output))
+                .unwrap();
+        }
+    }
+    let elapsed = began.elapsed();
+    assert_eq!(sum, 32 * (0..4096).map(|index| index / 4).sum::<usize>());
+    println!(
+        "OUTPUT_PROGRAM_INDEX lookups=131072 elapsed_ns={}",
+        elapsed.as_nanos()
+    );
+}
+
+#[test]
 fn logical_output_bindings_preserve_mixed_program_order_on_wire_replay() {
     let span = source_span("OutputBindings.mo", 1, 10);
     let block = ScalarProgramBlock::with_output_indices(

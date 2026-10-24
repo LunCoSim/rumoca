@@ -37,6 +37,7 @@ use rumoca_core::{
     ExternalTableData, ProvenanceSpan, SourceId, Span, StructuredIndexDomain,
     StructuredIndexDomainError,
 };
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -134,6 +135,9 @@ struct ScalarProgramData {
     programs: Vec<Vec<LinearOp>>,
     program_spans: Vec<Span>,
     output_indices: Vec<usize>,
+    /// First stored occurrence of each logical output, derived at construction.
+    /// Checked wire replay rebuilds this private lookup from the output bindings.
+    output_programs: FxHashMap<usize, usize>,
     /// Construction-owned execution capacity for each stored program.
     ///
     /// This proof is rebuilt on wire replay and deliberately is not
@@ -295,11 +299,19 @@ impl ScalarProgramBlock {
         output_indices: Vec<usize>,
         program_register_counts: Box<[usize]>,
     ) -> Self {
+        let mut output_programs =
+            FxHashMap::with_capacity_and_hasher(output_indices.len(), Default::default());
+        for binding in scalar_program_outputs::output_bindings(&programs, &output_indices) {
+            output_programs
+                .entry(binding.logical_index)
+                .or_insert(binding.program);
+        }
         Self {
             data: Arc::new(ScalarProgramData {
                 programs,
                 program_spans,
                 output_indices,
+                output_programs,
                 program_register_counts,
             }),
         }
@@ -377,13 +389,9 @@ impl ScalarProgramBlock {
             .sum()
     }
 
-    /// Total number of `StoreOutput` ops produced by this block.
+    /// Number of stored scalar outputs, including values from output ranges.
     pub fn stored_output_count(&self) -> usize {
-        self.data
-            .programs
-            .iter()
-            .map(|program| Self::program_output_count(program))
-            .sum()
+        self.data.output_indices.len()
     }
 
     pub fn uses_linear_solve_component(&self) -> bool {
@@ -393,30 +401,18 @@ impl ScalarProgramBlock {
             .any(|program| linear_ops_use_linear_solve_component(program))
     }
 
-    /// Map a dense output slot to the program that produces it.
+    /// Find the program owning a logical output index.
     ///
-    /// `output_indices` may be sparse, so this first maps the output slot to
-    /// its stored-output ordinal and then finds the owning program.
+    /// Sparse or repeated indices resolve to their first stored occurrence.
+    /// The immutable lookup is derived from the validated output bindings.
     pub fn program_index_for_output(&self, output: usize) -> Option<usize> {
-        let mut remaining = self
-            .data
-            .output_indices
-            .iter()
-            .position(|output_index| *output_index == output)?;
-        for (idx, program) in self.data.programs.iter().enumerate() {
-            let count = Self::program_output_count(program);
-            if remaining < count {
-                return Some(idx);
-            }
-            remaining -= count;
-        }
-        None
+        self.data.output_programs.get(&output).copied()
     }
 
-    /// Source span for a dense output slot, looked up via its owning program.
+    /// Source span for a logical output index, looked up via its owning program.
     ///
-    /// All outputs of a matmul/linsolve program share the node's span, matching
-    /// the pre-existing per-node span attribution.
+    /// Every output of a matrix multiplication or linear-solve program shares
+    /// that program's source span.
     pub fn span_for_output(&self, output: usize) -> Option<Span> {
         let program_index = self.program_index_for_output(output)?;
         self.program_span(program_index)
