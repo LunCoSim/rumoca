@@ -18,6 +18,7 @@ pattern-fixtures = []
 [dependencies]
 bincode = { workspace = true }
 rumoca-core = { workspace = true }
+rustc-hash = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 thiserror = { workspace = true }

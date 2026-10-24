@@ -31,6 +31,18 @@ the proof table. Encoding failure refuses the symbolic operation through the
 existing unevaluable result. The existing workspace `bincode` dependency owns
 the encoding; this adds no persistent format or decoder.
 
+Private proof lookup tables use the workspace's `rustc-hash` implementation.
+Full structural equality still resolves hash collisions. Program traversal
+assigns term and value IDs; table iteration does not choose execution order,
+output order or IDs. The independent symbolic check, register cap, effect
+preservation and exact floating-point keys retain their existing owners.
+
+The Griffin production constructor capture attributes 3,463 selected 1 kHz
+CPU samples to the 4.369 s coupled-initialization construction interval.
+Available frames include shared-value interning and standard SipHash; some
+symbols are unavailable. This motivates the private lookup change but does
+not itself measure its production benefit.
+
 ## Qualification
 
 Use the production consumer's Rust 1.97.1 with ordinary Cargo targets:
@@ -77,3 +89,21 @@ owner tests and diagnostic timings are in `native-cache-audit/` beside it.
 
 The owner-only all-feature Clippy check passes with `--no-deps -D warnings`.
 A full workspace lint/cohort sweep is not claimed.
+
+The private-hasher candidate passes all eighteen focused `shared_value` owner
+tests, including changed operands/output projection, effects, cap boundaries,
+signed zero and NaN payload rejection. Separate ordinary development test runs
+measure the scalar diagnostic at 5,520,739 ns before and 3,781,552 ns after,
+and the wide diagnostic at 4,245,661 ns before and 1,720,682 ns after. These
+small isolated measurements require production qualification; they are not
+loading or whole-tick acceptance.
+
+Its twenty-model canary uses the same fixed roster, MSL and OpenModelica
+versions as above. All twenty phase/error and channel-band rows match the
+previous canary exactly: twenty parse/flatten, fourteen DAE/solve and twelve
+initialized, simulated high-band traces; the same six DAE and two solve
+refusals remain. There are no timeouts. The owner-only all-feature Clippy
+check passes. Full workspace/coverage and the 566-model cohort are not run
+for this private lookup change, and are not claimed as qualification.
+Ignored receipts are under `proof-hasher-msl-canary/`, with the focused test
+and Clippy logs beside it in the consumer's evidence directory.

@@ -2,7 +2,7 @@
 //! shared-value construction keys its values by and its checker evaluates
 //! both sides over.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use super::super::*;
 use super::shape::{ShapeKey, value_shape};
@@ -36,9 +36,9 @@ struct OperationKey {
 /// check.
 #[derive(Default)]
 pub(super) struct Terms {
-    ids: HashMap<TermKey, Term>,
-    shapes: HashMap<ShapeKey, usize>,
-    values: HashMap<OperationKey, ValueKey>,
+    ids: FxHashMap<TermKey, Term>,
+    shapes: FxHashMap<ShapeKey, usize>,
+    values: FxHashMap<OperationKey, ValueKey>,
 }
 
 impl Terms {
@@ -70,7 +70,7 @@ impl Terms {
 /// every solver slot, committed after each program.
 #[derive(Default)]
 pub(super) struct SymbolicSlots {
-    slots: HashMap<usize, Term>,
+    slots: FxHashMap<usize, Term>,
 }
 
 impl SymbolicSlots {
@@ -87,7 +87,7 @@ impl SymbolicSlots {
         }
     }
 
-    pub(super) fn final_slots(&self) -> &HashMap<usize, Term> {
+    pub(super) fn final_slots(&self) -> &FxHashMap<usize, Term> {
         &self.slots
     }
 
@@ -100,7 +100,7 @@ impl SymbolicSlots {
         ops: &[LinearOp],
         targets: &[usize],
     ) -> Option<Vec<Term>> {
-        let mut registers: HashMap<Reg, Term> = HashMap::new();
+        let mut registers: FxHashMap<Reg, Term> = FxHashMap::default();
         let mut outputs = Vec::with_capacity(targets.len());
         for op in ops {
             self.step(terms, op, &mut registers, &mut outputs)?;
@@ -116,7 +116,7 @@ impl SymbolicSlots {
         &self,
         terms: &mut Terms,
         op: &LinearOp,
-        registers: &mut HashMap<Reg, Term>,
+        registers: &mut FxHashMap<Reg, Term>,
         outputs: &mut Vec<Term>,
     ) -> Option<()> {
         match *op {
@@ -164,7 +164,7 @@ impl SymbolicSlots {
 fn value_step(
     terms: &mut Terms,
     op: &LinearOp,
-    registers: &mut HashMap<Reg, Term>,
+    registers: &mut FxHashMap<Reg, Term>,
     outputs: &mut Vec<Term>,
 ) -> Option<()> {
     let shape = value_shape(op)?;

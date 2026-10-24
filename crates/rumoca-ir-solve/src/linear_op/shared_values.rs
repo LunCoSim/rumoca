@@ -17,7 +17,7 @@ mod symbolic;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use registers::{Role, read_registers, renamable, visit_registers};
 use shape::{ShapeKey, ValueShape, value_shape};
@@ -256,7 +256,7 @@ impl<'a> FusibleProgram<'a> {
         let registers = ScalarProgramRegisterFlow::derive(ops)
             .ok()?
             .register_count();
-        let mut written = HashSet::new();
+        let mut written = FxHashSet::default();
         let mut steps = Vec::with_capacity(ops.len());
         for op in ops {
             let start = op.dst_register().map_or(0, |start| start as usize);
@@ -328,7 +328,7 @@ struct Builder {
     shared: usize,
     capped: Vec<CappedValue>,
     /// Values of segments closed at the cap.
-    closed: HashSet<ValueKey>,
+    closed: FxHashSet<ValueKey>,
     segment: Segment,
 }
 
@@ -340,11 +340,11 @@ struct Segment {
     first_program: usize,
     registers: usize,
     /// Value key to the registers holding its outputs.
-    values: HashMap<ValueKey, Vec<Reg>>,
+    values: FxHashMap<ValueKey, Vec<Reg>>,
     /// Term of every register the segment wrote.
-    terms: HashMap<Reg, Term>,
+    terms: FxHashMap<Reg, Term>,
     /// Slots stored so far and the register holding each.
-    stored: HashMap<usize, Reg>,
+    stored: FxHashMap<usize, Reg>,
 }
 
 impl Builder {
@@ -367,7 +367,7 @@ impl Builder {
         let mut program_builder = ProgramBuilder {
             builder: self,
             base,
-            map: HashMap::new(),
+            map: FxHashMap::default(),
             output: 0,
             targets,
         };
@@ -426,7 +426,7 @@ struct ProgramBuilder<'a, 'p> {
     builder: &'a mut Builder,
     base: Reg,
     /// Program register to the segment register holding its value.
-    map: HashMap<Reg, Reg>,
+    map: FxHashMap<Reg, Reg>,
     output: usize,
     targets: &'p [usize],
 }
@@ -625,7 +625,7 @@ impl ProgramBuilder<'_, '_> {
 /// reads; output stores, operations writing nothing, and calls (whose body may
 /// reach an external function) are kept.
 fn without_dead_operations(ops: Vec<LinearOp>) -> Vec<LinearOp> {
-    let mut live: HashSet<Reg> = HashSet::new();
+    let mut live: FxHashSet<Reg> = FxHashSet::default();
     let mut keep = vec![false; ops.len()];
     for (index, op) in ops.iter().enumerate().rev() {
         let written = match op.dst_register() {
