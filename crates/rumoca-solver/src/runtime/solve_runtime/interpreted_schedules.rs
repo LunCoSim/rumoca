@@ -17,12 +17,12 @@ use crate::RuntimeSolveError;
 /// the solver slot of every output, in segment order.
 pub(crate) struct InterpretedSchedule {
     block: PreparedEvaluationBlock,
-    targets: Vec<usize>,
+    shared: solve::SharedAssignmentSchedule,
 }
 
-/// The prepared schedules of one runtime, by refresh sequence, each proved and
-/// prepared when the runtime is built, as the JIT and the C renderer prepare
-/// theirs; a sequence without an issued schedule has no entry.
+/// The prepared schedules of one runtime, by refresh sequence. Construction
+/// proves each issued schedule once and retains it for interpreter and native
+/// preparation; a sequence without an issued schedule has no entry.
 #[derive(Default)]
 pub(crate) struct InterpretedSchedules {
     prepared: FxHashMap<solve::RefreshSequenceId, Rc<InterpretedSchedule>>,
@@ -40,6 +40,15 @@ impl Clone for InterpretedSchedules {
 }
 
 impl InterpretedSchedules {
+    pub(super) fn shared(
+        &self,
+        sequence: solve::RefreshSequenceId,
+    ) -> Option<&solve::SharedAssignmentSchedule> {
+        self.prepared
+            .get(&sequence)
+            .map(|schedule| &schedule.shared)
+    }
+
     /// Prove and prepare every issued exact assignment schedule of `model`.
     pub(crate) fn construct(model: &solve::SolveModel) -> Result<Self, EvalSolveError> {
         let continuous = &model.problem.continuous;
@@ -81,8 +90,7 @@ impl SolveRuntime {
             return Ok(false);
         };
         let mut outputs = self.interpreted_assignment_schedules.outputs.borrow_mut();
-        let mut target = 0;
-        for row in 0..schedule.block.block().row_count() {
+        for (row, targets) in schedule.shared.target_rows().iter().enumerate() {
             schedule.block.eval_row_outputs_unchecked_with_context(
                 row,
                 solver_y,
@@ -91,9 +99,8 @@ impl SolveRuntime {
                 self.row_eval_context(),
                 &mut outputs,
             )?;
-            for &value in outputs.iter() {
-                solver_y[schedule.targets[target]] = value;
-                target += 1;
+            for (&target, &value) in targets.iter().zip(outputs.iter()) {
+                solver_y[target] = value;
             }
         }
         Ok(true)
@@ -113,24 +120,6 @@ fn prepare_schedule(
         Ok(shared) => shared,
         Err(error) => return Err(invalid(error.to_string())),
     };
-    let segments = shared.segments().segments();
-    let programs = segments
-        .iter()
-        .map(|segment| segment.ops().to_vec())
-        .collect::<Vec<_>>();
-    let targets = segments
-        .iter()
-        .flat_map(|segment| segment.targets().iter().copied())
-        .collect::<Vec<_>>();
-    let outputs = (0..targets.len()).collect();
-    let block = match solve::ScalarProgramBlock::with_output_indices(
-        programs,
-        shared.spans().to_vec(),
-        outputs,
-    ) {
-        Ok(block) => block,
-        Err(error) => return Err(invalid(error.to_string())),
-    };
-    let block = PreparedEvaluationBlock::new(block)?;
-    Ok(InterpretedSchedule { block, targets })
+    let block = PreparedEvaluationBlock::new(shared.block().clone())?;
+    Ok(InterpretedSchedule { block, shared })
 }

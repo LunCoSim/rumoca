@@ -722,13 +722,11 @@ mod native_policy_tests {
 
         fn compile_assignment_schedule(
             &self,
-            source: &solve::ComputeBlock,
-            owners: &solve::ContinuousRefreshOwners,
-            schedule: &solve::ExactRefreshAssignmentSchedule,
+            schedule: &solve::SharedAssignmentSchedule,
         ) -> Result<Rc<dyn CompiledSolveAssignmentSchedule>, String> {
             NativeCallCounters::bump(&self.counters.assignment_compiles);
             self.inner
-                .compile_assignment_schedule(source, owners, schedule)
+                .compile_assignment_schedule(schedule)
                 .map(|inner| {
                     Rc::new(CountingAssignment {
                         inner,
@@ -964,9 +962,7 @@ mod native_policy_tests {
 
         fn compile_assignment_schedule(
             &self,
-            _source: &solve::ComputeBlock,
-            _owners: &solve::ContinuousRefreshOwners,
-            _schedule: &solve::ExactRefreshAssignmentSchedule,
+            _schedule: &solve::SharedAssignmentSchedule,
         ) -> Result<Rc<dyn CompiledSolveAssignmentSchedule>, String> {
             Ok(Rc::new(FailingCompiled))
         }

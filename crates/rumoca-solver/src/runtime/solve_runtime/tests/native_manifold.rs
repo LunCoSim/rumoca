@@ -134,9 +134,7 @@ impl SolveExecutionBackend for Backend {
 
     fn compile_assignment_schedule(
         &self,
-        _: &solve::ComputeBlock,
-        _: &solve::ContinuousRefreshOwners,
-        _: &solve::ExactRefreshAssignmentSchedule,
+        _: &solve::SharedAssignmentSchedule,
     ) -> Result<Rc<dyn CompiledSolveAssignmentSchedule>, String> {
         Err("unused by manifold test".into())
     }

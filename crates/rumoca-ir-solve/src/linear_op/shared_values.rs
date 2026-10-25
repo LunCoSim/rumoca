@@ -94,6 +94,15 @@ pub enum SharedValueError {
 }
 
 impl SharedValueSegments {
+    /// Consume the segment storage after its owner has checked the sequence.
+    pub(crate) fn into_assignment_rows(
+        self,
+    ) -> impl Iterator<Item = (Vec<LinearOp>, Box<[usize]>)> {
+        self.segments
+            .into_iter()
+            .map(|segment| (segment.ops, segment.targets.into_boxed_slice()))
+    }
+
     /// The segments of `programs`, in order.
     #[must_use]
     pub fn derive(programs: &[AssignmentProgram<'_>]) -> Self {

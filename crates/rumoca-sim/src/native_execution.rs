@@ -240,19 +240,15 @@ impl rumoca_solver::SolveExecutionBackend for CraneliftExecutionBackend {
 
     fn compile_assignment_schedule(
         &self,
-        source: &rumoca_ir_solve::ComputeBlock,
-        owners: &rumoca_ir_solve::ContinuousRefreshOwners,
-        schedule: &rumoca_ir_solve::ExactRefreshAssignmentSchedule,
+        schedule: &rumoca_ir_solve::SharedAssignmentSchedule,
     ) -> Result<Rc<dyn rumoca_solver::CompiledSolveAssignmentSchedule>, String> {
         let compiled = match &self.pure_calls {
             Some(pure_calls) => {
                 rumoca_exec_cranelift::compile_exact_assignment_schedule_with_pure_calls(
-                    source, owners, schedule, pure_calls,
+                    schedule, pure_calls,
                 )
             }
-            None => {
-                rumoca_exec_cranelift::compile_exact_assignment_schedule(source, owners, schedule)
-            }
+            None => rumoca_exec_cranelift::compile_exact_assignment_schedule(schedule),
         };
         compiled
             .map(|compiled| Rc::new(CraneliftAssignmentSchedule(compiled)) as Rc<_>)

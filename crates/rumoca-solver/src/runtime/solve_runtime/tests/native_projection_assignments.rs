@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::runtime::projection::ImplicitProjectionModel;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 #[derive(Default)]
 struct AssignmentBackend {
@@ -11,6 +11,7 @@ struct AssignmentBackend {
     fail: bool,
     decline: bool,
     schedule_failure: bool,
+    schedule_blocks: RefCell<Vec<usize>>,
 }
 
 struct FailingAssignment(Rc<Cell<usize>>);
@@ -80,10 +81,11 @@ impl SolveExecutionBackend for AssignmentBackend {
 
     fn compile_assignment_schedule(
         &self,
-        _source: &solve::ComputeBlock,
-        _owners: &solve::ContinuousRefreshOwners,
-        _schedule: &solve::ExactRefreshAssignmentSchedule,
+        schedule: &solve::SharedAssignmentSchedule,
     ) -> Result<Rc<dyn CompiledSolveAssignmentSchedule>, String> {
+        self.schedule_blocks
+            .borrow_mut()
+            .push(schedule.block().programs().as_ptr() as usize);
         if self.schedule_failure {
             return Ok(Rc::new(FailingAssignment(self.calls.clone())));
         }
@@ -106,6 +108,23 @@ fn failed_native_refresh_restores_values_without_disabling_native_execution() {
         schedule_failure: true,
         ..Default::default()
     });
+    let prepared_blocks = runtime
+        .model
+        .problem
+        .continuous
+        .refresh_owners
+        .exact_assignment_schedules()
+        .iter()
+        .map(|schedule| {
+            runtime
+                .interpreted_assignment_schedules
+                .shared(schedule.sequence_id())
+                .expect("issued schedule is prepared")
+                .block()
+                .programs()
+                .as_ptr() as usize
+        })
+        .collect::<Vec<_>>();
     runtime.execution_backend = Some(backend.clone());
     for _ in 0..2 {
         let mut y = model.initial_y.clone();
@@ -126,6 +145,12 @@ fn failed_native_refresh_restores_values_without_disabling_native_execution() {
         backend.calls.get(),
         2,
         "failure must not cache an interpreter fallback"
+    );
+    let blocks = backend.schedule_blocks.borrow();
+    assert_eq!(blocks.len(), 1, "the issued schedule compiles only once");
+    assert!(
+        prepared_blocks.contains(&blocks[0]),
+        "native compilation must borrow the interpreter's proven program storage"
     );
 }
 

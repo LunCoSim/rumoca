@@ -247,11 +247,11 @@ pub trait SolveExecutionBackend {
         block: &solve::ScalarProgramBlock,
     ) -> Result<Rc<dyn CompiledSolveJacobianExpression>, String>;
 
+    /// Compile the runtime's already-proven assignment programs, committing
+    /// each program's targets in output order before executing the next.
     fn compile_assignment_schedule(
         &self,
-        source: &solve::ComputeBlock,
-        owners: &solve::ContinuousRefreshOwners,
-        schedule: &solve::ExactRefreshAssignmentSchedule,
+        schedule: &solve::SharedAssignmentSchedule,
     ) -> Result<Rc<dyn CompiledSolveAssignmentSchedule>, String>;
 
     /// Compile a causally ordered list of single-output isolator rows whose

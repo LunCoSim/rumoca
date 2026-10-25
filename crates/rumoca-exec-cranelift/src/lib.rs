@@ -498,21 +498,17 @@ pub fn compile_assignment_schedule_with_pure_calls(
 }
 
 pub fn compile_exact_assignment_schedule(
-    source: &rumoca_ir_solve::ComputeBlock,
-    owners: &rumoca_ir_solve::ContinuousRefreshOwners,
-    schedule: &rumoca_ir_solve::ExactRefreshAssignmentSchedule,
+    schedule: &rumoca_ir_solve::SharedAssignmentSchedule,
 ) -> Result<CompiledAssignmentSchedule, CompileError> {
-    emit::compile_exact_assignment_schedule(source, owners, schedule, None)
+    emit::compile_exact_assignment_schedule(schedule, None)
         .map(|jit| CompiledAssignmentSchedule { jit })
 }
 
 pub fn compile_exact_assignment_schedule_with_pure_calls(
-    source: &rumoca_ir_solve::ComputeBlock,
-    owners: &rumoca_ir_solve::ContinuousRefreshOwners,
-    schedule: &rumoca_ir_solve::ExactRefreshAssignmentSchedule,
+    schedule: &rumoca_ir_solve::SharedAssignmentSchedule,
     pure_calls: &CompiledPureCallTable,
 ) -> Result<CompiledAssignmentSchedule, CompileError> {
-    emit::compile_exact_assignment_schedule(source, owners, schedule, Some(pure_calls.jit.clone()))
+    emit::compile_exact_assignment_schedule(schedule, Some(pure_calls.jit.clone()))
         .map(|jit| CompiledAssignmentSchedule { jit })
 }
 
@@ -1108,8 +1104,10 @@ mod tests {
         let schedule = owners
             .exact_assignment_schedule(owners.algebraic().dynamic_causal_sequence)
             .expect("construction should freeze the exact order");
-        let compiled = compile_exact_assignment_schedule(&source, &owners, schedule)
-            .expect("compile owner schedule");
+        let shared = schedule
+            .shared_segments(&source, &owners)
+            .expect("prove owner schedule");
+        let compiled = compile_exact_assignment_schedule(&shared).expect("compile owner schedule");
         let mut y = [0.0, 0.0];
 
         compiled.call(&mut y, &[], 0.0).expect("run schedule");

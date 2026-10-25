@@ -667,28 +667,22 @@ impl SolveRuntime {
         {
             return cached;
         }
-        let owners = &self.model.problem.continuous.refresh_owners;
-        let Some(schedule) = owners.exact_assignment_schedule(sequence) else {
+        let Some(schedule) = self.interpreted_assignment_schedules.shared(sequence) else {
             self.compiled_assignment_schedules
                 .borrow_mut()
                 .insert(sequence, None);
             return None;
         };
         let compiled = backend
-            .compile_assignment_schedule(
-                &self.model.problem.continuous.implicit_rhs,
-                owners,
-                schedule,
-            )
+            .compile_assignment_schedule(schedule)
             .map_err(|error| {
                 tracing::debug!(
                     target: "rumoca_solver::native_execution",
-                    programs = schedule.program_ids().len(),
+                    programs = schedule.block().programs().len(),
                     targets = schedule
-                        .program_ids()
+                        .target_rows()
                         .iter()
-                        .filter_map(|id| owners.exact_assignment_program(*id))
-                        .map(|program| program.target_indices().len())
+                        .map(|targets| targets.len())
                         .sum::<usize>(),
                     %error,
                     "failed to compile assignment schedule"

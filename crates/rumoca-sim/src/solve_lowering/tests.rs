@@ -1433,5 +1433,5 @@ end Defaults;"#,
     let rumoca_ir_solve::ScalarSlot::P { index, .. } = slot else {
         panic!("input is a parameter slot");
     };
-    assert_eq!(model.parameters[index as usize], 6.0);
+    assert_eq!(model.parameters[index], 6.0);
 }

@@ -765,24 +765,21 @@ fn compile_assignment_schedule_attached(
 }
 
 pub(crate) fn compile_exact_assignment_schedule(
-    source: &rumoca_ir_solve::ComputeBlock,
-    owners: &rumoca_ir_solve::ContinuousRefreshOwners,
-    schedule: &rumoca_ir_solve::ExactRefreshAssignmentSchedule,
+    schedule: &rumoca_ir_solve::SharedAssignmentSchedule,
     pure_calls: Option<Rc<typed_program::CompiledPureCallTable>>,
 ) -> Result<CompiledAssignmentSchedule, CompileError> {
     // The schedule runs as its shared-value segments (SPEC_0043 §6a), each
     // one row committing its targets before the next.
-    let shared = schedule.shared_segments(source, owners).map_err(|error| {
-        CompileError::Input(format!("exact assignment segments failed: {error}"))
-    })?;
-    let segments = shared.segments().segments();
-    let rows = segments
+    let rows = schedule
+        .block()
+        .programs()
         .iter()
-        .map(|segment| segment.ops())
+        .map(Vec::as_slice)
         .collect::<Vec<_>>();
-    let targets = segments
+    let targets = schedule
+        .target_rows()
         .iter()
-        .flat_map(|segment| segment.targets().iter().copied())
+        .flat_map(|targets| targets.iter().copied())
         .collect::<Vec<_>>();
     compile_assignment_schedule_slices(&rows, &targets, pure_calls)
 }

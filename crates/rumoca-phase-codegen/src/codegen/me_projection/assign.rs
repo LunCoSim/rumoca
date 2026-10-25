@@ -58,16 +58,22 @@ impl AssignmentCatalog {
                 &problem.continuous.refresh_owners,
             )
             .map_err(|error| CodegenError::template(error.to_string()))?;
-        let mut functions = Vec::with_capacity(shared.segments().segments().len());
-        for (segment, &span) in shared.segments().segments().iter().zip(shared.spans()) {
-            let content = format!("{:?}{:?}", segment.targets(), segment.ops());
+        let block = shared.block();
+        let mut functions = Vec::with_capacity(block.programs().len());
+        for ((program, targets), &span) in block
+            .programs()
+            .iter()
+            .zip(shared.target_rows())
+            .zip(block.program_spans())
+        {
+            let content = format!("{targets:?}{program:?}");
             let function = match self.contents.get(&content) {
                 Some(&function) => function,
                 None => {
                     let function = self.programs.len();
-                    self.programs.push(segment.ops().to_vec());
+                    self.programs.push(program.to_vec());
                     self.spans.push(span);
-                    self.targets.extend_from_slice(segment.targets());
+                    self.targets.extend_from_slice(targets);
                     self.contents.insert(content, function);
                     function
                 }

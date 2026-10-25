@@ -131,9 +131,7 @@ impl SolveExecutionBackend for RecordingBackend {
 
     fn compile_assignment_schedule(
         &self,
-        _source: &solve::ComputeBlock,
-        _owners: &solve::ContinuousRefreshOwners,
-        _schedule: &solve::ExactRefreshAssignmentSchedule,
+        _schedule: &solve::SharedAssignmentSchedule,
     ) -> Result<Rc<dyn CompiledSolveAssignmentSchedule>, String> {
         Err("the sharing fixture refreshes through the interpreter".into())
     }
