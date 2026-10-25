@@ -17,7 +17,7 @@ mod tensor;
 mod tensor_product_tests;
 
 use super::host_runtime::{host_jit_builder, register_math_symbols};
-use super::owned_jit_module::{OwnedJitModule, declare_far_call_in_func};
+use super::owned_jit_module::{OwnedJitModule, declare_far_call_in_func, declare_far_data_in_func};
 use super::status;
 use super::{
     CompileError, MathImports, emit_binary_op, emit_unary_op, finalize_jit_module, to_backend_err,
@@ -31,6 +31,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use input_results::InputResults;
 use rumoca_ir_solve as solve;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use storage::compact_register_tape;
@@ -81,7 +82,8 @@ struct PureCallSymbol {
 pub(crate) struct CompiledPureCallTable {
     symbols: Box<[PureCallSymbol]>,
     directional_symbols: Box<[Option<PureCallSymbol>]>,
-    _input_results: Vec<InputResults>,
+    // Native result cells mutate through shared calls; tables cannot be Sync.
+    _mutable_results: Cell<()>,
     _module: OwnedJitModule,
 }
 
@@ -237,7 +239,6 @@ struct TableCompiler {
     math: MathImports,
     functions: Vec<FuncId>,
     directional_functions: Vec<Option<FuncId>>,
-    input_results: Vec<InputResults>,
 }
 
 impl TableCompiler {
@@ -280,7 +281,6 @@ impl TableCompiler {
             math: MathImports::default(),
             functions,
             directional_functions,
-            input_results: Vec::new(),
         })
     }
 
@@ -352,7 +352,7 @@ impl TableCompiler {
         } = unit;
         let config = self.module.target_config();
         let pointer_type = config.pointer_type();
-        let input_results = InputResults::new(coordinate)?;
+        let input_results = InputResults::new(&mut self.module, coordinate)?;
         let mut context = self.module.make_context();
         context
             .func
@@ -377,7 +377,13 @@ impl TableCompiler {
             builder.switch_to_block(entry);
             builder.seal_block(entry);
             let parameters = builder.block_params(entry).to_vec();
-            let cache = input_results.enter(&mut builder, config, parameters[0], parameters[1])?;
+            let cache = input_results.enter(
+                &mut builder,
+                &self.module,
+                config,
+                parameters[0],
+                parameters[1],
+            )?;
             let layout = ProgramLayout::new(program, input_count, output_count)?;
             let tape = create_tape(&mut builder, pointer_type, layout.tape_cells)?;
             let mut lowerer = ProgramLowerer {
@@ -401,7 +407,6 @@ impl TableCompiler {
             .define_function(function, &mut context)
             .map_err(to_backend_err)?;
         self.module.clear_context(&mut context);
-        self.input_results.push(input_results);
         Ok(())
     }
 
@@ -454,7 +459,7 @@ impl TableCompiler {
         Ok(CompiledPureCallTable {
             symbols: symbols.into_boxed_slice(),
             directional_symbols: directional_symbols.into_boxed_slice(),
-            _input_results: self.input_results,
+            _mutable_results: Cell::new(()),
             _module: self.module,
         })
     }

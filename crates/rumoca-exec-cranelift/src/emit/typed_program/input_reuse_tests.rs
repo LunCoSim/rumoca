@@ -1,7 +1,9 @@
 use super::*;
 use crate::emit::host_runtime::take_sin_calls;
+use crate::native_code_cache::{tests::MemoryStore, with_native_code_cache};
+use std::{cell::RefCell, rc::Rc};
 
-fn sine_owner() -> solve::SolvePureCallTable {
+fn unary_owner(operator: solve::SolveUnaryOperator) -> solve::SolvePureCallTable {
     let at = rumoca_core::Span::from_offsets(
         rumoca_core::SourceId::from_source_name("pure_input_reuse.mo"),
         0,
@@ -20,8 +22,8 @@ fn sine_owner() -> solve::SolvePureCallTable {
             at,
             |builder, inputs, outputs| {
                 let x = builder.load(inputs[0], at)?;
-                let sine = builder.unary(solve::SolveUnaryOperator::Sin, x, at)?;
-                builder.store(outputs[0], sine, at)
+                let result = builder.unary(operator, x, at)?;
+                builder.store(outputs[0], result, at)
             },
         )?;
         Ok(())
@@ -31,7 +33,7 @@ fn sine_owner() -> solve::SolvePureCallTable {
 
 #[test]
 fn native_pure_call_reuses_only_identical_complete_input_bits() {
-    let table = sine_owner();
+    let table = unary_owner(solve::SolveUnaryOperator::Sin);
     let compiled = CompiledPureCallTable::compile(&table).unwrap();
     let site = table.owners()[0].call_site();
     take_sin_calls();
@@ -57,7 +59,7 @@ fn native_pure_call_reuses_only_identical_complete_input_bits() {
 
 #[test]
 fn directional_input_reuse_includes_seed_and_is_separate_from_primal() {
-    let table = sine_owner();
+    let table = unary_owner(solve::SolveUnaryOperator::Sin);
     let compiled = CompiledPureCallTable::compile(&table).unwrap();
     let site = table.owners()[0].call_site();
     let directional = site.directional().unwrap();
@@ -195,23 +197,83 @@ fn failed_native_evaluation_never_publishes_a_result() {
 
 #[test]
 fn compiled_tables_have_independent_result_storage() {
-    let table = sine_owner();
-    let first = CompiledPureCallTable::compile(&table).unwrap();
-    let second = CompiledPureCallTable::compile(&table).unwrap();
+    let table = unary_owner(solve::SolveUnaryOperator::Sin);
+    let store = Rc::new(RefCell::new(MemoryStore::default()));
+    let (first, cold) = with_native_code_cache(store.clone(), || {
+        CompiledPureCallTable::compile(&table).unwrap()
+    });
+    assert!(cold.compilations > 0);
+    let (second, warm) =
+        with_native_code_cache(store, || CompiledPureCallTable::compile(&table).unwrap());
+    assert_eq!(warm.attempts, cold.attempts);
+    assert_eq!(warm.hits, warm.attempts);
+    assert_eq!(warm.compilations, 0);
     let site = table.owners()[0].call_site();
-    take_sin_calls();
-    for compiled in [&first, &second, &first, &second] {
-        let mut output = [0];
-        compiled
-            .call_cells(
-                rumoca_eval_solve::PureCallInvocation::Primal(&site),
-                &[0.7_f64.to_bits()],
-                &mut output,
-            )
-            .unwrap();
-        assert_eq!(output, [0.7_f64.sin().to_bits()]);
+    for x in [0.7_f64, -0.0, 0.0, -0.7] {
+        take_sin_calls();
+        for compiled in [&first, &second, &first, &second] {
+            let mut output = [0];
+            compiled
+                .call_cells(
+                    rumoca_eval_solve::PureCallInvocation::Primal(&site),
+                    &[x.to_bits()],
+                    &mut output,
+                )
+                .unwrap();
+            assert_eq!(output, [x.sin().to_bits()]);
+        }
+        assert_eq!(take_sin_calls(), 2);
     }
-    assert_eq!(take_sin_calls(), 2);
+    let directional = site.directional().unwrap();
+    for (x, seed) in [(0.7_f64, 1.0_f64), (0.7, 2.0), (-0.0, 0.0), (0.0, -0.0)] {
+        take_sin_calls();
+        for compiled in [&first, &second, &first, &second] {
+            let mut output = [0; 2];
+            compiled
+                .call_cells(
+                    rumoca_eval_solve::PureCallInvocation::Directional(directional),
+                    &[x.to_bits(), seed.to_bits()],
+                    &mut output,
+                )
+                .unwrap();
+            assert_eq!(output, [x.sin().to_bits(), (x.cos() * seed).to_bits()]);
+        }
+        assert_eq!(take_sin_calls(), 2);
+    }
+    drop(first);
+    let mut output = [0];
+    second
+        .call_cells(
+            rumoca_eval_solve::PureCallInvocation::Primal(&site),
+            &[0.3_f64.to_bits()],
+            &mut output,
+        )
+        .unwrap();
+    assert_eq!(output, [0.3_f64.sin().to_bits()]);
+}
+
+#[test]
+fn native_artifact_keys_include_pure_call_body() {
+    let store = Rc::new(RefCell::new(MemoryStore::default()));
+    let sine = unary_owner(solve::SolveUnaryOperator::Sin);
+    let (first, _) = with_native_code_cache(store.clone(), || {
+        CompiledPureCallTable::compile(&sine).unwrap()
+    });
+    let cosine = unary_owner(solve::SolveUnaryOperator::Cos);
+    let (changed, usage) =
+        with_native_code_cache(store, || CompiledPureCallTable::compile(&cosine).unwrap());
+    assert!(usage.compilations > 0);
+    let site = cosine.owners()[0].call_site();
+    let mut output = [0];
+    changed
+        .call_cells(
+            rumoca_eval_solve::PureCallInvocation::Primal(&site),
+            &[0.7_f64.to_bits()],
+            &mut output,
+        )
+        .unwrap();
+    assert_eq!(output, [0.7_f64.cos().to_bits()]);
+    drop(first);
 }
 
 #[test]

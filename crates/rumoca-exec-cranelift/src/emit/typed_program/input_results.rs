@@ -2,21 +2,22 @@
 
 use super::*;
 use cranelift_codegen::isa::TargetFrontendConfig;
-use std::cell::Cell;
+use cranelift_module::{DataDescription, DataId};
 
-/// Stable interior-mutable cells referenced only by this table's native code.
-/// `Cell` makes the table !Sync, so its shared compiled callers cannot cross
-/// threads. Moving an exclusively owned table preserves the boxed addresses.
-/// The acyclic call graph excludes reentry into the same owner; distinct
-/// owners and primal/directional forms have distinct storage.
+/// One zero-initialized writable data object owned by the native module.
+/// Code refers to it symbolically, so immutable compiled artifacts can be
+/// rebound to fresh result cells. The acyclic call graph excludes reentry into
+/// the same owner; distinct owners and primal/directional forms have distinct
+/// storage. The compiled table preserves the non-Sync mutation boundary.
 pub(super) struct InputResults {
-    cells: Box<[Cell<u64>]>,
+    cells: DataId,
     input_cells: u32,
     output_cells: u32,
 }
 
 impl InputResults {
     pub(super) fn new(
+        module: &mut JITModule,
         coordinate: solve::SolvePureCallInputCoordinate,
     ) -> Result<Self, CompileError> {
         let input_cells = u32::try_from(coordinate.input_cells()).map_err(|_| {
@@ -28,9 +29,16 @@ impl InputResults {
         let count = checked_cells(input_cells, output_cells, "pure result coordinate")?;
         let count = checked_cells(count, 1, "pure result flag")?;
         // All offsets used below must be representable before any code is issued.
-        cell_offset(count, "pure result storage")?;
+        let bytes = cell_offset(count, "pure result storage")? as usize;
+        let cells = module
+            .declare_anonymous_data(true, false)
+            .map_err(to_backend_err)?;
+        let mut data = DataDescription::new();
+        data.define_zeroinit(bytes);
+        data.set_align(CELL_BYTES as u64);
+        module.define_data(cells, &data).map_err(to_backend_err)?;
         Ok(Self {
-            cells: vec![Cell::new(0); count as usize].into_boxed_slice(),
+            cells,
             input_cells,
             output_cells,
         })
@@ -39,13 +47,13 @@ impl InputResults {
     pub(super) fn enter(
         &self,
         builder: &mut FunctionBuilder<'_>,
+        module: &JITModule,
         config: TargetFrontendConfig,
         input: Value,
         output: Value,
     ) -> Result<Value, CompileError> {
-        let cache = builder
-            .ins()
-            .iconst(config.pointer_type(), self.cells.as_ptr() as usize as i64);
+        let data = declare_far_data_in_func(module, self.cells, builder.func)?;
+        let cache = builder.ins().global_value(config.pointer_type(), data);
         let cached_input = cell_pointer(builder, cache, 1, "pure result inputs")?;
         let ready = builder.ins().load(types::I64, MemFlags::new(), cache, 0);
         let hit = builder.create_block();

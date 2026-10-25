@@ -2,9 +2,9 @@ use std::ops::{Deref, DerefMut};
 
 use cranelift_codegen::ir;
 use cranelift_jit::JITModule;
-use cranelift_module::{FuncId, Module};
+use cranelift_module::{DataId, FuncId, Module};
 
-/// Sole owner of one Cranelift executable-memory arena.
+/// Sole owner of one Cranelift code and data arena.
 ///
 /// `JITModule` intentionally does not release code memory from `Drop`; its
 /// unsafe consuming `free_memory` operation must be called after every
@@ -50,6 +50,24 @@ pub(super) fn declare_far_call_in_func(
     let callee = module.declare_func_in_func(func_id, func);
     func.dfg.ext_funcs[callee].colocated = false;
     callee
+}
+
+/// Materialize a module-owned data address without assuming that writable
+/// storage is near executable code. Cached code keeps the symbolic relocation;
+/// the current JIT module supplies the data allocation when it is finalized.
+pub(super) fn declare_far_data_in_func(
+    module: &JITModule,
+    data_id: DataId,
+    func: &mut ir::Function,
+) -> Result<ir::GlobalValue, crate::CompileError> {
+    let data = module.declare_data_in_func(data_id, func);
+    let ir::GlobalValueData::Symbol { colocated, .. } = &mut func.global_values[data] else {
+        return Err(crate::CompileError::Backend(
+            "JIT data declaration did not issue a symbolic address".into(),
+        ));
+    };
+    *colocated = false;
+    Ok(data)
 }
 
 impl Deref for OwnedJitModule {
@@ -120,6 +138,54 @@ mod tests {
             .expect("construct test JIT builder");
         builder.memory_provider(Box::new(CountingMemory { frees }));
         OwnedJitModule::new(JITModule::new(builder))
+    }
+
+    #[test]
+    #[ignore = "run with --features cranelift-codegen/arm64 -- --include-ignored"]
+    fn far_data_addresses_use_full_width_relocations_on_x86_and_arm64() {
+        use cranelift_codegen::{
+            Context,
+            ir::{AbiParam, InstBuilder, Signature},
+            isa,
+        };
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+        use cranelift_module::Module;
+
+        let mut module = guarded_module(Arc::new(AtomicUsize::new(0)));
+        let data = module.declare_anonymous_data(true, false).unwrap();
+        for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            let isa = isa::lookup(triple.parse().unwrap())
+                .unwrap()
+                .finish(module.isa().flags().clone())
+                .unwrap();
+            let pointer_type = isa.frontend_config().pointer_type();
+            let mut context = Context::new();
+            context.func.signature = Signature::new(isa.default_call_conv());
+            context
+                .func
+                .signature
+                .returns
+                .push(AbiParam::new(pointer_type));
+            let mut frontend = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut context.func, &mut frontend);
+            let entry = builder.create_block();
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            let data = super::declare_far_data_in_func(&module, data, builder.func).unwrap();
+            let address = builder.ins().global_value(pointer_type, data);
+            builder.ins().return_(&[address]);
+            builder.finalize();
+            let code = context
+                .compile(isa.as_ref(), &mut Default::default())
+                .unwrap();
+            let relocations = code.buffer.relocs();
+            assert_eq!(relocations.len(), 1, "{triple}");
+            assert_eq!(
+                relocations[0].kind,
+                cranelift_codegen::binemit::Reloc::Abs8,
+                "{triple}"
+            );
+        }
     }
 
     #[test]

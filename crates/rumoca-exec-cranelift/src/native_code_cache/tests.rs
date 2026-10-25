@@ -4,7 +4,7 @@ use rumoca_ir_solve::{BinaryOp, LinearOp, ScalarProgramBlock, UnaryOp};
 use std::{borrow::Cow, collections::BTreeMap};
 
 #[derive(Default)]
-struct MemoryStore(BTreeMap<Vec<u8>, Vec<u8>>);
+pub(crate) struct MemoryStore(BTreeMap<Vec<u8>, Vec<u8>>);
 
 impl CacheKvStore for MemoryStore {
     fn get(&self, key: &[u8]) -> Option<Cow<'_, [u8]>> {

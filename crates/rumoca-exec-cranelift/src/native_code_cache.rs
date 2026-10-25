@@ -16,7 +16,7 @@ use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module, ModuleError, ModuleReloc};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 type Store = Rc<RefCell<dyn CacheKvStore>>;
 

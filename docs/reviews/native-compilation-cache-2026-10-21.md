@@ -14,6 +14,10 @@ and upstream store trait. No upstream source, Modelica IR, flags or math changes
 The host owns immutable artifact storage, eviction, persistence and rejection
 reporting. Scope lifetime does not cross worker threads or async tasks. Solver
 instances, numeric workspaces and executable arenas are never cached here.
+Pure-call result cells are zero-initialized writable data in each current JIT
+module. Functions use full-width symbolic data relocations; cache keys retain
+program identity without process-specific storage addresses. The compiled
+table preserves its non-Sync boundary and drops its code/data arena last.
 
 Five focused native tests pass: bitwise output equivalence with changed
 coordinates/parameters/constants, nested/unwound/thread boundaries, a typed
@@ -28,15 +32,16 @@ f64 bits, digest
 One matched series measures uncached 7,269.063 ms, cold 7,190.815 ms and warm
 3,472.063 / 3,236.436 ms. A separate restart series measures uncached
 7,219.292 ms and its first persisted-cache construction 3,519.132 ms, with
-16,408 hits and 68 fresh compilations. Keys depending on current descriptors
-remain legitimate misses; no pointer normalization is performed.
+16,408 hits and 68 fresh compilations. Pure-call storage addresses are bound
+through module data relocations; no pointer normalization or cache-key
+relaxation is performed.
 
 These are constructor diagnostics, not full-Twin loading or FPS acceptance.
 The high-level JIT bytes API does not populate optional unwinder/code-range
 metadata; the current dependency has no unwinder feature enabled and Rumoca
 does not consume those ranges. A host enabling that feature needs separate
 qualification. AArch64 relocation behavior uses the existing emitter, but macOS
-has not been executed. No dependency patch has been published.
+has not been executed.
 
 The fixed twenty-model MSL canary has zero model/diagnostic or oracle-band
 delta against clean baseline `bda1e01ff223`. Both compile fourteen models,
