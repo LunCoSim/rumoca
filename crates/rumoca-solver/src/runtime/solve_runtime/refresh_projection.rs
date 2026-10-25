@@ -1,8 +1,6 @@
 mod grouped_jacobian;
 mod grouped_residual;
 mod prepared_jacobian;
-#[cfg(test)]
-mod workspace_tests;
 
 pub(super) use prepared_jacobian::{
     prepare_projection_jacobians, projection_jacobian_source, validate_projection_primal_source,
@@ -24,22 +22,7 @@ use crate::runtime::fallbacks::{self, ProjectionFallback, ProjectionSite};
 /// cache is dropped on clone because a clone owns a different model
 /// allocation, so inherited keys could collide with unrelated tearings.
 #[derive(Default)]
-pub(super) struct TornSweepCache {
-    entries: RefCell<FxHashMap<usize, Option<Rc<PreparedTornSweepEntry>>>>,
-    workspace: RefCell<TornSweepWorkspace>,
-}
-
-/// Temporary values for one active sweep, retained by its runtime and refilled
-/// before every read. Cloning the cache starts with independent empty storage.
-#[derive(Default)]
-struct TornSweepWorkspace {
-    raw: Vec<Option<f64>>,
-    dense_residuals: Vec<f64>,
-    #[cfg(debug_assertions)]
-    reference_y: Vec<f64>,
-    #[cfg(debug_assertions)]
-    reference_residuals: Vec<f64>,
-}
+pub(super) struct TornSweepCache(RefCell<FxHashMap<usize, Option<Rc<PreparedTornSweepEntry>>>>);
 
 impl Clone for TornSweepCache {
     fn clone(&self) -> Self {
@@ -931,34 +914,12 @@ impl ImplicitProjectionModel for RefreshProjectionModel<'_> {
         let Some(entry) = self.runtime.prepared_torn_sweep(tearing) else {
             return per_row_torn_block_sweep(self, tearing, y, p, t, residual_out);
         };
-        let mut workspace = self
-            .runtime
-            .torn_sweep_cache
-            .workspace
-            .try_borrow_mut()
-            .map_err(|_| RuntimeSolveError::solve_ir("torn sweep workspace is already active"))?;
-        workspace.raw.clear();
-        reserve_runtime_vec_capacity(
-            &mut workspace.raw,
-            tearing.residual_rows.len(),
-            "torn sweep raw residuals",
-        )?;
         #[cfg(debug_assertions)]
-        {
-            copy_runtime_values_into(&mut workspace.reference_y, y, "torn sweep reference state")?;
-            workspace.reference_residuals.clear();
-            reserve_runtime_vec_capacity(
-                &mut workspace.reference_residuals,
-                tearing.residual_rows.len(),
-                "torn sweep reference residuals",
-            )?;
-        }
-        let compiled_status = match entry.compiled.as_ref() {
-            Some(compiled) => {
-                self.eval_compiled_torn_sweep(compiled, tearing, y, p, t, &mut workspace)?
-            }
-            None => None,
-        };
+        let entry_y = y.to_vec();
+        let mut raw = Vec::with_capacity(tearing.residual_rows.len());
+        let compiled_status = entry.compiled.as_ref().and_then(|compiled| {
+            self.eval_compiled_torn_sweep(compiled, tearing, y, p, t, &mut raw)
+        });
         let status = match compiled_status {
             Some(status) => status,
             None => self
@@ -970,27 +931,19 @@ impl ImplicitProjectionModel for RefreshProjectionModel<'_> {
                     p,
                     t,
                     self.runtime.row_eval_context(),
-                    &mut workspace.raw,
+                    &mut raw,
                 )
                 .map_err(RuntimeSolveError::from)?,
         };
         let completed = status == TornSweepStatus::Completed;
         if completed {
             residual_out.clear();
-            for (&row, value) in tearing.residual_rows.iter().zip(&workspace.raw) {
+            for (&row, value) in tearing.residual_rows.iter().zip(&raw) {
                 residual_out.push(self.torn_residual_value(t, y, row, *value));
             }
         }
         #[cfg(debug_assertions)]
-        self.debug_assert_torn_sweep_agrees(
-            tearing,
-            &mut workspace,
-            p,
-            t,
-            completed,
-            y,
-            residual_out,
-        )?;
+        self.debug_assert_torn_sweep_agrees(tearing, &entry_y, p, t, completed, y, residual_out)?;
         Ok(completed)
     }
 
@@ -1059,20 +1012,22 @@ impl RefreshProjectionModel<'_> {
     fn debug_assert_torn_sweep_agrees(
         &self,
         tearing: &solve::BlockTearing,
-        workspace: &mut TornSweepWorkspace,
+        entry_y: &[f64],
         p: &[f64],
         t: f64,
         batched_completed: bool,
         batched_y: &[f64],
         batched_residual: &[f64],
     ) -> Result<(), RuntimeSolveError> {
+        let mut reference_y = entry_y.to_vec();
+        let mut reference_residual = Vec::new();
         let reference_completed = per_row_torn_block_sweep(
             self,
             tearing,
-            &mut workspace.reference_y,
+            &mut reference_y,
             p,
             t,
-            &mut workspace.reference_residuals,
+            &mut reference_residual,
         )?;
         debug_assert_eq!(
             reference_completed, batched_completed,
@@ -1087,11 +1042,11 @@ impl RefreshProjectionModel<'_> {
                         .all(|(a, b)| a.to_bits() == b.to_bits())
             };
             debug_assert!(
-                bits_equal(&workspace.reference_y, batched_y),
+                bits_equal(&reference_y, batched_y),
                 "batched torn sweep diverged from the per-row sweep in solver values"
             );
             debug_assert!(
-                bits_equal(&workspace.reference_residuals, batched_residual),
+                bits_equal(&reference_residual, batched_residual),
                 "batched torn sweep diverged from the per-row sweep in residual values"
             );
         }
@@ -1102,7 +1057,7 @@ impl RefreshProjectionModel<'_> {
     /// batch. A failed compiled call may leave causal targets partially
     /// written; that needs no restore, because the fallback rewrites every
     /// causal target in order from the untouched tear values before anything
-    /// reads them. Workspace reservation failures propagate as runtime errors.
+    /// reads them.
     fn eval_compiled_torn_sweep(
         &self,
         compiled: &CompiledTornSweep,
@@ -1110,41 +1065,28 @@ impl RefreshProjectionModel<'_> {
         y: &mut [f64],
         p: &[f64],
         t: f64,
-        workspace: &mut TornSweepWorkspace,
-    ) -> Result<Option<TornSweepStatus>, RuntimeSolveError> {
+        raw: &mut Vec<Option<f64>>,
+    ) -> Option<TornSweepStatus> {
         let tables = self.runtime.model.external_tables.as_slice();
-        if compiled.schedule.call(y, p, t, tables).is_err() {
-            return Ok(None);
-        }
+        compiled.schedule.call(y, p, t, tables).ok()?;
         // Mirror the per-row decline decision in causal order: the isolator
         // programs poison a singular step to a non-finite value, so the first
         // non-finite target is exactly where the per-row path declines.
         for step in &tearing.causal_steps {
             if !y.get(step.y_index).copied().unwrap_or(f64::NAN).is_finite() {
-                return Ok(Some(TornSweepStatus::Declined));
+                return Some(TornSweepStatus::Declined);
             }
         }
-        resize_runtime_values(
-            &mut workspace.dense_residuals,
-            compiled.residual_len,
-            0.0,
-            "torn sweep dense residuals",
-        )?;
-        workspace.dense_residuals.fill(0.0);
-        if compiled
+        let mut out = vec![0.0; compiled.residual_len];
+        compiled
             .residual_block
-            .call(y, p, t, tables, &mut workspace.dense_residuals)
-            .is_err()
-        {
-            return Ok(None);
-        }
-        workspace.raw.clear();
+            .call(y, p, t, tables, &mut out)
+            .ok()?;
+        raw.clear();
         for position in compiled.residual_outputs.iter() {
-            workspace
-                .raw
-                .push(position.and_then(|index| workspace.dense_residuals.get(index).copied()));
+            raw.push(position.and_then(|index| out.get(index).copied()));
         }
-        Ok(Some(TornSweepStatus::Completed))
+        Some(TornSweepStatus::Completed)
     }
 
     /// One residual row's sweep value under the per-row policy: report the
@@ -1171,12 +1113,12 @@ impl SolveRuntime {
         tearing: &solve::BlockTearing,
     ) -> Option<Rc<PreparedTornSweepEntry>> {
         let key = std::ptr::from_ref(tearing) as usize;
-        if let Some(prepared) = self.torn_sweep_cache.entries.borrow().get(&key) {
+        if let Some(prepared) = self.torn_sweep_cache.0.borrow().get(&key) {
             return prepared.clone();
         }
         let prepared = self.build_torn_sweep_entry(tearing).map(Rc::new);
         self.torn_sweep_cache
-            .entries
+            .0
             .borrow_mut()
             .insert(key, prepared.clone());
         prepared

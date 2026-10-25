@@ -24,10 +24,7 @@ fn test_span(name: &'static str) -> rumoca_core::Span {
     rumoca_core::Span::from_offsets(rumoca_core::SourceId::from_source_name(name), 1, 2)
 }
 
-pub(super) fn spanned_block(
-    rows: Vec<Vec<solve::LinearOp>>,
-    name: &'static str,
-) -> solve::ScalarProgramBlock {
+fn spanned_block(rows: Vec<Vec<solve::LinearOp>>, name: &'static str) -> solve::ScalarProgramBlock {
     solve::ScalarProgramBlock::with_source_span(
         rows,
         test_span(name)
@@ -47,7 +44,7 @@ fn mirror_scalar_implicit_jvp(model: &mut solve::SolveModel) {
     );
 }
 
-pub(super) fn set_test_implicit_jvp(
+fn set_test_implicit_jvp(
     model: &mut solve::SolveModel,
     rows: Vec<Vec<solve::LinearOp>>,
     name: &'static str,
@@ -56,7 +53,7 @@ pub(super) fn set_test_implicit_jvp(
     mirror_scalar_implicit_jvp(model);
 }
 
-pub(super) fn derive_test_structural_artifacts(model: &mut solve::SolveModel) {
+fn derive_test_structural_artifacts(model: &mut solve::SolveModel) {
     let (continuous, initialization) =
         solve_eval::derive_solve_structural_artifacts(&model.problem, &model.artifacts)
             .expect("fixture programs derive their structural artifacts");
