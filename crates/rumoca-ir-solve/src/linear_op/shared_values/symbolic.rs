@@ -3,26 +3,32 @@
 //! both sides over.
 
 use rustc_hash::FxHashMap;
+use std::num::NonZeroUsize;
 
 use super::super::*;
 use super::shape::{ShapeKey, value_shape};
 
-/// The id of one hash-consed symbolic value.
-pub(super) type Term = usize;
-
-/// One symbolic value.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum TermKey {
-    /// A solver slot as the sequence found it.
-    Slot(usize),
-    /// Output `output` of the operation value `key`.
-    Value { key: ValueKey, output: usize },
+/// A symbolic value: an original solver slot when `operation` is absent, or
+/// output `index` of one interned operation. The domains remain disjoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct Term {
+    operation: Option<ValueKey>,
+    index: usize,
 }
 
 /// An operation value interned within one `Terms` table. The builder retains
 /// that table across segment boundaries; a check uses one table for both sides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct ValueKey(usize);
+pub(super) struct ValueKey(NonZeroUsize);
+
+impl ValueKey {
+    pub(super) fn output(self, output: usize) -> Term {
+        Term {
+            operation: Some(self),
+            index: output,
+        }
+    }
+}
 
 /// One operation's complete structural identity, with operands ordered by
 /// field or register offset. Output terms refer to its interned key.
@@ -32,21 +38,14 @@ struct OperationKey {
     operands: Vec<(usize, Term)>,
 }
 
-/// The hash-consed terms and interned operation shapes of one derivation or
-/// check.
+/// Interned operation shapes and identities of one derivation or check.
 #[derive(Default)]
 pub(super) struct Terms {
-    ids: FxHashMap<TermKey, Term>,
     shapes: FxHashMap<ShapeKey, usize>,
     values: FxHashMap<OperationKey, ValueKey>,
 }
 
 impl Terms {
-    fn intern(&mut self, key: TermKey) -> Term {
-        let next = self.ids.len();
-        *self.ids.entry(key).or_insert(next)
-    }
-
     /// The key of the value of shape `shape` over `operands`.
     pub(super) fn key(&mut self, shape: &ShapeKey, operands: Vec<(usize, Term)>) -> ValueKey {
         let next = self.shapes.len();
@@ -54,15 +53,14 @@ impl Terms {
             Some(&id) => id,
             None => *self.shapes.entry(shape.clone()).or_insert(next),
         };
-        let next = ValueKey(self.values.len());
+        let next = ValueKey(
+            NonZeroUsize::new(self.values.len() + 1)
+                .expect("allocated operation count fits a nonzero index"),
+        );
         *self
             .values
             .entry(OperationKey { shape, operands })
             .or_insert(next)
-    }
-
-    pub(super) fn value(&mut self, key: ValueKey, output: usize) -> Term {
-        self.intern(TermKey::Value { key, output })
     }
 }
 
@@ -74,10 +72,13 @@ pub(super) struct SymbolicSlots {
 }
 
 impl SymbolicSlots {
-    pub(super) fn slot(&self, terms: &mut Terms, index: usize) -> Term {
+    pub(super) fn slot(&self, index: usize) -> Term {
         match self.slots.get(&index) {
             Some(&term) => term,
-            None => terms.intern(TermKey::Slot(index)),
+            None => Term {
+                operation: None,
+                index,
+            },
         }
     }
 
@@ -121,7 +122,7 @@ impl SymbolicSlots {
     ) -> Option<()> {
         match *op {
             LinearOp::LoadY { dst, index } => {
-                registers.insert(dst, self.slot(terms, index));
+                registers.insert(dst, self.slot(index));
             }
             LinearOp::TensorLoad {
                 dst_start,
@@ -132,10 +133,7 @@ impl SymbolicSlots {
                 lanes: 1,
             } => {
                 for offset in 0..count {
-                    registers.insert(
-                        dst_start + offset as Reg,
-                        self.slot(terms, input_start + offset),
-                    );
+                    registers.insert(dst_start + offset as Reg, self.slot(input_start + offset));
                 }
             }
             LinearOp::Move { dst, src } => {
@@ -184,11 +182,11 @@ fn value_step(
         _ => 0,
     };
     for ordinal in 0..stored {
-        outputs.push(terms.value(key, ordinal));
+        outputs.push(key.output(ordinal));
     }
     if let Some(start) = op.dst_register() {
         for offset in 0..op.dst_register_count() {
-            registers.insert(start + offset as Reg, terms.value(key, offset));
+            registers.insert(start + offset as Reg, key.output(offset));
         }
     }
     Some(())

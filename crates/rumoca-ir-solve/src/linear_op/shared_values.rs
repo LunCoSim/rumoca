@@ -490,7 +490,7 @@ impl ProgramBuilder<'_, '_> {
             .map(|offset| first + offset as Reg)
             .collect::<Vec<_>>();
         for (offset, &register) in registers.iter().enumerate() {
-            let term = self.builder.terms.value(key, offset);
+            let term = key.output(offset);
             self.segment().terms.insert(register, term);
             self.map.insert(dst + offset as Reg, register);
         }
@@ -515,7 +515,7 @@ impl ProgramBuilder<'_, '_> {
             self.map.insert(dst, register);
             return;
         }
-        let term = self.builder.slots.slot(&mut self.builder.terms, index);
+        let term = self.builder.slots.slot(index);
         let key = self.builder.terms.key(&ShapeKey::Slot, vec![(0, term)]);
         if let Some(registers) = self.builder.segment.values.get(&key).cloned() {
             return self.reuse(dst, &registers);
@@ -536,10 +536,7 @@ impl ProgramBuilder<'_, '_> {
             .map(
                 |offset| match self.builder.segment.stored.get(&(first + offset)) {
                     Some(&register) => self.builder.segment.terms[&register],
-                    None => self
-                        .builder
-                        .slots
-                        .slot(&mut self.builder.terms, first + offset),
+                    None => self.builder.slots.slot(first + offset),
                 },
             )
             .collect::<Vec<_>>();

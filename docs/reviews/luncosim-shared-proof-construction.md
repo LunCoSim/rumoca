@@ -21,6 +21,14 @@ segments; the checker evaluates both sequences in one independent table. IDs
 never leave their owning derivation/check. Register normalization uses one
 operation clone, with a read-only discovery pass before mutation.
 
+Symbolic terms carry the original slot index or the operation ID plus output
+ordinal directly. An optional nonzero operation ID keeps those domains disjoint
+in two machine words. The allocated operation table bounds its one-based IDs;
+the term does not require a separate interning table. This representation is
+private to construction/checking and changes no persistent format, executor
+operation or floating-point evaluation. The checker still independently walks
+the complete original and transformed sequences.
+
 `shared_values/shape.rs` derives an operation's identity through its existing
 typed IR serialization. The proof-local key contains the complete binary
 encoding, preserving floating-point bits. Slot and slot-range reads have
@@ -33,7 +41,7 @@ the encoding; this adds no persistent format or decoder.
 
 Private proof lookup tables use the workspace's `rustc-hash` implementation.
 Full structural equality still resolves hash collisions. Program traversal
-assigns term and value IDs; table iteration does not choose execution order,
+assigns operation IDs; table iteration does not choose execution order,
 output order or IDs. The independent symbolic check, register cap, effect
 preservation and exact floating-point keys retain their existing owners.
 
@@ -45,65 +53,36 @@ not itself measure its production benefit.
 
 ## Qualification
 
-Use the production consumer's Rust 1.97.1 with ordinary Cargo targets:
+The direct-term candidate passes 423 active IR tests (one pre-existing ignored
+test) and the owner-only Clippy command with `--no-deps -D warnings`, using Rust
+1.97.1 and four build/test workers. The dependency-inclusive Clippy command
+stops on three existing `rumoca-core` nesting findings; that broader command is
+not green. The eighteen focused shared-value cases include changed operand and
+output selection, final-slot equivalence, effects, register caps, signed zero
+and NaN payload rejection.
+
+Independent baseline/candidate test binaries run ABBA, ten processes per block,
+for each existing scalar and wide proof fixture. Scalar median time changes
+from 5.280 to 5.065 ms (4.1%); wide median changes from 2.613 to 2.478 ms (5.2%).
+All eighty fixture runs pass their derivation/check assertions. These are local
+proof measurements, not a claim about end-to-end initialization or simulation.
+Binary hashes and complete outputs remain in the consumer checkout's ignored
+`.cache/codex-evidence/performance-20261026/term-identity-compact-matched.json`.
+
+The fixed twenty-model canary completes with MSL 4.1.0 and OpenModelica
+1.27.1~2-g6db4671: twenty parse/flatten, fourteen DAE/solve, and twelve initialized
+and simulated traces. All twelve compare in the high band with accurate initial
+conditions; there are no timeouts, skipped comparisons or missing traces.
+Six DAE refusals and two solve refusals remain visible. These counts match the
+previous published qualification at `5febdef6`; its deleted raw results are not
+available for an exact row-by-row comparison. Current raw evidence is ignored
+under `target/msl/direct-term-identity-canary`. No full-cohort or workspace
+coverage qualification is claimed for this private representation change.
+
+Commands:
 
 ```sh
-cargo test -p rumoca-ir-solve --lib -j4 -- --nocapture
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 cargo +1.97.1 test --locked -p rumoca-ir-solve --lib -j 4
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 cargo +1.97.1 clippy --locked -p rumoca-ir-solve --no-deps -j 4 -- -D warnings
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 RAYON_NUM_THREADS=4 cargo +1.97.1 xtask verify msl-parity --sim-targets-file infra/verification/msl-canary-20.json --results-dir target/msl/direct-term-identity-canary
 ```
-
-All 422 tests pass. The constant-bit regression checks destination-independent
-sharing, then requires the checker to reject changed finite, signed-zero and
-NaN payload bits. The baseline checker accepted a changed NaN payload; the
-current checker rejects it. Focused read-set cases cover scalar aliases,
-strided and broadcast reads, matrix multiplication, tensor transpose, output
-ranges, empty and overflowing ranges, and a nested load outside its required context.
-The ordinary `shared_read_collection_range_benchmark` verifies 64 operations
-with 1,024 reads each: the local diagnostic measures 36,838,415 ns before and
-227,143 ns after. This is an isolated constructor-path measurement, not a
-whole-simulation speedup.
-
-The ordinary `shared_wide_value_proof_benchmark` derives and checks eight pairs
-of 16×16 matrix programs, each with 512 inputs and 256 outputs. It measures
-37,767,766 ns before operation-key interning and 6,113,756 ns after. The paired
-negative test changes operand order and output selection separately; both are
-rejected. Existing tests retain cap boundaries, effects and final-slot checks.
-These measurements qualify isolated proof construction, not scene loading.
-
-The scalar diagnostic derives and checks eight sequences of 256 programs.
-It measures 7,067,212 ns in the baseline's focused test run and 6,620,901 ns in
-the current full owner suite. The wide diagnostic measures 4,520,923 ns and
-5,205,547 ns respectively. The differing suite scopes and concurrent workloads
-prevent a causal timing claim from these small differences; production
-construction timing remains the performance gate.
-
-The fixed twenty-model Tier 1 canary runs through `cargo xtask verify msl-parity`
-with `infra/verification/msl-canary-20.json`. MSL 4.1.0 and OpenModelica
-1.27.1~2-g6db4671 produce exactly the same twenty phase/error and channel-band
-rows as the published `b9720023` baseline: twenty parse/flatten, fourteen
-DAE/solve and twelve initialized, simulated and compared high-band traces. The six DAE and
-two solve refusals remain visible. This is a zero-delta canary, not full-cohort
-qualification. There are no timeouts, skipped or missing candidate traces.
-Raw results remain ignored in the consumer checkout under
-`.cache/codex-evidence/performance-20261023/structural-shape-msl-canary/`;
-owner tests and diagnostic timings are in `native-cache-audit/` beside it.
-
-The owner-only all-feature Clippy check passes with `--no-deps -D warnings`.
-A full workspace lint/cohort sweep is not claimed.
-
-The private-hasher candidate passes all eighteen focused `shared_value` owner
-tests, including changed operands/output projection, effects, cap boundaries,
-signed zero and NaN payload rejection. Separate ordinary development test runs
-measure the scalar diagnostic at 5,520,739 ns before and 3,781,552 ns after,
-and the wide diagnostic at 4,245,661 ns before and 1,720,682 ns after. These
-small isolated measurements require production qualification; they are not
-loading or whole-tick acceptance.
-
-Its twenty-model canary uses the same fixed roster, MSL and OpenModelica
-versions as above. All twenty phase/error and channel-band rows match the
-previous canary exactly: twenty parse/flatten, fourteen DAE/solve and twelve
-initialized, simulated high-band traces; the same six DAE and two solve
-refusals remain. There are no timeouts. The owner-only all-feature Clippy
-check passes. Full workspace/coverage and the 566-model cohort are not run
-for this private lookup change, and are not claimed as qualification.
-Ignored receipts are under `proof-hasher-msl-canary/`, with the focused test
-and Clippy logs beside it in the consumer's evidence directory.
