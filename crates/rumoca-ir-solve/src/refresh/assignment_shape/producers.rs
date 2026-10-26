@@ -1,17 +1,21 @@
 //! Compact, source-bound ownership of disjoint destination ranges.
 
-use std::collections::BTreeMap;
-
 use crate::{LinearOp, Reg};
+
+struct DestinationRange {
+    start: Reg,
+    end: u64,
+    position: usize,
+}
 
 pub(super) struct UniqueProgram<'a> {
     operations: &'a [LinearOp],
-    ranges: BTreeMap<Reg, (u64, usize)>,
+    ranges: Vec<DestinationRange>,
 }
 
 impl<'a> UniqueProgram<'a> {
     pub(super) fn new(operations: &'a [LinearOp]) -> Option<Self> {
-        let mut ranges = BTreeMap::<Reg, (u64, usize)>::new();
+        let mut ranges = Vec::new();
         for (position, operation) in operations.iter().enumerate() {
             let Some(start) = operation.dst_register() else {
                 continue;
@@ -21,19 +25,21 @@ impl<'a> UniqueProgram<'a> {
                 continue;
             }
             let end = u64::from(start).checked_add(count)?;
-            if end > u64::from(Reg::MAX) + 1
-                || ranges
-                    .range(..=start)
-                    .next_back()
-                    .is_some_and(|(_, (previous_end, _))| *previous_end > u64::from(start))
-                || ranges
-                    .range(start..)
-                    .next()
-                    .is_some_and(|(next_start, _)| u64::from(*next_start) < end)
-            {
+            if end > u64::from(Reg::MAX) + 1 {
                 return None;
             }
-            ranges.insert(start, (end, position));
+            ranges.push(DestinationRange {
+                start,
+                end,
+                position,
+            });
+        }
+        ranges.sort_unstable_by_key(|range| range.start);
+        if ranges
+            .windows(2)
+            .any(|pair| pair[0].end > u64::from(pair[1].start))
+        {
+            return None;
         }
         Some(Self { operations, ranges })
     }
@@ -49,7 +55,7 @@ impl<'a> UniqueProgram<'a> {
 #[derive(Clone, Copy)]
 pub(super) struct ProgramPrefix<'a> {
     operations: &'a [LinearOp],
-    ranges: &'a BTreeMap<Reg, (u64, usize)>,
+    ranges: &'a [DestinationRange],
 }
 
 impl<'a> ProgramPrefix<'a> {
@@ -69,8 +75,13 @@ impl<'a> ProgramPrefix<'a> {
     }
 
     pub(super) fn producer_position(self, register: Reg) -> Option<usize> {
-        let (_, &(end, position)) = self.ranges.range(..=register).next_back()?;
-        (u64::from(register) < end && position < self.operations.len()).then_some(position)
+        let index = self
+            .ranges
+            .partition_point(|range| range.start <= register)
+            .checked_sub(1)?;
+        let range = &self.ranges[index];
+        (u64::from(register) < range.end && range.position < self.operations.len())
+            .then_some(range.position)
     }
 }
 
@@ -91,9 +102,95 @@ mod tests {
 
     fn reference_producer(operations: &[LinearOp], register: Reg) -> Option<usize> {
         operations.iter().position(|operation| {
-            let start = operation.dst_register().unwrap();
-            (start..start + operation.dst_register_count() as u32).contains(&register)
+            operation.dst_register().is_some_and(|start| {
+                let start = u64::from(start);
+                let end = start + operation.dst_register_count() as u64;
+                (start..end).contains(&u64::from(register))
+            })
         })
+    }
+
+    #[test]
+    fn prefix_index_matches_linear_reference_for_sparse_permuted_ranges() {
+        for count in [0, 1, 2, 7, 31, 257] {
+            let base = Reg::MAX - (count * 8) as Reg;
+            let mut operations = Vec::new();
+            let mut registers = vec![0, Reg::MAX, base];
+            for i in (0..count).rev() {
+                let start = base + (i * 8) as Reg;
+                let width = [0, 1, 3, 7][i % 4];
+                operations.push(tensor(start, width));
+                operations.push(LinearOp::StoreOutput { src: start });
+                registers.extend([start - 1, start, start + width as Reg, start + 7]);
+            }
+            assert_prefixes_match(&operations, &registers);
+        }
+    }
+
+    fn assert_prefixes_match(operations: &[LinearOp], registers: &[Reg]) {
+        let source = UniqueProgram::new(operations).unwrap();
+        for limit in 0..=operations.len() {
+            let prefix = source.view().before(limit).unwrap();
+            assert_eq!(prefix.len(), limit);
+            for &register in registers {
+                assert_eq!(
+                    prefix.producer_position(register),
+                    reference_producer(&operations[..limit], register)
+                );
+            }
+        }
+        assert!(source.view().before(operations.len() + 1).is_none());
+    }
+
+    fn measure_index(
+        operations: &[LinearOp],
+        queries: &[(usize, Reg, Option<usize>)],
+        iterations: usize,
+    ) -> u128 {
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            let source = UniqueProgram::new(std::hint::black_box(operations)).unwrap();
+            for &(prefix, register, expected) in queries {
+                assert_eq!(
+                    source
+                        .view()
+                        .before(prefix)
+                        .unwrap()
+                        .producer_position(register),
+                    expected
+                );
+            }
+            std::hint::black_box(source);
+        }
+        started.elapsed().as_nanos()
+    }
+
+    #[test]
+    #[ignore = "manual producer construction and prefix-query timing"]
+    fn producer_index_diagnostic() {
+        for count in [4, 64, 1024, 8192] {
+            let operations: Vec<_> = (0..count)
+                .map(|i| tensor((((i * 37) % count) * 8 + 1024) as Reg, 3))
+                .collect();
+            let queries: Vec<_> = (0..(count * 8).min(4096))
+                .map(|i| {
+                    let prefix = (i * 29) % (count + 1);
+                    let register = ((i * 13) % (count * 8) + 1024) as Reg;
+                    (
+                        prefix,
+                        register,
+                        reference_producer(&operations[..prefix], register),
+                    )
+                })
+                .collect();
+            let iterations = 131_072 / count;
+            for (with_queries, selected) in [(false, &[][..]), (true, queries.as_slice())] {
+                let elapsed = measure_index(&operations, selected, iterations);
+                println!(
+                    "PRODUCER_INDEX count={count} queries={with_queries} iterations={iterations} elapsed_ns={elapsed}"
+                );
+            }
+        }
     }
 
     #[test]
