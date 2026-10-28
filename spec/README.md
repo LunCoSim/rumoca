@@ -17,7 +17,7 @@ For setup and day-to-day usage, see [CONTRIBUTING.md](../CONTRIBUTING.md).
 | [SPEC_0001](SPEC_0001_DEFID.md) | DefId for Stable References | IR | ~128 | ACCEPTED |
 | [SPEC_0002](SPEC_0002_SCOPE_TREE.md) | Scope Tree for Name Lookup | IR | ~119 | ACCEPTED |
 | [SPEC_0007](SPEC_0007_IR_PIPELINE.md) | Compiler Pipeline and IR Contracts | architecture | ~326 | ACCEPTED |
-| [SPEC_0008](SPEC_0008_PHASE_ERRORS.md) | Diagnostics, Traceability, and Phase-Local Errors | error | ~328 | ACCEPTED |
+| [SPEC_0008](SPEC_0008_PHASE_ERRORS.md) | Diagnostics, Traceability, and Phase-Local Errors | error | ~336 | ACCEPTED |
 | [SPEC_0018](SPEC_0018_TOOL_CONFIG.md) | Tool Configuration Loading | tooling | ~329 | ACCEPTED |
 | [SPEC_0021](SPEC_0021_CODE_COMPLEXITY.md) | Maintainability and Determinism Guidelines | convention | ~248 | ACCEPTED |
 | [SPEC_0022](SPEC_0022_MLS_COMPILER_COMPLIANCE.md) | MLS Compiler Compliance (438 contracts) | MLS | ~1010 | REFERENCE |

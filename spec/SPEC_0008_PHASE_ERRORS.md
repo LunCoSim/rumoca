@@ -4,23 +4,12 @@
 ACCEPTED
 
 ## Summary
-Each compiler phase defines its own error enum with phase-specific error codes.
-Diagnostics, source spans, and optional tracing are owned by the phase that
-emits them. Errors are defined close to the code that produces them, not in a
-central location.
+Each compiler phase owns its local error enum, codes, diagnostics, source spans
+and optional tracing beside their producers.
 
 ## Motivation
-A monolithic error enum has problems:
-- Grows unboundedly as features are added
-- Every phase depends on every error type
-- Hard to find which phase produces which error
-- Error codes become inconsistent
-
-Phase-local errors provide:
-- Errors next to the code that emits them
-- Clear ownership and responsibility
-- Independent evolution per phase
-- Consistent error code ranges
+Local errors expose ownership, allow independent phase evolution, avoid
+cross-phase error dependencies and keep code ranges consistent as features grow.
 
 ## Specification
 
@@ -197,12 +186,10 @@ handles them.
 | Widening an existing rejection to new input is a new rejection path | Author | Scope creep needs the same contract |
 | Never discharge it by relaxing an existing fixture or assertion | Test suite | Weakening hides the over-reach it should expose |
 
-**Why:** `EF025` over-reached onto callables that legally select no
-implementation — MLS §3.7 predefined operators, record constructors, `type`
-conversions — because nothing stated which callables stay legal; the `EI012`
-partial-class rejection was absorbed by weakening a fixture instead of naming
-the accepted deferred-declaration shape. Rejections whose accepted shape was
-designed first landed clean.
+**Why:** `EF025` wrongly rejected MLS §3.7 predefined operators, record
+constructors and `type` conversions. `EI012` prompted a weakened fixture instead
+of an explicit accepted deferred-declaration shape. Acceptance contracts prevent
+such overreach.
 
 **Checklist-item template** — one per new rejection path:
 
