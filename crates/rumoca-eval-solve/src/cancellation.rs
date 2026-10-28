@@ -47,6 +47,15 @@ pub fn evaluation_cancellation_requested() -> bool {
     })
 }
 
+/// Fail an evaluation at its owner before reading or writing output buffers.
+pub(crate) fn check_evaluation_cancellation() -> Result<(), crate::EvalSolveError> {
+    if evaluation_cancellation_requested() {
+        Err(crate::EvalSolveError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,14 +85,5 @@ mod tests {
         assert!(evaluation_cancellation_requested());
         drop(guard);
         assert!(!evaluation_cancellation_requested());
-    }
-}
-
-/// Fail an evaluation at its owner before reading or writing output buffers.
-pub(crate) fn check_evaluation_cancellation() -> Result<(), crate::EvalSolveError> {
-    if evaluation_cancellation_requested() {
-        Err(crate::EvalSolveError::Cancelled)
-    } else {
-        Ok(())
     }
 }

@@ -362,54 +362,24 @@ fn collect_type_candidates(
                 .iter()
                 .filter(|_| kind != LookupKind::BaseClass || current != enclosing)
             {
-                let base_target = collect_type_candidates(
+                collect_scope_base_candidates(
                     current,
                     base.base_name(),
-                    LookupKind::BaseClass,
+                    raw_name,
                     lookup,
                     visiting,
-                    true,
-                )
-                .into_iter()
-                .find(|candidate| lookup(candidate).is_some());
-                if let Some(base_target) = base_target
-                    && include_lexical
-                {
-                    collect_inherited_type_candidates(
-                        &base_target,
-                        raw_name,
-                        lookup,
-                        visiting,
-                        &mut candidates,
-                    );
-                }
+                    &mut candidates,
+                    include_lexical,
+                );
             }
-            let (head, tail) =
-                rumoca_core::split_first_top_level(raw_name).unwrap_or((raw_name, ""));
-            let explicit = interface
-                .import_map
-                .explicit_bindings
-                .iter()
-                .filter(|(local, _)| local == head)
-                .collect::<Vec<_>>();
-            if !explicit.is_empty() {
-                for (_, target) in explicit {
-                    let imported = if tail.is_empty() {
-                        target.clone()
-                    } else {
-                        format!("{target}.{tail}")
-                    };
-                    candidates.insert(imported);
-                    if !tail.is_empty() && include_lexical {
-                        collect_inherited_type_candidates(
-                            target,
-                            tail,
-                            lookup,
-                            visiting,
-                            &mut candidates,
-                        );
-                    }
-                }
+            if collect_explicit_import_candidates(
+                &interface,
+                raw_name,
+                lookup,
+                visiting,
+                &mut candidates,
+                include_lexical,
+            ) {
                 allow_global = false;
                 break;
             }
@@ -429,6 +399,62 @@ fn collect_type_candidates(
     }
     visiting.shift_remove(&key);
     candidates.into_iter().collect()
+}
+
+fn collect_scope_base_candidates(
+    current: &str,
+    base_name: &str,
+    raw_name: &str,
+    lookup: &mut impl FnMut(&str) -> Option<Arc<ClassInterface>>,
+    visiting: &mut IndexSet<(String, String, VisitKind)>,
+    candidates: &mut IndexSet<String>,
+    include_lexical: bool,
+) {
+    let base_target = collect_type_candidates(
+        current,
+        base_name,
+        LookupKind::BaseClass,
+        lookup,
+        visiting,
+        true,
+    )
+    .into_iter()
+    .find(|candidate| lookup(candidate).is_some());
+    if let Some(base_target) = base_target.filter(|_| include_lexical) {
+        collect_inherited_type_candidates(&base_target, raw_name, lookup, visiting, candidates);
+    }
+}
+
+fn collect_explicit_import_candidates(
+    interface: &ClassInterface,
+    raw_name: &str,
+    lookup: &mut impl FnMut(&str) -> Option<Arc<ClassInterface>>,
+    visiting: &mut IndexSet<(String, String, VisitKind)>,
+    candidates: &mut IndexSet<String>,
+    include_lexical: bool,
+) -> bool {
+    let (head, tail) = rumoca_core::split_first_top_level(raw_name).unwrap_or((raw_name, ""));
+    let explicit = interface
+        .import_map
+        .explicit_bindings
+        .iter()
+        .filter(|(local, _)| local == head)
+        .collect::<Vec<_>>();
+    if explicit.is_empty() {
+        return false;
+    }
+    for (_, target) in explicit {
+        let imported = if tail.is_empty() {
+            target.clone()
+        } else {
+            format!("{target}.{tail}")
+        };
+        candidates.insert(imported);
+        if !tail.is_empty() && include_lexical {
+            collect_inherited_type_candidates(target, tail, lookup, visiting, candidates);
+        }
+    }
+    true
 }
 
 fn collect_inherited_type_candidates(

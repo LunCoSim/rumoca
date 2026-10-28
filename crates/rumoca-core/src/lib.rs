@@ -288,13 +288,9 @@ pub fn qualified_name_segments(name: &str) -> impl Iterator<Item = &str> {
         let mut brackets = 0usize;
         for (index, byte) in segment.bytes().enumerate() {
             if let Some(delimiter) = quote {
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == delimiter {
-                    quote = None;
-                }
+                let closes_quote = !escaped && byte == delimiter;
+                escaped = !escaped && byte == b'\\';
+                quote = (!closes_quote).then_some(delimiter);
                 continue;
             }
             match byte {

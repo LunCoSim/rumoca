@@ -1327,13 +1327,14 @@ impl Session {
                 cache,
             )?;
             prefixes.has_dimensions |= inherited.has_dimensions;
+            if primitive_alias
+                && prefixes.scalar_type.is_some()
+                && inherited.scalar_type.is_some()
+                && prefixes.scalar_type != inherited.scalar_type
+            {
+                return None;
+            }
             if primitive_alias {
-                if prefixes.scalar_type.is_some()
-                    && inherited.scalar_type.is_some()
-                    && prefixes.scalar_type != inherited.scalar_type
-                {
-                    return None;
-                }
                 prefixes.scalar_type = prefixes.scalar_type.or(inherited.scalar_type);
             }
             if matches!(prefixes.causality, rumoca_core::Causality::Empty) {
@@ -1716,13 +1717,12 @@ impl Session {
                 extend.base_name(),
                 super::class_interface::LookupKind::BaseClass,
             );
-            let Some(base_target) = self.lookup_query_extends_target(&base_candidates) else {
-                // Primitive types have no named component declarations.
-                if rumoca_core::is_builtin_type(extend.base_name()) {
-                    continue;
-                }
-                return None;
-            };
+            let base_target = self.lookup_query_extends_target(&base_candidates);
+            // Primitive types have no named component declarations.
+            if base_target.is_none() && rumoca_core::is_builtin_type(extend.base_name()) {
+                continue;
+            }
+            let base_target = base_target?;
             self.collect_query_class_component_members(
                 &base_target.uri,
                 &base_target.qualified_name,
