@@ -3,7 +3,7 @@
 //! both sides over.
 
 use rustc_hash::FxHashMap;
-use std::num::NonZeroUsize;
+use std::{collections::hash_map::Entry, num::NonZeroUsize};
 
 use super::super::*;
 use super::shape::{ShapeKey, value_shape};
@@ -47,20 +47,24 @@ pub(super) struct Terms {
 
 impl Terms {
     /// The key of the value of shape `shape` over `operands`.
-    pub(super) fn key(&mut self, shape: &ShapeKey, operands: Vec<(usize, Term)>) -> ValueKey {
+    pub(super) fn key(
+        &mut self,
+        shape: &ShapeKey,
+        operands: Vec<(usize, Term)>,
+    ) -> Option<ValueKey> {
         let next = self.shapes.len();
         let shape = match self.shapes.get(shape) {
             Some(&id) => id,
             None => *self.shapes.entry(shape.clone()).or_insert(next),
         };
-        let next = ValueKey(
-            NonZeroUsize::new(self.values.len() + 1)
-                .expect("allocated operation count fits a nonzero index"),
-        );
-        *self
-            .values
-            .entry(OperationKey { shape, operands })
-            .or_insert(next)
+        let next = self.values.len();
+        match self.values.entry(OperationKey { shape, operands }) {
+            Entry::Occupied(entry) => Some(*entry.get()),
+            Entry::Vacant(entry) => {
+                let key = ValueKey(NonZeroUsize::MIN.checked_add(next)?);
+                Some(*entry.insert(key))
+            }
+        }
     }
 }
 
@@ -171,7 +175,7 @@ fn value_step(
         .iter()
         .map(|&(field, register)| Some((field, *registers.get(&register)?)))
         .collect::<Option<Vec<_>>>()?;
-    let key = terms.key(&shape.shape, operands);
+    let key = terms.key(&shape.shape, operands)?;
     let stored = match op {
         LinearOp::StoreOutputFunctionFold { count, .. } => *count,
         LinearOp::StoreOutputFoldTensorUpdate {

@@ -83,6 +83,8 @@ pub struct SharedValueSegments {
 /// Why segments are not an equivalent form of their programs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SharedValueError {
+    /// The local symbolic operation identity space is exhausted.
+    IdentitySpaceExhausted,
     /// A program or segment cannot be evaluated symbolically.
     Unevaluable,
     /// The segments store a different number of outputs.
@@ -104,16 +106,16 @@ impl SharedValueSegments {
     }
 
     /// The segments of `programs`, in order.
-    #[must_use]
-    pub fn derive(programs: &[AssignmentProgram<'_>]) -> Self {
+    pub fn derive(programs: &[AssignmentProgram<'_>]) -> Result<Self, SharedValueError> {
         let mut builder = Builder::default();
         for (index, program) in programs.iter().enumerate() {
-            match FusibleProgram::classify(program.ops) {
-                Some(fusible) => builder.append(index, program.targets, &fusible),
-                None => builder.push_opaque(index, program),
+            if let Some(fusible) = FusibleProgram::classify(program.ops) {
+                builder.append(index, program.targets, &fusible)?;
+            } else {
+                builder.push_opaque(index, program);
             }
         }
-        builder.finish()
+        Ok(builder.finish())
     }
 
     /// Evaluate `programs` and the segments symbolically and require every
@@ -187,8 +189,10 @@ pub fn share_program_values(program: Vec<LinearOp>) -> Vec<LinearOp> {
             .map(|output| usize::MAX - output)
             .collect::<Vec<_>>();
         let mut builder = Builder::default();
-        builder.append(0, &targets, &fusible);
-        admit_proven(builder.finish(), &program, &targets)
+        let shared = builder
+            .append(0, &targets, &fusible)
+            .map(|()| builder.finish());
+        admit_proven(shared, &program, &targets)
     };
     match shared {
         Some(segment) if segment.ops.len() <= program.len() => segment.ops,
@@ -212,19 +216,24 @@ pub fn shared_value_proof_failures() -> u64 {
 /// proof is counted and admits nothing, since the program as written is its
 /// own proof.
 fn admit_proven(
-    shared: SharedValueSegments,
+    shared: Result<SharedValueSegments, SharedValueError>,
     program: &[LinearOp],
     targets: &[usize],
 ) -> Option<SharedValueSegment> {
-    let proven = shared.check(&[AssignmentProgram {
-        ops: program,
-        targets,
-    }]);
-    if proven.is_err() {
-        SHARED_VALUE_PROOF_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return None;
+    let proven = shared.and_then(|shared| {
+        shared.check(&[AssignmentProgram {
+            ops: program,
+            targets,
+        }])?;
+        Ok(shared)
+    });
+    match proven {
+        Ok(shared) => shared.segments.into_iter().next(),
+        Err(_) => {
+            SHARED_VALUE_PROOF_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
     }
-    shared.segments.into_iter().next()
 }
 
 /// A program a segment may absorb, classified once: every operation is a
@@ -360,7 +369,12 @@ impl Builder {
     /// Append a fusible program to the open segment, first closing it when
     /// the program's registers would exceed the cap. An open segment holds at
     /// most the cap, so the program's offset is a register.
-    fn append(&mut self, index: usize, targets: &[usize], program: &FusibleProgram<'_>) {
+    fn append(
+        &mut self,
+        index: usize,
+        targets: &[usize],
+        program: &FusibleProgram<'_>,
+    ) -> Result<(), SharedValueError> {
         let fits = self.segment.registers + program.registers <= SHARED_VALUE_REGISTER_CAP;
         let base = match Reg::try_from(self.segment.registers) {
             Ok(base) if fits || self.segment.ops.is_empty() => base,
@@ -381,9 +395,10 @@ impl Builder {
             targets,
         };
         for step in &program.steps {
-            program_builder.step(step);
+            program_builder.step(step)?;
         }
         self.segment.targets.extend_from_slice(targets);
+        Ok(())
     }
 
     fn push_opaque(&mut self, index: usize, program: &AssignmentProgram<'_>) {
@@ -441,15 +456,15 @@ struct ProgramBuilder<'a, 'p> {
 }
 
 impl ProgramBuilder<'_, '_> {
-    fn step(&mut self, step: &Step<'_>) {
+    fn step(&mut self, step: &Step<'_>) -> Result<(), SharedValueError> {
         match step {
-            &Step::LoadSlot { dst, index } => self.load_slot(dst, index),
+            &Step::LoadSlot { dst, index } => self.load_slot(dst, index)?,
             &Step::LoadSlots {
                 op,
                 dst,
                 first,
                 count,
-            } => self.load_slots(op, dst, first, count),
+            } => self.load_slots(op, dst, first, count)?,
             // A copy names the value it copies; a range reading it gathers
             // the value into place.
             &Step::Copy { dst, src } => {
@@ -466,8 +481,9 @@ impl ProgramBuilder<'_, '_> {
                 ref shape,
                 dst,
                 count,
-            } => self.value(op, shape, dst, count),
+            } => self.value(op, shape, dst, count)?,
         }
+        Ok(())
     }
 
     fn segment(&mut self) -> &mut Segment {
@@ -510,15 +526,20 @@ impl ProgramBuilder<'_, '_> {
         self.builder.segment.terms[&self.map[&register]]
     }
 
-    fn load_slot(&mut self, dst: Reg, index: usize) {
+    fn load_slot(&mut self, dst: Reg, index: usize) -> Result<(), SharedValueError> {
         if let Some(&register) = self.builder.segment.stored.get(&index) {
             self.map.insert(dst, register);
-            return;
+            return Ok(());
         }
         let term = self.builder.slots.slot(index);
-        let key = self.builder.terms.key(&ShapeKey::Slot, vec![(0, term)]);
+        let key = self
+            .builder
+            .terms
+            .key(&ShapeKey::Slot, vec![(0, term)])
+            .ok_or(SharedValueError::IdentitySpaceExhausted)?;
         if let Some(registers) = self.builder.segment.values.get(&key).cloned() {
-            return self.reuse(dst, &registers);
+            self.reuse(dst, &registers);
+            return Ok(());
         }
         let op = LinearOp::LoadY {
             dst: self.base + dst,
@@ -529,9 +550,16 @@ impl ProgramBuilder<'_, '_> {
         self.map.insert(dst, register);
         self.segment().ops.push(op);
         self.segment().values.insert(key, vec![register]);
+        Ok(())
     }
 
-    fn load_slots(&mut self, op: &LinearOp, dst: Reg, first: usize, count: usize) {
+    fn load_slots(
+        &mut self,
+        op: &LinearOp,
+        dst: Reg,
+        first: usize,
+        count: usize,
+    ) -> Result<(), SharedValueError> {
         let terms = (0..count)
             .map(
                 |offset| match self.builder.segment.stored.get(&(first + offset)) {
@@ -540,12 +568,17 @@ impl ProgramBuilder<'_, '_> {
                 },
             )
             .collect::<Vec<_>>();
-        let key = self.builder.terms.key(
-            &ShapeKey::Slots,
-            terms.iter().copied().enumerate().collect(),
-        );
+        let key = self
+            .builder
+            .terms
+            .key(
+                &ShapeKey::Slots,
+                terms.iter().copied().enumerate().collect(),
+            )
+            .ok_or(SharedValueError::IdentitySpaceExhausted)?;
         if let Some(registers) = self.builder.segment.values.get(&key).cloned() {
-            return self.reuse(dst, &registers);
+            self.reuse(dst, &registers);
+            return Ok(());
         }
         let mut load = op.clone();
         if let LinearOp::TensorLoad { dst_start, .. } = &mut load {
@@ -566,19 +599,31 @@ impl ProgramBuilder<'_, '_> {
             registers.push(register);
         }
         self.segment().values.insert(key, registers);
+        Ok(())
     }
 
-    fn value(&mut self, op: &LinearOp, shape: &ValueShape, dst: Reg, count: usize) {
+    fn value(
+        &mut self,
+        op: &LinearOp,
+        shape: &ValueShape,
+        dst: Reg,
+        count: usize,
+    ) -> Result<(), SharedValueError> {
         let operands = shape
             .operands
             .iter()
             .map(|&(field, register)| (field, self.term(register)))
             .collect();
-        let key = self.builder.terms.key(&shape.shape, operands);
+        let key = self
+            .builder
+            .terms
+            .key(&shape.shape, operands)
+            .ok_or(SharedValueError::IdentitySpaceExhausted)?;
         // A call may reach an external body, so it runs at every occurrence.
         let shareable = !matches!(op, LinearOp::PureCall { .. });
         if shareable && let Some(registers) = self.builder.segment.values.get(&key).cloned() {
-            return self.reuse(dst, &registers);
+            self.reuse(dst, &registers);
+            return Ok(());
         }
         if self.builder.closed.contains(&key) {
             let segment = self.builder.done.len();
@@ -589,6 +634,7 @@ impl ProgramBuilder<'_, '_> {
         }
         let renamed = self.renamed(op, shape);
         self.emit(renamed, key, dst, count);
+        Ok(())
     }
 
     /// `op` in the segment's register file: scalar operands read the register

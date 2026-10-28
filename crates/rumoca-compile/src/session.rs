@@ -166,6 +166,7 @@ mod session_impl_caches;
 mod session_impl_diagnostics;
 mod session_impl_inputs;
 mod session_impl_model_queries;
+mod session_impl_navigation_queries;
 mod session_impl_queries;
 mod session_impl_source_root_loads;
 mod session_impl_source_roots;

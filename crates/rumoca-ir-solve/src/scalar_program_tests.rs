@@ -43,7 +43,7 @@ fn sparse_output_lookup_preserves_first_program_and_source_on_replay() {
 }
 
 #[test]
-#[ignore = "manual scalar output ownership lookup measurement"]
+#[cfg(feature = "diagnostic-benchmarks")]
 fn output_program_index_benchmark() {
     let span = source_span("OutputIndexBench.mo", 1, 2);
     let programs = (0..1024)

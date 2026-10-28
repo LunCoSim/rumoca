@@ -10,7 +10,7 @@ The fix indexes constructor-owned DAE transaction identity by target variable, t
 
 Focused before: one conditional counter passed; the two-instance algorithm test failed at Solve lowering. After: both tests pass, including the two-instance trajectory through interpreter and native automatic execution. Expected final states are 3, timers 30 seconds, and the exposed alias agrees. The test asserts that DAE retains two transaction owners before Solve construction.
 
-Application integration uses approved sibling source paths to the repaired Rumoca checkout. No dependency patch is published or pushed. The factory's separately observed zero-production result still requires production verification; this counter fix alone does not close that counterexample.
+Application integration pins published Git revisions of the repaired Rumoca source; it requires no sibling checkout. The factory's separately observed zero-production result still requires production verification; this counter fix alone does not close that counterexample.
 
 ## Silent counterexample: structural replay dropped the ordered owner
 

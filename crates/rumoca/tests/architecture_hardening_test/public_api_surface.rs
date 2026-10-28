@@ -31,6 +31,10 @@ use std::path::{Path, PathBuf};
 /// in the same file and is live.
 const REMOVED_DECLARATION_ONLY_SURFACES: &[(&str, &str)] = &[
     (
+        "crates/rumoca-solver/src/runtime/output_budget.rs",
+        "sample_capacity",
+    ),
+    (
         "crates/rumoca-compile/src/session.rs",
         "prewarm_document_read_queries",
     ),
@@ -158,6 +162,11 @@ const REMOVED_DECLARATION_ONLY_SURFACES: &[(&str, &str)] = &[
 /// Each entry is `(path, name, owning document)`, and that document must still
 /// name the item: the exemption dies with the row that grants it.
 const DOCUMENTED_CONTRACT_SURFACES: &[(&str, &str, &str)] = &[
+    (
+        "crates/rumoca-sim/src/rk45.rs",
+        "from_fmi_component",
+        "spec/SPEC_0041_CRATE_OWNERSHIP_CATALOG.md",
+    ),
     (
         "crates/rumoca-phase-structural/src/dae_transform/observation.rs",
         "manifold_expression_ordinals",

@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+# Cross-ISA relocation proof, independent of the native host backend.
+cross-isa-tests = ["cranelift-codegen/arm64"]
+
 [dependencies]
 rumoca-core = { workspace = true }
 rumoca-ir-solve = { workspace = true }

@@ -141,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "run with --features cranelift-codegen/arm64 -- --include-ignored"]
+    #[cfg(feature = "cross-isa-tests")]
     fn far_data_addresses_use_full_width_relocations_on_x86_and_arm64() {
         use cranelift_codegen::{
             Context,

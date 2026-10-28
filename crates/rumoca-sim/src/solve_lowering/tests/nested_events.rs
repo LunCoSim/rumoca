@@ -314,3 +314,40 @@ end Test;
         assert_eq!(last(&result, "unit.blockedCount"), 0.0);
     }
 }
+
+#[test]
+fn external_prepared_component_session_keeps_future_events_and_reset() {
+    let model = compile(
+        r#"
+model ExternalCounter
+  Real x(start=0,fixed=true);
+  discrete Integer count(start=0,fixed=true);
+equation
+  der(x)=1;
+  when sample(5,5) then count=pre(count)+1; end when;
+end ExternalCounter;
+"#,
+        "ExternalCounter",
+    );
+    for execution_policy in [
+        rumoca_solver::SimExecutionPolicy::Interpreter,
+        rumoca_solver::SimExecutionPolicy::Auto,
+    ] {
+        let options = SimOptions {
+            t_end: 1.0 / 60.0,
+            dt: Some(1.0 / 60.0),
+            solver_mode: SimSolverMode::RkLike,
+            execution_policy,
+            ..Default::default()
+        };
+        let component = crate::prepare_fmi_component(&model, &options).unwrap();
+        let mut session =
+            crate::rk45::SimulationSession::from_fmi_component(&component, options).unwrap();
+        session.advance_to(16.0).unwrap();
+        assert_eq!(session.get("count").unwrap().unwrap(), 3.0);
+        assert!((session.get("x").unwrap().unwrap() - 16.0).abs() < 1e-8);
+        session.reset(0.0).unwrap();
+        session.advance_to(10.0).unwrap();
+        assert_eq!(session.get("count").unwrap().unwrap(), 2.0);
+    }
+}

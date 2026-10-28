@@ -8,12 +8,12 @@ fn test_generated_parser_contract_is_pinned_and_documented() {
 
     assert!(
         section_dependency_line(&workspace_toml, "workspace.dependencies", "parol")
-            .is_some_and(|line| line == r#"parol = "=4.2.2""#),
+            .is_some_and(|line| line == r#"parol = "=4.7.0""#),
         "workspace parol dependency must be pinned exactly so generated parser output is reproducible"
     );
     assert!(
         section_dependency_line(&workspace_toml, "workspace.dependencies", "parol_runtime")
-            .is_some_and(|line| line == r#"parol_runtime = "=4.2.0""#),
+            .is_some_and(|line| line == r#"parol_runtime = "=4.5.0""#),
         "workspace parol_runtime dependency must be pinned exactly with the generated parser"
     );
 

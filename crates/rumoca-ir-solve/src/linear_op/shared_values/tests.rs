@@ -36,7 +36,7 @@ fn shared_wide_value_proof_benchmark() {
     let programs = programs(&rows);
     let start = std::time::Instant::now();
     for _ in 0..8 {
-        let shared = SharedValueSegments::derive(std::hint::black_box(&programs));
+        let shared = SharedValueSegments::derive(std::hint::black_box(&programs)).unwrap();
         shared.check(&programs).unwrap();
         assert_eq!(shared.segments.len(), 1);
         assert_eq!(count(shared.segments[0].ops(), "MatrixMultiply"), 1);
@@ -52,7 +52,7 @@ fn shared_wide_value_proof_benchmark() {
 fn shared_wide_value_proof_rejects_changed_operands_and_output_projection() {
     let rows = [(wide_matrix_program(), (512..768).collect())];
     let programs = programs(&rows);
-    let mut changed = SharedValueSegments::derive(&programs);
+    let mut changed = SharedValueSegments::derive(&programs).unwrap();
     for op in &mut changed.segments[0].ops {
         if let LinearOp::MatrixMultiply {
             lhs_start,
@@ -67,7 +67,7 @@ fn shared_wide_value_proof_rejects_changed_operands_and_output_projection() {
         changed.check(&programs),
         Err(SharedValueError::Output { index: 0 })
     );
-    let mut changed = SharedValueSegments::derive(&programs);
+    let mut changed = SharedValueSegments::derive(&programs).unwrap();
     let output = changed.segments[0]
         .ops
         .iter_mut()
@@ -234,7 +234,7 @@ fn shared_value_proof_preserves_constant_bits_and_normalizes_destinations() {
             )
         });
         let programs = programs(&rows);
-        let mut shared = SharedValueSegments::derive(&programs);
+        let mut shared = SharedValueSegments::derive(&programs).unwrap();
         shared.check(&programs).unwrap();
         assert_eq!(count(shared.segments[0].ops(), "Const"), 1);
         for op in &mut shared.segments[0].ops {
@@ -257,7 +257,7 @@ fn shared_scalar_value_proof_benchmark() {
     let programs = programs(&rows);
     let start = std::time::Instant::now();
     for _ in 0..8 {
-        let shared = SharedValueSegments::derive(std::hint::black_box(&programs));
+        let shared = SharedValueSegments::derive(std::hint::black_box(&programs)).unwrap();
         shared.check(&programs).unwrap();
         assert!(shared.shared > 256);
         std::hint::black_box(shared);
@@ -285,7 +285,7 @@ fn a_repeated_value_is_computed_once_and_the_segment_checks() {
         (product_plus(0, 1, 2.0), vec![11]),
     ];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs);
+    let shared = SharedValueSegments::derive(&programs).unwrap();
     shared.check(&programs).unwrap();
     let [segment] = shared.segments() else {
         panic!("both programs fuse into one segment");
@@ -304,7 +304,7 @@ fn a_slot_an_earlier_program_stored_is_read_from_its_register() {
         (product_plus(5, 2, 3.0), vec![6]),
     ];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs);
+    let shared = SharedValueSegments::derive(&programs).unwrap();
     shared.check(&programs).unwrap();
     let [segment] = shared.segments() else {
         panic!("one segment");
@@ -341,7 +341,7 @@ fn a_program_with_an_effect_or_a_rewritten_register_is_its_own_segment() {
         (rewritten.clone(), vec![8]),
     ];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs);
+    let shared = SharedValueSegments::derive(&programs).unwrap();
     shared.check(&programs).unwrap();
     let segments = shared.segments();
     assert_eq!(segments.len(), 4);
@@ -385,7 +385,7 @@ fn a_tensor_value_keeps_its_layout_and_is_shared_whole() {
         (product(3), vec![12]),
     ];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs);
+    let shared = SharedValueSegments::derive(&programs).unwrap();
     shared.check(&programs).unwrap();
     let [segment] = shared.segments() else {
         panic!("one segment");
@@ -413,7 +413,7 @@ fn a_segment_closes_at_the_register_cap_and_records_what_is_recomputed() {
     };
     let rows = [identity(0), identity(1)];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs);
+    let shared = SharedValueSegments::derive(&programs).unwrap();
     shared.check(&programs).unwrap();
     assert_eq!(shared.segments().len(), 2);
     assert_eq!(
@@ -432,7 +432,7 @@ fn the_checker_rejects_a_segment_that_computes_another_value() {
         (product_plus(0, 1, 2.0), vec![11]),
     ];
     let programs = programs(&rows);
-    let mut shared = SharedValueSegments::derive(&programs);
+    let mut shared = SharedValueSegments::derive(&programs).unwrap();
     for op in &mut shared.segments[0].ops {
         if let LinearOp::Const { value, .. } = op
             && *value == 2.0
@@ -477,7 +477,7 @@ fn copied_fill(a: usize) -> Vec<LinearOp> {
 fn a_copy_names_the_value_it_copies_and_a_gathered_range_checks() {
     let rows = [(copied_fill(0), vec![10]), (copied_fill(1), vec![11])];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs);
+    let shared = SharedValueSegments::derive(&programs).unwrap();
     shared.check(&programs).unwrap();
     let [segment] = shared.segments() else {
         panic!("one segment");
@@ -526,7 +526,7 @@ fn parameter_and_continuous_values_are_computed_once_per_call() {
             (sine_of(load.clone(), 2.0), vec![11]),
         ];
         let programs = programs(&rows);
-        let shared = SharedValueSegments::derive(&programs);
+        let shared = SharedValueSegments::derive(&programs).unwrap();
         shared.check(&programs).unwrap();
         let [segment] = shared.segments() else {
             panic!("one segment");
@@ -564,7 +564,7 @@ fn a_discrete_memory_value_is_read_from_its_slot_at_every_call() {
         (sine_of(pre, 2.0), vec![22]),
     ];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs);
+    let shared = SharedValueSegments::derive(&programs).unwrap();
     shared.check(&programs).unwrap();
     let [segment] = shared.segments() else {
         panic!("one segment");
@@ -591,14 +591,16 @@ fn a_sharing_that_fails_its_proof_is_counted_and_admits_nothing() {
     let wrong = SharedValueSegments::derive(&[AssignmentProgram {
         ops: &other,
         targets: &targets,
-    }]);
+    }])
+    .unwrap();
     let before = shared_value_proof_failures();
-    assert!(admit_proven(wrong, &program, &targets).is_none());
+    assert!(admit_proven(Ok(wrong), &program, &targets).is_none());
     assert!(shared_value_proof_failures() > before);
     let right = SharedValueSegments::derive(&[AssignmentProgram {
         ops: &program,
         targets: &targets,
-    }]);
-    let admitted = admit_proven(right, &program, &targets).expect("a proven sharing");
+    }])
+    .unwrap();
+    let admitted = admit_proven(Ok(right), &program, &targets).expect("a proven sharing");
     assert_eq!(count(&admitted.ops, "StoreOutput"), 1);
 }

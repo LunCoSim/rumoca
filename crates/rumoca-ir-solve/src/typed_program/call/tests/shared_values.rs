@@ -73,7 +73,7 @@ fn a_call_runs_at_every_occurrence_and_is_kept_when_unread() {
         .iter()
         .map(|(ops, targets)| AssignmentProgram { ops, targets })
         .collect::<Vec<_>>();
-    let shared = SharedValueSegments::derive(&programs);
+    let shared = SharedValueSegments::derive(&programs).unwrap();
     shared.check(&programs).unwrap();
     let [segment] = shared.segments() else {
         panic!("the programs fuse into one segment");

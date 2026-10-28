@@ -142,6 +142,7 @@ mod tests {
         assert!(source.view().before(operations.len() + 1).is_none());
     }
 
+    #[cfg(feature = "diagnostic-benchmarks")]
     fn measure_index(
         operations: &[LinearOp],
         queries: &[(usize, Reg, Option<usize>)],
@@ -166,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "manual producer construction and prefix-query timing"]
+    #[cfg(feature = "diagnostic-benchmarks")]
     fn producer_index_diagnostic() {
         for count in [4, 64, 1024, 8192] {
             let operations: Vec<_> = (0..count)

@@ -35,12 +35,6 @@ impl SolverOutputBudget {
         }
         Ok(())
     }
-    pub fn sample_capacity(self, outputs: usize) -> Result<usize, RuntimeSolveError> {
-        let columns = outputs
-            .checked_add(1)
-            .ok_or_else(|| RuntimeSolveError::solve_ir("solver output dimensions overflow"))?;
-        Ok(self.max_values / columns)
-    }
 }
 
 struct OutputBudgetState {

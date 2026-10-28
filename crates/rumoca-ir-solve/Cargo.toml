@@ -14,6 +14,8 @@ homepage.workspace = true
 # production build: dependent crates enable it from `[dev-dependencies]` only,
 # which `pattern_fixture_feature_is_dev_only` in tests.rs enforces.
 pattern-fixtures = []
+# Opt-in producer/output ownership timing diagnostics.
+diagnostic-benchmarks = []
 
 [dependencies]
 bincode = { workspace = true }
