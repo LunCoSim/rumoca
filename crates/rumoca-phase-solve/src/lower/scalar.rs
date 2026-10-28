@@ -416,6 +416,7 @@ type TensorBinaryKey<'dae> = (
 pub(super) struct ScalarCompiler<'layout, 'dae> {
     view: dae::DaeView<'dae>,
     layout: &'layout LoweredLayout<'dae>,
+    refreshed_coordinates: Option<&'layout std::collections::BTreeSet<u32>>,
     domain_points: Vec<(dae::DomainId<'dae>, Vec<i64>)>,
     symbolic_domain_points: Vec<(dae::DomainId<'dae>, Vec<solve::Reg>)>,
     function_arguments: Vec<FunctionArgumentsFrame<'dae>>,
@@ -498,6 +499,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         Self {
             view,
             layout,
+            refreshed_coordinates: None,
             domain_points: domain_point
                 .map(|(domain, values)| vec![(domain, values.to_vec())])
                 .unwrap_or_default(),
@@ -707,6 +709,17 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             }
         }
         0
+    }
+
+    /// A C57 intermediate reads the issued work-state values. A relation whose
+    /// operands include an earlier issued coordinate cannot use tick-entry
+    /// relation memory: that memory describes a different coordinate tuple.
+    pub(super) const fn with_refreshed_coordinates(
+        mut self,
+        coordinates: &'layout std::collections::BTreeSet<u32>,
+    ) -> Self {
+        self.refreshed_coordinates = Some(coordinates);
+        self
     }
 
     /// Let this program resolve a derivative coordinate through the continuous
@@ -1285,6 +1298,13 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
 
     fn buffered_relation_slot(&self, expression: dae::ExprId<'dae>) -> Option<usize> {
         let slot = self.layout.buffered_relations.expression_slot(expression)?;
+        if let Some(refreshed) = self.refreshed_coordinates {
+            let mut reads = std::collections::BTreeSet::new();
+            rumoca_phase_structural::collect_same_instant_reads(self.view, expression, &mut reads);
+            if !reads.is_disjoint(refreshed) {
+                return None;
+            }
+        }
         let mut context = self.context_id;
         while let Some(frame) = self.context_frames.get(&context) {
             if matches!(frame, ScalarContextFrame::NoEvent { .. }) {

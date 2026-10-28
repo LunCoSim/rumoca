@@ -11,6 +11,8 @@ mod coincident_strict;
 #[cfg(all(feature = "solver-diffsol", feature = "solver-rk45"))]
 mod input_batches;
 mod jacobian_source_trajectories;
+#[cfg(feature = "solver-rk45")]
+mod nested_events;
 #[cfg(all(feature = "solver-diffsol", feature = "solver-rk45"))]
 mod parameter_bindings;
 mod probe_jacobian;

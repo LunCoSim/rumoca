@@ -386,7 +386,7 @@ impl SolveMeKernel {
         }
         let state = &saved.component;
         self.lifecycle.state() == state.lifecycle
-            && self.stop_time.to_bits() == state.stop_time.to_bits()
+            && self.stop_time.map(f64::to_bits) == state.stop_time.map(f64::to_bits)
             && self.time.to_bits() == state.time.to_bits()
             && option_float_bit_eq(self.event_boundary, state.event_boundary)
             && option_float_bit_eq(self.post_event_eval_time, state.post_event_eval_time)
@@ -1269,24 +1269,38 @@ impl SolveMeKernel {
 
     /// Query the next component-owned scheduled event while constructing
     /// `fmi3UpdateDiscreteStates` output.
+    #[cfg(test)]
     pub(super) fn next_event_stop_inner(&mut self, horizon: f64) -> Result<MeEventStop, MeError> {
+        Ok(self.next_event_after_inner(Some(horizon))?.map_or(
+            MeEventStop {
+                time: horizon,
+                is_event: false,
+            },
+            |(time, _)| MeEventStop {
+                time,
+                is_event: true,
+            },
+        ))
+    }
+
+    fn next_event_after_inner(
+        &mut self,
+        horizon: Option<f64>,
+    ) -> Result<Option<(f64, RuntimeEventStop)>, MeError> {
         let solver_y = self
             .runtime
             .dynamic_time_event_stop_reads_solver_y()
             .then(|| self.current_solver_y())
             .transpose()?;
-        let (time, event) = self.runtime.next_runtime_event_stop(
+        let next = self.runtime.next_runtime_event_after(
             solver_y.as_deref().unwrap_or(&[]),
             &self.params,
-            &mut self.stop_schedule,
+            &self.stop_schedule,
             self.time,
             horizon,
         )?;
-        self.pending_event_stop = event.map(|event| (time, event));
-        Ok(MeEventStop {
-            time,
-            is_event: event.is_some(),
-        })
+        self.pending_event_stop = next;
+        Ok(next)
     }
 
     // -- event boundary ----------------------------------------------------
@@ -1586,7 +1600,9 @@ impl SolveMeKernel {
                 y: &mut solver_y,
                 p: &mut self.params,
                 t_start: self.time,
-                t_end: self.stop_time,
+                t_end: self
+                    .stop_time
+                    .unwrap_or_else(|| crate::timeline::event_right_limit_time(self.time)),
                 tol,
                 event_pre_y: &startup_event_pre_y,
                 event_pre_p: &startup_event_pre_p,
@@ -1697,13 +1713,14 @@ impl SolveMeKernel {
         &mut self,
         values_of_continuous_states_changed: bool,
     ) -> Result<MeDiscreteStates, MeError> {
-        let next_event_time = if self.termination.is_some() || self.time >= self.stop_time {
-            self.pending_event_stop = None;
-            None
-        } else {
-            let stop = self.next_event_stop_inner(self.stop_time)?;
-            stop.is_event.then_some(stop.time)
-        };
+        let next_event_time =
+            if self.termination.is_some() || self.stop_time.is_some_and(|stop| self.time >= stop) {
+                self.pending_event_stop = None;
+                None
+            } else {
+                self.next_event_after_inner(self.stop_time)?
+                    .map(|(time, _)| time)
+            };
         Ok(MeDiscreteStates {
             discrete_states_need_update: false,
             terminate_simulation: self.termination.clone(),

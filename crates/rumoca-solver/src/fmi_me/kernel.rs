@@ -8,12 +8,12 @@ mod event_boundary;
 
 use super::lifecycle::{MeLifecycle, MeLifecycleCommand, MeLifecycleViolation, MeState};
 use super::{
-    MeCompletedIntegratorStep, MeDiscreteStates, MeError, MeEventCause, MeEventEntry, MeEventStop,
+    MeCompletedIntegratorStep, MeDiscreteStates, MeError, MeEventCause, MeEventEntry,
     MeFloat64Backing, MeFmuState, MeInstanceConfig, MeModelDescription, MeModelSource,
     MeObservation, MeStage, MeTime, MeValueRef, advance_states_to_event_probe,
 };
 #[cfg(test)]
-use super::{MeIndicatorCrossing, MeOutputSeries};
+use super::{MeEventStop, MeIndicatorCrossing, MeOutputSeries};
 use crate::runtime::pre_params::{
     clear_scheduled_root_relation_memory, commit_pre_params_after_event_at,
 };
@@ -150,7 +150,7 @@ pub struct SolveMeKernel {
     /// FMI `tolerance`.
     tolerance: f64,
     /// FMI `stopTime`.
-    stop_time: f64,
+    stop_time: Option<f64>,
     /// The time `fmi3SetTime` last set.
     time: f64,
     /// The event instant the integrator is stepping toward, if any.
@@ -215,7 +215,7 @@ pub struct SolveMeKernel {
 #[derive(Clone)]
 pub(crate) struct MeKernelSnapshot {
     lifecycle: MeState,
-    stop_time: f64,
+    stop_time: Option<f64>,
     time: f64,
     event_boundary: Option<f64>,
     post_event_eval_time: Option<f64>,
@@ -974,7 +974,7 @@ impl SolveMeKernel {
                 "extended stop time requires finite values with stop_time >= from_time",
             ));
         }
-        self.stop_time = stop_time;
+        self.stop_time = Some(stop_time);
         self.stop_schedule =
             SolveStopSchedule::new(&self.runtime.model.problem, from_time, stop_time);
         Ok(())

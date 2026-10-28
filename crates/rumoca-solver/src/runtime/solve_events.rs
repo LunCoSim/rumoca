@@ -18,29 +18,49 @@ pub fn next_runtime_event_stop(
     current_t: f64,
     target: f64,
 ) -> Result<(f64, Option<RuntimeEventStop>), RuntimeSolveError> {
-    let (static_stop, static_event) = stop_schedule.next_stop(current_t, target);
-    let Some(dynamic_stop) =
-        next_dynamic_time_event(model, runtime_state, y, params, current_t, target)?
-    else {
-        return Ok((static_stop, static_event));
+    Ok(next_runtime_event_after(
+        model,
+        runtime_state,
+        y,
+        params,
+        stop_schedule,
+        current_t,
+        Some(target),
+    )?
+    .map_or((target, None), |(time, event)| (time, Some(event))))
+}
+
+pub fn next_runtime_event_after(
+    model: &solve::SolveModel,
+    runtime_state: &solve_eval::SimulationRuntimeState,
+    y: &[f64],
+    params: &[f64],
+    stop_schedule: &SolveStopSchedule,
+    current_t: f64,
+    target: Option<f64>,
+) -> Result<Option<(f64, RuntimeEventStop)>, RuntimeSolveError> {
+    let static_event = stop_schedule.next_event(current_t, target);
+    let dynamic = next_dynamic_time_event(model, runtime_state, y, params, current_t, target)?;
+    let Some(dynamic) = dynamic else {
+        return Ok(static_event);
     };
-    if dynamic_stop < static_stop && !sample_time_match_with_tol(dynamic_stop, static_stop) {
-        return Ok((dynamic_stop, Some(RuntimeEventStop::dynamic_time_event())));
+    let Some((static_time, event)) = static_event else {
+        return Ok(Some((dynamic, RuntimeEventStop::dynamic_time_event())));
+    };
+    if sample_time_match_with_tol(dynamic, static_time) {
+        // Coincident deadlines enter after both owners have reached their
+        // instant, bounded only when the caller actually supplied a horizon.
+        let time = static_time.max(dynamic);
+        return Ok(Some((
+            target.map_or(time, |target| time.min(target)),
+            event.merge_dynamic_time_event(),
+        )));
     }
-    if sample_time_match_with_tol(dynamic_stop, static_stop) {
-        let event = static_event
-            .unwrap_or_else(RuntimeEventStop::dynamic_time_event)
-            .merge_dynamic_time_event();
-        // A periodic clock uses an exact rational lattice while a dynamic
-        // deadline may reach the same mathematical instant through floating-
-        // point arithmetic.  Enter the shared superdense event only after
-        // both owners' deadlines have actually been reached, except when the
-        // host target bounds this step. Returning the earlier value can leave
-        // the later relation false and replay the clock when that dynamic
-        // deadline is processed immediately after it.
-        return Ok((static_stop.max(dynamic_stop).min(target), Some(event)));
+    if dynamic < static_time {
+        Ok(Some((dynamic, RuntimeEventStop::dynamic_time_event())))
+    } else {
+        Ok(Some((static_time, event)))
     }
-    Ok((static_stop, static_event))
 }
 
 pub fn current_dynamic_time_event_stop(
@@ -192,7 +212,7 @@ fn next_dynamic_time_event(
     y: &[f64],
     params: &[f64],
     current_t: f64,
-    target: f64,
+    target: Option<f64>,
 ) -> Result<Option<f64>, RuntimeSolveError> {
     let named_events = model
         .problem
@@ -202,7 +222,11 @@ fn next_dynamic_time_event(
         .filter_map(|name| dynamic_time_event_value(model, params, name));
     let mut candidates = dynamic_time_event_row_values(model, runtime_state, y, params, current_t)?;
     candidates.extend(named_events);
-    candidates.retain(|event_t| event_time_in_window(*event_t, current_t, target));
+    candidates.retain(|event_t| {
+        event_t.is_finite()
+            && *event_t > current_t
+            && target.is_none_or(|target| event_time_in_window(*event_t, current_t, target))
+    });
     Ok(canonical_dynamic_time_event(&candidates))
 }
 

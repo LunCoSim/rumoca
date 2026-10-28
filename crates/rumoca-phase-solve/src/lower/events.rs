@@ -275,6 +275,7 @@ struct DiscreteRows<'dae> {
     guarded_assignments: Vec<PendingGuardedAssignment>,
     structured_output_cursor: usize,
     event_iteration_owners: Vec<Option<EventIterationOwnerClaim>>,
+    transaction_owners: Vec<Option<dae::ModelEventTransactionId<'dae>>>,
     /// Exact same-tick definitions (SOLVE-C57), derived once per DAE. Program
     /// granularity consults it while lowering, and the issued order replays it.
     same_tick_definitions: rumoca_phase_structural::SameTickDefinitions<'dae>,
@@ -390,7 +391,14 @@ enum EventIterationOwnerClaim {
 impl<'dae> DiscreteRows<'dae> {
     fn new(view: dae::DaeView<'dae>) -> Result<Self, LowerError> {
         let plan = causal_discrete_plan(view)?;
+        let mut transaction_owners = vec![None; view.variable_count()];
+        for (id, transaction) in view.model_event_transactions() {
+            for target in transaction.targets() {
+                transaction_owners[target.variable() as usize] = Some(id);
+            }
+        }
         Ok(Self {
+            transaction_owners,
             same_tick_definitions: rumoca_phase_structural::SameTickDefinitions::derive(
                 view, &plan,
             ),
@@ -1470,6 +1478,10 @@ fn lower_guarded_targets<'dae>(
             && targets[end].clock == clock
             && targets[end].event_clock == event_clock
             && targets[end].pre_mode == pre_mode
+            // A program is claimed as a complete producer by one ordered
+            // algorithm transaction; fusion must preserve that DAE identity.
+            && rows.transaction_owners[targets[first].variable.index() as usize]
+                == rows.transaction_owners[targets[end].variable.index() as usize]
             && same_guarded_control(&targets[first], &targets[end])
             && exchange.fusable_with_range(first, end)
         {

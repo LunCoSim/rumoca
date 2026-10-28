@@ -16,10 +16,16 @@ pub(super) struct EventBoundaryOutcome {
     pub(super) right_limit_t: Option<f64>,
 }
 
-pub(super) fn event_boundary_horizon(event: RuntimeEventStop, target: f64, horizon: f64) -> f64 {
+pub(super) fn event_boundary_horizon(
+    event: RuntimeEventStop,
+    target: f64,
+    horizon: Option<f64>,
+) -> f64 {
     match (event.pre_mode, event.observe_right_limit) {
         (EventPreMode::EventEntry | EventPreMode::Fixed, _) => target,
-        (EventPreMode::FollowCurrent, true) => horizon,
+        (EventPreMode::FollowCurrent, true) => {
+            horizon.unwrap_or_else(|| crate::timeline::event_right_limit_time(target))
+        }
         (EventPreMode::FollowCurrent, false) => target,
     }
 }

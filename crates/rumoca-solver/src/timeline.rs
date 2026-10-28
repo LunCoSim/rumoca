@@ -206,6 +206,14 @@ pub fn next_periodic_event_time(
     current_t: f64,
     target_t: f64,
 ) -> Option<f64> {
+    next_periodic_event_after(schedules, current_t, Some(target_t))
+}
+
+pub fn next_periodic_event_after(
+    schedules: &[solve::PeriodicEventSchedule],
+    current_t: f64,
+    target_t: Option<f64>,
+) -> Option<f64> {
     schedules
         .iter()
         .filter_map(|schedule| next_schedule_event_time(schedule, current_t, target_t))
@@ -215,7 +223,7 @@ pub fn next_periodic_event_time(
 fn next_schedule_event_time(
     schedule: &solve::PeriodicEventSchedule,
     current_t: f64,
-    target_t: f64,
+    target_t: Option<f64>,
 ) -> Option<f64> {
     let period = schedule.period_seconds();
     let phase = schedule.phase_seconds();
@@ -223,19 +231,23 @@ fn next_schedule_event_time(
         || !phase.is_finite()
         || period <= 0.0
         || !current_t.is_finite()
-        || !target_t.is_finite()
+        || target_t.is_some_and(|target| !target.is_finite())
     {
         return None;
     }
     let mut tick = ((current_t - phase) / period).floor().max(0.0);
     for _ in 0..4 {
         let event_t = schedule_tick_time(schedule, tick);
-        if event_time_in_window(event_t, current_t, target_t)
+        if event_t.is_finite()
+            && event_t > current_t
+            && target_t.is_none_or(|target| event_time_in_window(event_t, current_t, target))
             && !sample_time_match_with_tol(event_t, current_t)
         {
             return Some(event_t);
         }
-        if event_t > target_t && !sample_time_match_with_tol(event_t, target_t) {
+        if target_t
+            .is_some_and(|target| event_t > target && !sample_time_match_with_tol(event_t, target))
+        {
             return None;
         }
         let tolerance = sample_time_tolerance(event_t, current_t);

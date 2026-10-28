@@ -45,7 +45,7 @@ impl BackendSimulationSession {
         let root_location = source.root_location();
         let retained = MeRetainedComponent::instantiate(
             source,
-            &instance_config(instance_name, opts)?,
+            &instance_config(instance_name, opts, None)?,
             execution_backend,
         )?;
         let options = live_session_options(
@@ -130,7 +130,7 @@ pub(crate) fn simulate_artifact(
     let mut cursor = batch_output_cursor(&options)?;
     let retained = MeRetainedComponent::instantiate(
         artifact.source(),
-        &instance_config(instance_name, opts)?,
+        &instance_config(instance_name, opts, Some(opts.t_end))?,
         execution_backend,
     )?;
     let host = retained.into_lease(options)?;
@@ -167,8 +167,9 @@ pub(crate) fn plugin_for_host(
 pub(crate) fn instance_config(
     instance_name: &'static str,
     opts: &SimOptions,
+    stop_time: Option<f64>,
 ) -> Result<MeInstanceConfig, SimError> {
-    MeInstanceConfig::new(instance_name, opts.rtol, opts.t_start, opts.t_end).map_err(Into::into)
+    MeInstanceConfig::new(instance_name, opts.rtol, opts.t_start, stop_time).map_err(Into::into)
 }
 
 fn default_output_dt(opts: &SimOptions) -> f64 {

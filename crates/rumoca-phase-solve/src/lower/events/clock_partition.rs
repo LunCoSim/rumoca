@@ -76,6 +76,7 @@ pub(super) fn issue_clock_partition_order<'dae>(
         }
     })?;
     let mut order = Vec::with_capacity(schedule.steps.len());
+    let mut refreshed_coordinates = BTreeSet::new();
     let intermediate_consumers = schedule.intermediate_consumers;
     for step in schedule.steps {
         match step {
@@ -94,6 +95,8 @@ pub(super) fn issue_clock_partition_order<'dae>(
                         solve::ClockPartitionStep::EventTransaction { program_index }
                     }
                 });
+                refreshed_coordinates
+                    .extend(admitted[index].targets.iter().map(|target| target.index()));
             }
             rumoca_phase_structural::SameTickStep::IntermediateDefinition {
                 variable,
@@ -114,9 +117,11 @@ pub(super) fn issue_clock_partition_order<'dae>(
                         variable,
                         definition,
                         consumers,
+                        refreshed_coordinates: &refreshed_coordinates,
                     },
                     &mut order,
                 )?;
+                refreshed_coordinates.insert(variable.index());
             }
         }
     }
@@ -128,6 +133,7 @@ struct IntermediateDefinitionIssue<'a, 'dae> {
     variable: dae::VariableId<'dae>,
     definition: dae::ExprId<'dae>,
     consumers: &'a [usize],
+    refreshed_coordinates: &'a BTreeSet<u32>,
 }
 
 fn issue_intermediate_definition<'dae>(
@@ -179,7 +185,9 @@ fn issue_intermediate_definition<'dae>(
         .expect("checked intermediate variable resolves")
         .scalar_count();
     for scalar in 0..scalar_count {
-        let program = ScalarCompiler::new(view, layout, None).program(issue.definition, scalar)?;
+        let program = ScalarCompiler::new(view, layout, None)
+            .with_refreshed_coordinates(issue.refreshed_coordinates)
+            .program(issue.definition, scalar)?;
         let target = variable_scalar_slot(layout, issue.variable.index(), scalar, definition_span)?;
         let row = discrete.clock_partition_intermediate_targets.len();
         discrete

@@ -8,6 +8,8 @@
 //! replacement here, which is the only point where the rebuilt system stops
 //! being an exact structural copy of its source.
 
+mod model_events;
+
 use rumoca_ir_dae as dae;
 
 use super::declarations::RebuiltDomain;
@@ -81,7 +83,8 @@ pub(super) fn rebuild_semantic_owners<'target>(
         expressions,
         identities.variables,
         identities.conditions,
-    )
+    )?;
+    model_events::rebuild(source, target, expressions, &identities)
 }
 
 fn rebuild_equations<'target>(

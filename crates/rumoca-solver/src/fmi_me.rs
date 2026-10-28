@@ -538,8 +538,8 @@ pub struct MeInstanceConfig {
     tolerance: f64,
     /// FMI `startTime`.
     start_time: f64,
-    /// FMI `stopTime` (`stopTimeDefined = true`).
-    stop_time: f64,
+    /// FMI `stopTime`; None means `stopTimeDefined = false`.
+    stop_time: Option<f64>,
     /// Who orders this instance's continuous-time evaluations, which selects
     /// its refresh warm start (Solve IR `RefreshSeedRule`).
     executor: rumoca_ir_solve::RefreshExecutor,
@@ -555,8 +555,9 @@ impl MeInstanceConfig {
         instance_name: &'static str,
         relative_tolerance: f64,
         start_time: f64,
-        stop_time: f64,
+        stop_time: impl Into<Option<f64>>,
     ) -> Result<Self, MeError> {
+        let stop_time = stop_time.into();
         if instance_name.is_empty() {
             return Err(MeError::Contract {
                 reason: "ME instance name must not be empty".to_owned(),
@@ -567,7 +568,9 @@ impl MeInstanceConfig {
                 reason: "ME relative tolerance must be finite and positive".to_owned(),
             });
         }
-        if !start_time.is_finite() || !stop_time.is_finite() || stop_time < start_time {
+        if !start_time.is_finite()
+            || stop_time.is_some_and(|stop| !stop.is_finite() || stop < start_time)
+        {
             return Err(MeError::Contract {
                 reason: "ME time horizon requires finite values with stop_time >= start_time"
                     .to_owned(),

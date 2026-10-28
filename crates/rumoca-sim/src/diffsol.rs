@@ -70,7 +70,7 @@ pub(crate) fn assess_bdf_capability(
     };
     let retained = rumoca_solver::fmi_me::session::MeRetainedComponent::instantiate(
         artifact.source(),
-        &instance_config("bdf", opts)?,
+        &instance_config("bdf", opts, Some(opts.t_end))?,
         execution_backend,
     )?;
     let prepared = PreparedSimulation {
@@ -230,7 +230,7 @@ fn build_simulation_artifact(
         rumoca_solver::fmi_me::admit_execution_backend(opts.execution_policy, execution_backend)?;
     let retained = rumoca_solver::fmi_me::session::MeRetainedComponent::instantiate(
         artifact.source(),
-        &instance_config("bdf", opts)?,
+        &instance_config("bdf", opts, Some(opts.t_end))?,
         execution_backend,
     )?;
     let prepared = PreparedSimulation {

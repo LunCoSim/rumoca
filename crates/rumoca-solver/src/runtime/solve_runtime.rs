@@ -19,8 +19,8 @@ use crate::runtime::projection::{
     project_algebraics_with_plan, project_algebraics_with_plan_certified,
 };
 use crate::runtime::solve_events::{
-    current_dynamic_time_event_stop, event_action_params, next_runtime_event_stop,
-    visible_values_with_context,
+    current_dynamic_time_event_stop, event_action_params, next_runtime_event_after,
+    next_runtime_event_stop, visible_values_with_context,
 };
 use crate::runtime::solve_ops::write_clock_activation_params;
 use crate::{

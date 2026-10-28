@@ -2,7 +2,7 @@ use rumoca_ir_solve as solve;
 
 use super::solve_ops::EventPreMode;
 use crate::timeline::{
-    ScheduledTimeEvents, next_periodic_event_time, periodic_schedule_matches_time,
+    ScheduledTimeEvents, next_periodic_event_after, periodic_schedule_matches_time,
     sample_time_match_with_tol, schedule_tick_time, scheduled_time_in_horizon,
 };
 
@@ -27,7 +27,8 @@ struct StopEvent {
 }
 
 impl SolveStopSchedule {
-    pub fn new(problem: &solve::SolveProblem, t_start: f64, t_end: f64) -> Self {
+    pub fn new(problem: &solve::SolveProblem, t_start: f64, t_end: impl Into<Option<f64>>) -> Self {
+        let t_end = t_end.into();
         let mut schedule = Self {
             events: collect_static_ode_events(problem, t_start, t_end),
             periodic_schedules: problem.clocks.periodic_event_schedules.clone(),
@@ -45,14 +46,25 @@ impl SolveStopSchedule {
     /// explicitly; keeping this query read-only prevents output-grid points
     /// near a future stop from silently consuming that stop.
     pub fn next_stop(&self, t_current: f64, t_target: f64) -> (f64, Option<RuntimeEventStop>) {
+        self.next_event(t_current, Some(t_target))
+            .map_or((t_target, None), |(time, event)| (time, Some(event)))
+    }
+
+    pub fn next_event(
+        &self,
+        t_current: f64,
+        t_target: Option<f64>,
+    ) -> Option<(f64, RuntimeEventStop)> {
         let mut next = None;
         if let Some(event) = self.events.get(self.next_idx)
             && !sample_time_match_with_tol(event.time, t_current)
-            && (event.time < t_target || sample_time_match_with_tol(event.time, t_target))
+            && t_target.is_none_or(|target| {
+                event.time < target || sample_time_match_with_tol(event.time, target)
+            })
         {
             merge_next_stop(&mut next, *event);
         }
-        if let Some(time) = next_periodic_event_time(&self.periodic_schedules, t_current, t_target)
+        if let Some(time) = next_periodic_event_after(&self.periodic_schedules, t_current, t_target)
         {
             merge_next_stop(
                 &mut next,
@@ -64,16 +76,16 @@ impl SolveStopSchedule {
             );
         }
         if let Some(event) = next {
-            return (
+            return Some((
                 event.time,
-                Some(RuntimeEventStop {
+                RuntimeEventStop {
                     pre_mode: event.pre_mode,
                     observe_right_limit: event.pre_mode == EventPreMode::FollowCurrent,
                     terminal: event.terminal,
-                }),
-            );
+                },
+            ));
         }
-        (t_target, None)
+        None
     }
 
     pub fn advance_past(&mut self, t_current: f64) {
@@ -364,21 +376,32 @@ fn periodic_tick_time_at(schedule: &solve::PeriodicEventSchedule, t: f64) -> Opt
 fn collect_static_ode_events(
     problem: &solve::SolveProblem,
     t_start: f64,
-    t_end: f64,
+    t_end: Option<f64>,
 ) -> Vec<StopEvent> {
     let mut events: Vec<StopEvent> = problem
         .events
         .scheduled_time_events
         .iter()
         .copied()
-        .filter(|event_t| scheduled_time_in_horizon(*event_t, t_start, t_end))
+        .filter(|event_t| {
+            t_end.map_or_else(
+                || {
+                    event_t.is_finite()
+                        && (*event_t > t_start || sample_time_match_with_tol(*event_t, t_start))
+                },
+                |end| scheduled_time_in_horizon(*event_t, t_start, end),
+            )
+        })
         .map(|time| StopEvent {
             time,
             pre_mode: EventPreMode::FollowCurrent,
             terminal: false,
         })
         .collect();
-    if problem.events.has_terminal_event && scheduled_time_in_horizon(t_end, t_start, t_end) {
+    if let Some(t_end) = t_end
+        && problem.events.has_terminal_event
+        && scheduled_time_in_horizon(t_end, t_start, t_end)
+    {
         events.push(StopEvent {
             time: t_end,
             pre_mode: EventPreMode::EventEntry,

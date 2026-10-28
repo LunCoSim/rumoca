@@ -94,6 +94,25 @@ impl SolveRuntime {
         )
     }
 
+    pub fn next_runtime_event_after(
+        &self,
+        y: &[f64],
+        params: &[f64],
+        stop_schedule: &SolveStopSchedule,
+        current_t: f64,
+        target: Option<f64>,
+    ) -> Result<Option<(f64, RuntimeEventStop)>, RuntimeSolveError> {
+        next_runtime_event_after(
+            &self.model,
+            &self.runtime_state,
+            y,
+            params,
+            stop_schedule,
+            current_t,
+            target,
+        )
+    }
+
     pub fn dynamic_time_event_stop_reads_solver_y(&self) -> bool {
         !self.model.problem.events.dynamic_time_event_rhs.is_empty()
     }
