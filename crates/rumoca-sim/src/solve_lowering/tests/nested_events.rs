@@ -316,7 +316,7 @@ end Test;
 }
 
 #[test]
-fn external_prepared_component_session_keeps_future_events_and_reset() {
+fn external_host_persisted_component_keeps_future_events_and_reset() {
     let model = compile(
         r#"
 model ExternalCounter
@@ -341,6 +341,26 @@ end ExternalCounter;
             ..Default::default()
         };
         let component = crate::prepare_fmi_component(&model, &options).unwrap();
+        let declaration_inputs = serde_json::to_value(component.construction_inputs()).unwrap();
+        let wire = rumoca_phase_solve::fmi::runtime_fmi_component_wire(&component).unwrap();
+        let encoded = serde_json::to_string(&wire).unwrap();
+        drop(component);
+        let mut deserializer = serde_json::Deserializer::from_str(&encoded);
+        let component =
+            rumoca_phase_solve::fmi::deserialize_fmi_component(&mut deserializer).unwrap();
+        assert_eq!(
+            serde_json::to_value(component.construction_inputs()).unwrap(),
+            declaration_inputs,
+            "runtime persistence preserves admitted declaration facts"
+        );
+        assert_eq!(
+            serde_json::to_string(
+                &rumoca_phase_solve::fmi::runtime_fmi_component_wire(&component).unwrap()
+            )
+            .unwrap(),
+            encoded,
+            "checked runtime replay has a canonical construction wire"
+        );
         let mut session =
             crate::rk45::SimulationSession::from_fmi_component(&component, options).unwrap();
         session.advance_to(16.0).unwrap();

@@ -47,6 +47,31 @@ fn parse_source_document(source: &str, file_name: &str) -> ParsedSourceDocument 
         .expect("test source document should parse")
 }
 
+#[test]
+fn external_host_parsed_source_views_retain_utf8_provenance_through_admission() {
+    let source = "within Plant;\nmodel Mixer \"café\"\n  Real mass(start=1,fixed=true);\nequation\n  der(mass)=-mass;\nend Mixer;";
+    let document = parse_source_document(source, "mixer.mo");
+    assert_eq!(document.uri(), "mixer.mo");
+    assert_eq!(document.source(), source);
+    let class = document
+        .definition()
+        .get_class_by_qualified_name("Plant.Mixer")
+        .expect("external host can inspect the parsed class");
+    let declaration = class.location.span();
+    assert_eq!(
+        &document.source()[declaration.start.0..declaration.end.0],
+        "model Mixer \"café\"\n  Real mass(start=1,fixed=true);\nequation\n  der(mass)=-mass;\nend Mixer;"
+    );
+    let mass = &class.components["mass"].name_token.location;
+    assert_eq!(
+        &document.source()[mass.start as usize..mass.end as usize],
+        "mass"
+    );
+    let mut session = Session::default();
+    session.add_in_memory_parsed_batch(vec![document]);
+    assert!(session.compile_model("Plant.Mixer").unwrap().is_balanced());
+}
+
 fn source_set_record<'a>(session: &'a Session, source_set_id: &str) -> &'a SourceSetRecord {
     session
         .source_sets
