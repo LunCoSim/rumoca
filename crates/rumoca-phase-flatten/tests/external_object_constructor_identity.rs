@@ -126,10 +126,10 @@ fn external_object_constructor_is_executable_while_record_constructor_is_structu
     assert_ne!(handle.def_id, Some(fixture.handle_class_def_id));
     assert_eq!(handle.span, fixture.constructor_span);
     let declaration_text = source_text(handle.span).trim_start();
-    assert!(
-        declaration_text.starts_with("constructor")
-            && declaration_text.ends_with("end constructor"),
-        "unexpected constructor declaration provenance: {declaration_text:?}"
+    assert_eq!(
+        declaration_text,
+        "function constructor\n    input Real seed;\n    output Handle handle;\n    external \"C\" handle = make_handle(seed);\n  end constructor;",
+        "constructor provenance retains the complete authored declaration"
     );
 
     let add_pair = model

@@ -969,7 +969,7 @@ areas.
 
 | Category | Prefix | Count |
 |----------|--------|-------|
-| Lexical | LEX | 13 |
+| Lexical | LEX | 14 |
 | Declarations | DECL | 37 |
 | Instantiation | INST | 58 |
 | Expressions | EXPR | 41 |
@@ -987,7 +987,7 @@ areas.
 | State Machines | SM | 8 |
 | Annotations | ANN | 17 |
 | Unit Expressions | UNIT | 9 |
-| **Total** | | **457** |
+| **Total** | | **458** |
 
 ---
 
@@ -1076,5 +1076,5 @@ The following design decisions extend MLS requirements for implementation:
 | Data Structures | 26 |
 | Algorithmic Processes | 4 |
 | Contract Categories | 18 |
-| Total Contracts | 457 |
+| Total Contracts | 458 |
 | MLS Chapters Referenced | 21 |

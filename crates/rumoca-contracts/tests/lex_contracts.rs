@@ -1,6 +1,6 @@
 //! LEX (Lexical) contract tests - MLS §2
 //!
-//! Tests for the 13 lexical contracts defined in SPEC_0022.
+//! Tests for the 14 lexical contracts defined in SPEC_0022.
 
 use rumoca_compile::parsing::parse_source_to_ast as parse_to_ast;
 use rumoca_compile::{Session, SessionConfig};
@@ -321,6 +321,41 @@ fn lex_013_string_escapes() {
 }
 
 // =============================================================================
+// LEX-014: UTF-8 file metadata preserves original byte coordinates
+// =============================================================================
+
+#[test]
+fn lex_014_leading_bom_retains_offsets() {
+    let source = "\u{feff}model Test\r\n  Real value;\r\nend Test;";
+    let ast = parse_to_ast(source, "encoding.mo").expect("leading BOM is metadata");
+    let class = &ast.classes["Test"];
+    assert_eq!(
+        class.name.location.start as usize,
+        source.find("Test").unwrap()
+    );
+    let span = class.location.span();
+    assert_eq!(&source[span.start.0..span.end.0], &source[3..]);
+    let token = &class.components["value"].name_token;
+    assert_eq!(token.location.start as usize, source.find("value").unwrap());
+    assert_eq!(token.location.start_line, 2);
+}
+
+#[test]
+fn lex_014_nonleading_or_repeated_bom_is_rejected() {
+    for source in [
+        " \u{feff}model Test end Test;",
+        "\u{feff}\u{feff}model Test end Test;",
+        "model Test \u{feff} Real value; end Test;",
+        "model Test end Test;\u{feff}",
+    ] {
+        assert!(
+            parses_err(source),
+            "unexpected encoding mark accepted: {source:?}"
+        );
+    }
+}
+
+// =============================================================================
 // Integration test: Run all LEX contracts through the test runner
 // =============================================================================
 
@@ -388,6 +423,12 @@ fn register_lex_contracts(runner: &mut TestRunner) {
         "LEX-013",
         r#"model Test String s = "hello\nworld"; end Test;"#,
         "String escapes should work",
+    );
+    register_parse_ok_case(
+        runner,
+        "LEX-014",
+        "\u{feff}model Test end Test;",
+        "A single leading UTF-8 BOM is file metadata",
     );
 
     // LEX-006/007/008/009 assert more than "parses or not", so they register

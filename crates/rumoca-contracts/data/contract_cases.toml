@@ -1556,6 +1556,20 @@ kind = 'Parse'
 outcome = 'Accept'
 
 [[cases]]
+contract_id = 'LEX-014'
+case_id = 'lex_014_leading_bom_retains_offsets'
+test_file = 'tests/lex_contracts.rs'
+kind = 'Parse'
+outcome = 'Accept'
+
+[[cases]]
+contract_id = 'LEX-014'
+case_id = 'lex_014_nonleading_or_repeated_bom_is_rejected'
+test_file = 'tests/lex_contracts.rs'
+kind = 'Parse'
+outcome = 'Reject'
+
+[[cases]]
 contract_id = 'OPREC-001'
 case_id = 'oprec_001_encapsulated_operator_ok'
 test_file = 'tests/oprec_contracts.rs'

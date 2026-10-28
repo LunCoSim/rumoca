@@ -3228,6 +3228,15 @@ status = 'Implemented'
 tier = 1
 
 [[contracts]]
+id = 'LEX-014'
+category = 'Lexical'
+name = 'UTF-8 file metadata'
+mls_ref = '§13.4'
+requirement = 'A single leading UTF-8 BOM is file metadata; parser tokens and diagnostics retain original source offsets, and a BOM elsewhere is not an encoding mark'
+status = 'Implemented'
+tier = 1
+
+[[contracts]]
 id = 'OPREC-001'
 category = 'OperatorRecord'
 name = 'Encapsulated'
