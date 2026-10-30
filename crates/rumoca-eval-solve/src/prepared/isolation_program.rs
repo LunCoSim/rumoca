@@ -8,7 +8,9 @@
 //! isolator; an output that another shape owns, or that reads the target
 //! without a shape, has no isolation; any other output is its own value.
 
-use rumoca_ir_solve::{LinearOp, materialize_target_assignment, share_program_values};
+use rumoca_ir_solve::{
+    LinearOp, TargetAssignmentShape, materialize_target_assignment, share_program_values,
+};
 
 use super::{PreparedScalarProgramBlock, row_output_depends_on_y_index};
 
@@ -157,40 +159,39 @@ impl PreparedScalarProgramBlock {
     /// sweep through this one construction.
     pub fn torn_sweep_runs(&self, causal: &[(usize, usize)]) -> Option<Vec<TornSweepRun>> {
         let mut runs: Vec<TornSweepRun> = Vec::new();
+        let mut current: Option<(TornSweepRun, IsolationChainCandidate<'_>)> = None;
         for (step, &(row, target)) in causal.iter().enumerate() {
             let (program_row, offset) = self.row_output_position(row)?;
-            if !matches!(
-                self.target_isolation_output_program(program_row, offset, target),
-                TargetIsolationProgram::Isolator(_)
-            ) {
-                return None;
-            }
-            if let Some(run) = runs.last_mut().filter(|run| run.program_row == program_row)
-                && self.extends_run(run, (offset, target))
+            let shape = self.assignment_shape_for_output(program_row, offset, target)?;
+            if let Some((run, candidate)) = current
+                .as_mut()
+                .filter(|(run, _)| run.program_row == program_row)
+                && candidate.append(shape).is_some()
             {
+                run.pairs.push((offset, target));
                 continue;
             }
-            runs.push(TornSweepRun {
-                program_row,
-                pairs: vec![(offset, target)],
-                first_step: step,
-            });
+            // A failed extension is discarded: materialization may have
+            // appended registers before declining. The new run starts from
+            // the exact source prefix of this step.
+            let mut next = IsolationChainCandidate::new(self.block.programs().get(program_row)?);
+            next.append(shape)?;
+            if let Some((run, _)) = current.take() {
+                runs.push(run);
+            }
+            current = Some((
+                TornSweepRun {
+                    program_row,
+                    pairs: vec![(offset, target)],
+                    first_step: step,
+                },
+                next,
+            ));
+        }
+        if let Some((run, _)) = current {
+            runs.push(run);
         }
         Some(runs)
-    }
-}
-
-impl PreparedScalarProgramBlock {
-    /// Append `pair` to `run` when the chain program still answers it.
-    fn extends_run(&self, run: &mut TornSweepRun, pair: (usize, usize)) -> bool {
-        run.pairs.push(pair);
-        let extends = self
-            .target_isolation_chain_candidate(run.program_row, &run.pairs)
-            .is_some();
-        if !extends {
-            run.pairs.pop();
-        }
-        extends
     }
 }
 
@@ -223,50 +224,59 @@ impl PreparedScalarProgramBlock {
         row_idx: usize,
         pairs: &[(usize, usize)],
     ) -> Option<Vec<LinearOp>> {
-        self.target_isolation_chain_candidate(row_idx, pairs)
-            .map(share_program_values)
+        let mut candidate = IsolationChainCandidate::new(self.block.programs().get(row_idx)?);
+        for &(output, target) in pairs {
+            candidate.append(self.assignment_shape_for_output(row_idx, output, target)?)?;
+        }
+        Some(share_program_values(candidate.program))
+    }
+}
+
+/// One checked run under construction. Both membership discovery and final
+/// executable materialization extend this same source-bound candidate.
+struct IsolationChainCandidate<'a> {
+    row: &'a [LinearOp],
+    program: Vec<LinearOp>,
+    evaluated: usize,
+    earlier_targets: Vec<usize>,
+}
+
+impl<'a> IsolationChainCandidate<'a> {
+    fn new(row: &'a [LinearOp]) -> Self {
+        Self {
+            row,
+            program: Vec::new(),
+            evaluated: 0,
+            earlier_targets: Vec::new(),
+        }
     }
 
-    // A candidate proves all chain admission conditions and materializations.
-    // Executable consumers share its values after admission; run probes only
-    // need to know whether this construction succeeds.
-    fn target_isolation_chain_candidate(
-        &self,
-        row_idx: usize,
-        pairs: &[(usize, usize)],
-    ) -> Option<Vec<LinearOp>> {
-        let row = self.block.programs().get(row_idx)?;
-        let mut program = Vec::new();
-        let mut evaluated = 0;
-        for (position, &(output, target)) in pairs.iter().enumerate() {
-            let shape = self.assignment_shape_for_output(row_idx, output, target)?;
-            let length = shape.expr_eval_len();
-            let prefix = row.get(..length)?;
-            let earlier = pairs[..position]
-                .iter()
-                .map(|&(_, target)| target)
-                .collect::<Vec<_>>();
-            if length < evaluated
-                || super::assignment_shape_reads_any_y_index(row, shape, &earlier)
-                || super::dependency::failable_op_reads_any_y_index(prefix, &earlier)
-            {
-                return None;
-            }
-            program.extend(
-                row.get(evaluated..length)?
-                    .iter()
-                    .filter(|op| {
-                        !matches!(
-                            op,
-                            LinearOp::StoreOutput { .. } | LinearOp::StoreOutputRange { .. }
-                        )
-                    })
-                    .cloned(),
-            );
-            evaluated = length;
-            let (result, _) = materialize_target_assignment(shape, &mut program)?;
-            program.push(LinearOp::StoreOutput { src: result });
+    /// A declined candidate must be discarded, never extended again.
+    fn append(&mut self, shape: &TargetAssignmentShape) -> Option<()> {
+        let length = shape.expr_eval_len();
+        let prefix = self.row.get(..length)?;
+        if length < self.evaluated
+            || super::assignment_shape_reads_any_y_index(self.row, shape, &self.earlier_targets)
+            || super::dependency::failable_op_reads_any_y_index(prefix, &self.earlier_targets)
+        {
+            return None;
         }
-        Some(program)
+        self.program.extend(
+            self.row
+                .get(self.evaluated..length)?
+                .iter()
+                .filter(|op| {
+                    !matches!(
+                        op,
+                        LinearOp::StoreOutput { .. } | LinearOp::StoreOutputRange { .. }
+                    )
+                })
+                .cloned(),
+        );
+        let (result, _) = materialize_target_assignment(shape, &mut self.program)?;
+        self.program.push(LinearOp::StoreOutput { src: result });
+        self.evaluated = length;
+        self.earlier_targets.push(shape.target_y_index());
+        Some(())
     }
 }

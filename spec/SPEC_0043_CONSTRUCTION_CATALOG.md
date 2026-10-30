@@ -415,9 +415,10 @@ materialization checks still decide their admission. Tensor range outputs do
 not acquire assignment certificates for unrelated coordinates merely because
 those coordinates are loaded by the same range operation.
 
-Run admission constructs and checks each candidate once without sharing values
-of a discarded candidate. Executable chains still share values through the
-checked transformation. Chain-output, directional-JVP, projection Jacobian and
+Run admission extends one source-bound candidate per run, checking and
+materializing each appended isolator once. A declined extension discards that
+candidate and starts a fresh run. Executable chains use the same append checks
+and share values through the checked transformation after admission. Chain-output, directional-JVP, projection Jacobian and
 state-manifold Jacobian evaluators use the evaluation-only prepared block. Its
 selected-output reads retain source validation and output ordering; assignment
 certificates belong to the source residual owner. These output evaluators do

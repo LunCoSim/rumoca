@@ -184,3 +184,40 @@ fn a_long_torn_sweep_preserves_all_outputs_in_one_run() {
         assert_eq!(value.to_bits(), (index as f64 + 0.5).to_bits());
     }
 }
+
+#[test]
+fn a_declined_extension_starts_a_fresh_chain_for_later_steps() {
+    let mut row = dependent_row();
+    row.extend([
+        LinearOp::Const { dst: 5, value: 3.0 },
+        LinearOp::LoadY { dst: 6, index: 2 },
+        sub(7, 6, 5),
+        LinearOp::StoreOutput { src: 7 },
+    ]);
+    let prepared = prepare(row);
+    let runs = prepared.torn_sweep_runs(&[(0, 0), (1, 1), (2, 2)]).unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].pairs, [(0, 0)]);
+    assert_eq!(runs[0].first_step, 0);
+    assert_eq!(runs[1].pairs, [(1, 1), (2, 2)]);
+    assert_eq!(runs[1].first_step, 1);
+    let program = prepared
+        .target_isolation_chain_program(0, &runs[1].pairs)
+        .unwrap();
+    let mut values = [f64::NAN; 2];
+    prepare(program)
+        .eval_with_context(
+            &[5.0, -7.0, 8.0],
+            &P,
+            0.0,
+            RowEvalContext::default(),
+            &mut values,
+        )
+        .unwrap();
+    assert_eq!(values, [5.0, 3.0]);
+    assert!(
+        prepared
+            .torn_sweep_runs(&[(0, 0), (1, 1), (2, 0)])
+            .is_none()
+    );
+}
