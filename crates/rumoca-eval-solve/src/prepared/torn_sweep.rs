@@ -20,7 +20,7 @@ use super::{
     AssignmentProgramBuilder, PreparedScalarProgramBlock, RowOutputRequest,
     TargetAssignmentScratchRequest,
 };
-use crate::{EvalSolveError, RowEvalContext};
+use crate::{EvalSolveError, PreparedEvaluationBlock, RowEvalContext};
 
 /// One causal back-substitution step resolved at prepare time.
 struct PreparedTornStep {
@@ -38,7 +38,7 @@ pub struct PreparedTornSweep {
     /// ([`PreparedScalarProgramBlock::torn_sweep_runs`]), each evaluated as
     /// one chain program of `chains`, in step order.
     runs: Vec<PreparedTornRun>,
-    chains: Option<Box<PreparedScalarProgramBlock>>,
+    chains: Option<Box<PreparedEvaluationBlock>>,
     /// Residual rows resolved to (program, output offset); `None` marks a row
     /// with no scalar view, which the sweep reports as unevaluable exactly as
     /// the per-row path does.
@@ -140,10 +140,7 @@ impl PreparedScalarProgramBlock {
     fn prepare_torn_chains(
         &self,
         causal_steps: &[(usize, usize)],
-    ) -> Option<(
-        Vec<PreparedTornRun>,
-        Option<Box<PreparedScalarProgramBlock>>,
-    )> {
+    ) -> Option<(Vec<PreparedTornRun>, Option<Box<PreparedEvaluationBlock>>)> {
         let mut runs = Vec::new();
         let mut programs = Vec::new();
         let mut spans = Vec::new();
@@ -163,7 +160,7 @@ impl PreparedScalarProgramBlock {
             return Some((runs, None));
         }
         let block = ScalarProgramBlock::with_program_spans(programs, spans).ok()?;
-        let prepared = PreparedScalarProgramBlock::new(block).ok()?;
+        let prepared = PreparedEvaluationBlock::new(block).ok()?;
         Some((runs, Some(Box::new(prepared))))
     }
 

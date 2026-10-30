@@ -137,3 +137,50 @@ fn a_pair_without_a_shape_declines_the_chain() {
         None
     );
 }
+
+#[test]
+fn a_long_torn_sweep_preserves_all_outputs_in_one_run() {
+    const OUTPUTS: usize = 64;
+    let mut row = Vec::new();
+    for index in 0..OUTPUTS {
+        let dst = (index * 3) as u32;
+        row.extend([
+            LinearOp::Const {
+                dst,
+                value: index as f64 + 0.5,
+            },
+            LinearOp::LoadY {
+                dst: dst + 1,
+                index,
+            },
+            sub(dst + 2, dst + 1, dst),
+            LinearOp::StoreOutput { src: dst + 2 },
+        ]);
+    }
+    let prepared = prepare(row);
+    let causal = (0..OUTPUTS).map(|index| (index, index)).collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    let runs = prepared.torn_sweep_runs(&causal).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].pairs, causal);
+    let program = prepared
+        .target_isolation_chain_program(0, &runs[0].pairs)
+        .unwrap();
+    eprintln!(
+        "run_discovery_and_final_program_us={}",
+        started.elapsed().as_micros()
+    );
+    let mut values = vec![f64::NAN; OUTPUTS];
+    prepare(program)
+        .eval_with_context(
+            &vec![0.0; OUTPUTS],
+            &[],
+            0.0,
+            RowEvalContext::default(),
+            &mut values,
+        )
+        .unwrap();
+    for (index, value) in values.into_iter().enumerate() {
+        assert_eq!(value.to_bits(), (index as f64 + 0.5).to_bits());
+    }
+}

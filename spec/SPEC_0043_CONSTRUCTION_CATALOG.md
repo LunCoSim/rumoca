@@ -408,6 +408,12 @@ once and writes exactly the per-step isolators' values; the linked kernel and
 the generated C consume the same runs, and an evaluation failure inside a run
 falls back to its steps one by one.
 
+Run admission constructs and checks each candidate once without sharing values
+of a discarded candidate. Executable chains still share values through the
+checked transformation. Chain-output and directional-JVP evaluators use the
+evaluation-only prepared block: assignment certificates belong to their source
+residual owner, and neither consumer queries assignments of its output program.
+
 A projection block's residual split constructs from the block's checked row
 programs and its unknown set (`y_indices`), once per (block, program). The
 block-unknown cone of a program is the set of register versions written by an

@@ -94,7 +94,7 @@ pub struct TornTangentEvaluator {
     plan: TornTangentPlan,
     programs: Vec<PreparedTangentLaneProgram>,
     /// The JVP rows a one-direction plan evaluates.
-    directions: Option<std::rc::Rc<crate::PreparedScalarProgramBlock>>,
+    directions: Option<std::rc::Rc<crate::PreparedEvaluationBlock>>,
 }
 
 impl TornTangentEvaluator {
@@ -112,11 +112,11 @@ impl TornTangentEvaluator {
     pub fn sharing_directions(
         plan: TornTangentPlan,
         jvp: &rumoca_ir_solve::ScalarProgramBlock,
-        shared: &mut Option<std::rc::Rc<crate::PreparedScalarProgramBlock>>,
+        shared: &mut Option<std::rc::Rc<crate::PreparedEvaluationBlock>>,
     ) -> Result<Self, EvalSolveError> {
         let directions = if plan.directional() {
             if shared.is_none() {
-                *shared = Some(std::rc::Rc::new(crate::PreparedScalarProgramBlock::new(
+                *shared = Some(std::rc::Rc::new(crate::PreparedEvaluationBlock::new(
                     jvp.clone(),
                 )?));
             }
@@ -213,7 +213,7 @@ impl TornTangentEvaluator {
     /// multi-lane form.
     fn eval_directions(
         &self,
-        directions: &crate::PreparedScalarProgramBlock,
+        directions: &crate::PreparedEvaluationBlock,
         point: TangentPoint<'_>,
         call: &mut DirectionCall<'_>,
     ) -> Result<Option<TornTangentJacobian>, EvalSolveError> {

@@ -185,7 +185,7 @@ impl PreparedScalarProgramBlock {
     fn extends_run(&self, run: &mut TornSweepRun, pair: (usize, usize)) -> bool {
         run.pairs.push(pair);
         let extends = self
-            .target_isolation_chain_program(run.program_row, &run.pairs)
+            .target_isolation_chain_candidate(run.program_row, &run.pairs)
             .is_some();
         if !extends {
             run.pairs.pop();
@@ -223,6 +223,18 @@ impl PreparedScalarProgramBlock {
         row_idx: usize,
         pairs: &[(usize, usize)],
     ) -> Option<Vec<LinearOp>> {
+        self.target_isolation_chain_candidate(row_idx, pairs)
+            .map(share_program_values)
+    }
+
+    // A candidate proves all chain admission conditions and materializations.
+    // Executable consumers share its values after admission; run probes only
+    // need to know whether this construction succeeds.
+    fn target_isolation_chain_candidate(
+        &self,
+        row_idx: usize,
+        pairs: &[(usize, usize)],
+    ) -> Option<Vec<LinearOp>> {
         let row = self.block.programs().get(row_idx)?;
         let mut program = Vec::new();
         let mut evaluated = 0;
@@ -255,7 +267,6 @@ impl PreparedScalarProgramBlock {
             let (result, _) = materialize_target_assignment(shape, &mut program)?;
             program.push(LinearOp::StoreOutput { src: result });
         }
-        // Each value is computed once across the run (SPEC_0043 §6a).
-        Some(share_program_values(program))
+        Some(program)
     }
 }
