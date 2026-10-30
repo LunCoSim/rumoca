@@ -20,6 +20,9 @@ pub(super) fn check(status: u8) -> Result<(), CompileError> {
         3 => Err(CompileError::Input(
             "native Integer quotient has a zero divisor or no representable result".into(),
         )),
+        4 => Err(CompileError::Backend(
+            "native program selector is out of bounds".into(),
+        )),
         _ => Err(CompileError::Backend(format!(
             "unknown native kernel status {status}"
         ))),

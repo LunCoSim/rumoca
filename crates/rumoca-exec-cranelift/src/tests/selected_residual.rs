@@ -2,6 +2,45 @@ use super::*;
 use rumoca_ir_solve::BinaryOp;
 
 #[test]
+fn selectable_programs_bound_native_function_preparation() {
+    use crate::native_code_cache::{tests::MemoryStore, with_native_code_cache};
+    use std::{cell::RefCell, rc::Rc};
+    let rows = (0..64)
+        .map(|index| {
+            vec![
+                LinearOp::LoadY { dst: 0, index },
+                LinearOp::StoreOutput { src: 0 },
+            ]
+        })
+        .collect();
+    let block = ScalarProgramBlock::with_program_spans(rows, vec![fixture_span(); 64]).unwrap();
+    let inputs: Vec<_> = (0..64).map(|index| index as f64 - 32.0).collect();
+    let store = Rc::new(RefCell::new(MemoryStore::default()));
+    let (residual, usage) = with_native_code_cache(store.clone(), || {
+        compile_selectable_expression_scalar_program_block(&block, None).unwrap()
+    });
+    assert_eq!(
+        usage.attempts, 2,
+        "64 small programs require two bounded dispatch functions"
+    );
+    for (index, expected) in inputs.iter().copied().enumerate() {
+        assert_eq!(
+            residual
+                .call_program_output((index, 0), &inputs, &[], 0.0, &[])
+                .unwrap(),
+            Some(expected)
+        );
+    }
+    let (jacobian, usage) = with_native_code_cache(store, || {
+        compile_jacobian_scalar_program_block(&block).unwrap()
+    });
+    assert_eq!(usage.attempts, 2);
+    let mut output = [0.0; 64];
+    jacobian.call(&inputs, &[], 0.0, &[], &mut output).unwrap();
+    assert_eq!(output.as_slice(), inputs);
+}
+
+#[test]
 fn selected_residual_does_not_split_a_shared_conditional_owner() {
     use rumoca_ir_solve::{FunctionConditionalOwnerId, FunctionConditionalProgram};
     let owner = std::sync::Arc::new(

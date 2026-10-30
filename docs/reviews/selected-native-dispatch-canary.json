@@ -1,0 +1,145 @@
+{
+  "agreement_bands": {
+    "deviation": 0,
+    "high_agreement": 12,
+    "minor_agreement": 0
+  },
+  "baseline_commit": "257ee2651197ee6fae8c6eedbe64594f0a7e8d69",
+  "candidate_base_commit": "257ee2651197ee6fae8c6eedbe64594f0a7e8d69",
+  "candidate_change": "bounded selected native dispatch",
+  "command": "CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 RAYON_NUM_THREADS=4 cargo xtask verify msl-parity --sim-targets-file infra/verification/msl-canary-20.json --no-remote-quality-baseline",
+  "compiled": 14,
+  "exit_code": 0,
+  "missing_trace_models": 0,
+  "model_status_delta": {},
+  "models_compared": 12,
+  "scope": "Fixed canary only; no full-cohort parity claim. Memory-aware scheduling admitted one worker under concurrent workloads.",
+  "sim_attempted": 14,
+  "sim_ok": 12,
+  "sim_solver_fail": 2,
+  "sim_timeout": 0,
+  "skipped_models": 0,
+  "statuses": {
+    "Modelica.Blocks.Examples.BooleanNetwork1": {
+      "error_code": "ED019",
+      "ic_status": null,
+      "phase_reached": "ToDae",
+      "sim_status": null
+    },
+    "Modelica.Blocks.Examples.Noise.AutomaticSeed": {
+      "error_code": "ED019",
+      "ic_status": null,
+      "phase_reached": "ToDae",
+      "sim_status": null
+    },
+    "Modelica.Clocked.Examples.Elementary.BooleanSignals.BackSample": {
+      "error_code": null,
+      "ic_status": "ic_ok",
+      "phase_reached": "Success",
+      "sim_status": "sim_ok"
+    },
+    "Modelica.Clocked.Examples.Elementary.BooleanSignals.TimeBasedPulse": {
+      "error_code": null,
+      "ic_status": "ic_ok",
+      "phase_reached": "Success",
+      "sim_status": "sim_ok"
+    },
+    "Modelica.Clocked.Examples.Elementary.IntegerSignals.BackSample": {
+      "error_code": null,
+      "ic_status": "ic_ok",
+      "phase_reached": "Success",
+      "sim_status": "sim_ok"
+    },
+    "Modelica.Clocked.Examples.Elementary.IntegerSignals.TimeBasedStep": {
+      "error_code": null,
+      "ic_status": "ic_ok",
+      "phase_reached": "Success",
+      "sim_status": "sim_ok"
+    },
+    "Modelica.Clocked.Examples.Elementary.RealSignals.Sample1": {
+      "error_code": null,
+      "ic_status": "ic_ok",
+      "phase_reached": "Success",
+      "sim_status": "sim_ok"
+    },
+    "Modelica.Clocked.Examples.Elementary.RealSignals.TickBasedRamp": {
+      "error_code": null,
+      "ic_status": "ic_ok",
+      "phase_reached": "Success",
+      "sim_status": "sim_ok"
+    },
+    "Modelica.Clocked.Examples.SimpleControlledDrive.ClockedWithDiscreteController": {
+      "error_code": null,
+      "ic_status": "ic_ok",
+      "phase_reached": "Success",
+      "sim_status": "sim_ok"
+    },
+    "Modelica.Electrical.Analog.Examples.DemoPowerSupply": {
+      "error_code": null,
+      "ic_status": "ic_ok",
+      "phase_reached": "Success",
+      "sim_status": "sim_ok"
+    },
+    "Modelica.Electrical.Analog.Examples.OpAmps.Comparator": {
+      "error_code": null,
+      "ic_status": "ic_ok",
+      "phase_reached": "Success",
+      "sim_status": "sim_ok"
+    },
+    "Modelica.Electrical.Analog.Examples.OpAmps.OpAmpCircuits.Add": {
+      "error_code": null,
+      "ic_status": null,
+      "phase_reached": "Success",
+      "sim_status": "sim_solver_fail"
+    },
+    "Modelica.Electrical.Analog.Examples.ShowSaturatingInductor": {
+      "error_code": null,
+      "ic_status": "ic_ok",
+      "phase_reached": "Success",
+      "sim_status": "sim_ok"
+    },
+    "Modelica.Electrical.Digital.Examples.Counter": {
+      "error_code": "ED010",
+      "ic_status": null,
+      "phase_reached": "ToDae",
+      "sim_status": null
+    },
+    "Modelica.Electrical.Digital.Examples.FullAdder": {
+      "error_code": "ED013",
+      "ic_status": null,
+      "phase_reached": "ToDae",
+      "sim_status": null
+    },
+    "Modelica.Electrical.Polyphase.Examples.TransformerYD": {
+      "error_code": null,
+      "ic_status": null,
+      "phase_reached": "Success",
+      "sim_status": "sim_solver_fail"
+    },
+    "Modelica.Math.Nonlinear.Examples.QuadratureLobatto3": {
+      "error_code": "ED020",
+      "ic_status": null,
+      "phase_reached": "ToDae",
+      "sim_status": null
+    },
+    "Modelica.Mechanics.Rotational.Examples.FirstGrounded": {
+      "error_code": null,
+      "ic_status": "ic_ok",
+      "phase_reached": "Success",
+      "sim_status": "sim_ok"
+    },
+    "Modelica.Mechanics.Rotational.Examples.Friction": {
+      "error_code": "ED001",
+      "ic_status": null,
+      "phase_reached": "ToDae",
+      "sim_status": null
+    },
+    "Modelica.StateGraph.Examples.ShowCompositeStep": {
+      "error_code": null,
+      "ic_status": "ic_ok",
+      "phase_reached": "Success",
+      "sim_status": "sim_ok"
+    }
+  },
+  "target_file": "infra/verification/msl-canary-20.json"
+}

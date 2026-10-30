@@ -34,6 +34,7 @@ mod register_constants;
 mod register_storage;
 #[cfg(test)]
 mod register_storage_tests;
+mod selected_dispatch;
 mod selected_jvp;
 mod selected_residual;
 mod status;
@@ -78,6 +79,10 @@ struct CompiledResidualJit {
 
 enum ResidualJit {
     Whole(ResidualRowFn),
+    Selected {
+        function: selected_dispatch::ResidualFn,
+        index: u32,
+    },
     Chunked(Box<[ResidualChunkFn]>),
 }
 
@@ -93,7 +98,7 @@ enum LoweredConditionalOutput {
 
 struct CompiledJacobianRow {
     plan: RowPlan,
-    jit: JacobianRowFn,
+    jit: selected_dispatch::JacobianEntry,
     validate_with_interpreter: bool,
     interpreter_supported: bool,
 }
@@ -485,14 +490,14 @@ impl CompiledJacobianRows {
                 external_tables: ctx.external_tables,
             };
             execute_row(&row.plan, regs_scratch, inputs, &mut expected)?;
-            status::check(unsafe { call_jacobian_jit(row.jit, ctx.y, ctx.p, ctx.t, ctx.v, out) })?;
+            status::check(unsafe { row.jit.call(ctx.y, ctx.p, ctx.t, ctx.v, out) })?;
             self.record_jit_call();
             for (actual, expected) in out.iter().zip(&expected) {
                 validate_jit_matches_interpreter("jacobian", *actual, *expected)?;
             }
             return Ok(());
         }
-        status::check(unsafe { call_jacobian_jit(row.jit, ctx.y, ctx.p, ctx.t, ctx.v, out) })?;
+        status::check(unsafe { row.jit.call(ctx.y, ctx.p, ctx.t, ctx.v, out) })?;
         self.record_jit_call();
         Ok(())
     }
@@ -524,6 +529,7 @@ enum RowKind {
 
 enum ResidualFuncIds {
     Whole(FuncId),
+    Selected { function: FuncId, index: u32 },
     Chunked(Vec<FuncId>),
 }
 
@@ -634,7 +640,7 @@ fn compile_residual_functions(
         row_start = rows.len();
     }
     while row_start < rows.len() {
-        if selectable || residual_program_cost(&rows[row_start]) > RESIDUAL_CHUNK_THRESHOLD {
+        if residual_program_cost(&rows[row_start]) > RESIDUAL_CHUNK_THRESHOLD {
             let output_count = plans[row_start].output_count();
             pending.push((
                 emitter.compile_residual_program(&rows[row_start], row_start)?,
@@ -644,6 +650,29 @@ fn compile_residual_functions(
             ));
             output_start += output_count;
             row_start += 1;
+            continue;
+        }
+        if selectable {
+            let end = selected_dispatch::group_end(rows, row_start);
+            let function = emitter.compile_selected_group(
+                &rows[row_start..end],
+                RowKind::Residual,
+                &format!("rumoca_selected_residual_{row_start}"),
+            )?;
+            for (index, plan) in plans[row_start..end].iter().enumerate() {
+                let count = plan.output_count();
+                pending.push((
+                    ResidualFuncIds::Selected {
+                        function,
+                        index: index as u32,
+                    },
+                    plan.register_count(),
+                    output_start,
+                    count,
+                ));
+                output_start += count;
+            }
+            row_start = end;
             continue;
         }
         let mut row_end = row_start;
@@ -700,6 +729,10 @@ fn finalize_residual_jits(
             ResidualFuncIds::Whole(func_id) => {
                 ResidualJit::Whole(finalized_residual_fn(module, func_id)?)
             }
+            ResidualFuncIds::Selected { function, index } => ResidualJit::Selected {
+                function: selected_dispatch::finalize_residual(module, function)?,
+                index,
+            },
             ResidualFuncIds::Chunked(func_ids) => ResidualJit::Chunked(
                 func_ids
                     .into_iter()
@@ -849,20 +882,26 @@ fn compile_jacobian_rows_attached(
     let mut emitter = CraneliftEmitter::new(pure_calls.as_deref())?;
     let plans = plan_rows(rows)?;
     let mut func_ids = checked_vec_with_capacity(rows.len(), "Jacobian row function ids")?;
-    for (index, row) in rows.iter().enumerate() {
+    for row in rows {
         validate_row_supported_by_jit(row, RowKind::JacobianV)?;
+    }
+    let mut start = 0;
+    while start < rows.len() {
+        let end = selected_dispatch::group_end(rows, start);
         let name = match projection {
-            Some(block) => format!("rumoca_projection_{block}_jacobian_row_{index}"),
-            None => format!("rumoca_jacobian_row_{index}"),
+            Some(block) => format!("rumoca_projection_{block}_jacobian_group_{start}"),
+            None => format!("rumoca_jacobian_group_{start}"),
         };
-        let func_id = emitter.compile_row(row, RowKind::JacobianV, &name)?;
-        func_ids.push(func_id);
+        let function =
+            emitter.compile_selected_group(&rows[start..end], RowKind::JacobianV, &name)?;
+        func_ids.extend((0..end - start).map(|index| (function, index as u32)));
+        start = end;
     }
     finalize_jit_module(&mut emitter.module)?;
     let input_requirements = input_requirements_for_plans(&plans);
     let mut compiled_rows = checked_vec_with_capacity(rows.len(), "compiled Jacobian rows")?;
-    for (index, (plan, func_id)) in plans.into_iter().zip(func_ids).enumerate() {
-        let jit = finalized_jacobian_fn(&emitter.module, func_id)?;
+    for (index, (plan, (func_id, selector))) in plans.into_iter().zip(func_ids).enumerate() {
+        let jit = selected_dispatch::JacobianEntry::finalize(&emitter.module, func_id, selector)?;
         compiled_rows.push(CompiledJacobianRow {
             plan,
             jit,
@@ -910,9 +949,8 @@ fn finalized_residual_fn(
             "Cranelift returned a null residual function pointer".to_string(),
         ));
     }
-    // SAFETY: compile_row declared this function with the ResidualRowFn ABI:
-    // (y pointer, p pointer, time) -> f64. The JITModule owns the code memory
-    // for at least as long as the CompiledResidualRows containing this pointer.
+    // SAFETY: residual emission declares the ResidualRowFn ABI with an output
+    // pointer and status return. CompiledResidualRows retains the code arena.
     Ok(unsafe { std::mem::transmute::<*const u8, ResidualRowFn>(ptr) })
 }
 
@@ -926,10 +964,9 @@ fn finalized_jacobian_fn(
             "Cranelift returned a null Jacobian function pointer".to_string(),
         ));
     }
-    // SAFETY: compile_row declared this function with the JacobianRowFn ABI:
-    // (y pointer, p pointer, time, seed pointer) -> f64. The JITModule owns the
-    // code memory for at least as long as the CompiledJacobianRows containing
-    // this pointer.
+    // SAFETY: projection batch emission declares the JacobianRowFn ABI with
+    // seed/output pointers and a status return. Its compiled application
+    // retains the shared projection module and therefore the code arena.
     Ok(unsafe { std::mem::transmute::<*const u8, JacobianRowFn>(ptr) })
 }
 
@@ -976,6 +1013,11 @@ unsafe fn call_residual_jit(
             // SAFETY: prevalidation proves all input/output accesses.
             unsafe { jit(y.as_ptr(), p.as_ptr(), t, out.as_mut_ptr()) }
         }
+        ResidualJit::Selected { function, index } => {
+            // SAFETY: prevalidation checks this program's extents; its selector
+            // is issued with the function, and no other arm is evaluated.
+            unsafe { function(y.as_ptr(), p.as_ptr(), t, out.as_mut_ptr(), *index) }
+        }
         ResidualJit::Chunked(chunks) => {
             // Chunk functions exchange compiler registers through this tape.
             // Each register is written before its first read by validated SSA.
@@ -999,20 +1041,6 @@ unsafe fn call_residual_jit(
             0
         }
     }
-}
-
-unsafe fn call_jacobian_jit(
-    jit: JacobianRowFn,
-    y: &[f64],
-    p: &[f64],
-    t: f64,
-    v: &[f64],
-    out: &mut [f64],
-) -> u8 {
-    // SAFETY: the caller guarantees the function pointer came from
-    // finalized_jacobian_fn, prevalidation ensures any loaded y/p/seed indices
-    // are in bounds, and `out` has room for this program's outputs.
-    unsafe { jit(y.as_ptr(), p.as_ptr(), t, v.as_ptr(), out.as_mut_ptr()) }
 }
 
 fn validate_jit_matches_interpreter(
@@ -1462,51 +1490,7 @@ impl CraneliftEmitter {
             fb.seal_block(entry);
 
             let params = fb.block_params(entry).to_vec();
-            let y_ptr = params[0];
-            let p_ptr = params[1];
-            let t_value = params[2];
-            let (v_ptr, out_ptr) = if kind.has_seed() {
-                (Some(params[3]), params[4])
-            } else {
-                (None, params[3])
-            };
-
-            let mut regs: HashMap<u32, cranelift_codegen::ir::Value> = HashMap::new();
-            let mut loaded_y = HashMap::new();
-            let mut loaded_p = HashMap::new();
-            let flags = MemFlags::new();
-            let backing_regs_ptr = create_row_register_tape(&mut fb, pointer_type, row)?;
-            let mut row_lower = RowLowerCtx {
-                fb: &mut fb,
-                module: &mut self.module,
-                math: &mut self.math,
-                regs: &mut regs,
-                y_ptr,
-                p_ptr,
-                t_value,
-                v_ptr,
-                backing_regs_ptr,
-                flags,
-                loaded_y: backing_regs_ptr.is_none().then_some(&mut loaded_y),
-                loaded_p: backing_regs_ptr.is_none().then_some(&mut loaded_p),
-                fold_carried: None,
-                fold_indices: None,
-                fold_index_constants: None,
-                fold_captures: None,
-                fold_captures_ptr: None,
-                conditional_captures: None,
-                conditional_captures_ptr: None,
-                fold_functions: &self.fold_functions,
-                conditional_functions: &self.conditional_functions,
-                pure_call_functions: &self.pure_call_functions,
-                pure_call_results: HashMap::new(),
-                nested_fold_results: HashMap::new(),
-                conditional_results: HashMap::new(),
-                fold_carried_versions: Vec::new(),
-                known_constants: HashMap::new(),
-            };
-
-            row_lower.lower_row_outputs(row, out_ptr)?;
+            self.lower_independent_row(&mut fb, row, kind, &params)?;
             status::succeed(&mut fb);
             fb.finalize();
         }
