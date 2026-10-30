@@ -408,6 +408,13 @@ once and writes exactly the per-step isolators' values; the linked kernel and
 the generated C consume the same runs, and an evaluation failure inside a run
 falls back to its steps one by one.
 
+Assignment isolation uses the checked structural dependency owner to exclude
+solver-Y targets absent from the selected output before deriving an isolator.
+Unknown dependency sets remain candidates; source-prefix, coefficient and
+materialization checks still decide their admission. Tensor range outputs do
+not acquire assignment certificates for unrelated coordinates merely because
+those coordinates are loaded by the same range operation.
+
 Run admission constructs and checks each candidate once without sharing values
 of a discarded candidate. Executable chains still share values through the
 checked transformation. Chain-output, directional-JVP, projection Jacobian and

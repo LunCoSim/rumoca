@@ -24,6 +24,11 @@ fn canonical_assignment_shape(
     target_y_index: usize,
     dependencies: &ScalarProgramYDependency<'_>,
 ) -> Option<TargetAssignmentShape> {
+    // The checked dependency owner can exclude a target before isolator
+    // construction. Unbounded dependencies remain candidates.
+    if !dependencies.depends_on(output, target_y_index) {
+        return None;
+    }
     let direct = assignment_expression_registers(prefix, output)
         .into_iter()
         .flatten()
@@ -676,4 +681,54 @@ fn producer(program: ProgramPrefix<'_>, register: u32) -> Option<&LinearOp> {
 
 fn producer_position(program: ProgramPrefix<'_>, register: u32) -> Option<usize> {
     program.producer_position(register)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tensor_output_assignments_only_target_its_dependencies() {
+        const COUNT: usize = 64;
+        let program = vec![
+            LinearOp::LoadP { dst: 0, index: 0 },
+            LinearOp::TensorLoad {
+                dst_start: 1,
+                input: crate::TensorInputKind::Y,
+                input_start: 0,
+                count: COUNT,
+                seed_start: None,
+                lanes: 1,
+            },
+            LinearOp::TensorBinary {
+                dst_start: 1 + COUNT as u32,
+                op: BinaryOp::Mul,
+                lhs_start: 0,
+                rhs_start: 1,
+                count: COUNT,
+                lhs_stride: 0,
+                rhs_stride: 1,
+                lanes: 1,
+            },
+            LinearOp::StoreOutputRange {
+                start: 1 + COUNT as u32,
+                count: COUNT,
+                stride: 1,
+            },
+        ];
+        let started = std::time::Instant::now();
+        let shapes = derive_target_assignment_shapes(&program);
+        eprintln!(
+            "tensor_assignment_preparation_us={}",
+            started.elapsed().as_micros()
+        );
+        assert_eq!(shapes.len(), COUNT);
+        for (output, shape) in shapes {
+            assert_eq!(shape.target_y_index(), output);
+            assert!(
+                canonical_assignment_shape_for_output(&program, output, (output + 1) % COUNT)
+                    .is_none()
+            );
+        }
+    }
 }

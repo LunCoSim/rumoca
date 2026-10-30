@@ -100,11 +100,10 @@ fn state() -> Vec<f64> {
 }
 
 #[test]
-fn residual_preparation_materializes_one_program_per_slice_output() {
+fn residual_preparation_materializes_only_each_slice_outputs_dependencies() {
     let full = PreparedScalarProgramBlock::new(stencil_block()).unwrap();
-    // Each output isolates every state it reads: the certificates grow with
-    // the square of the slice length.
-    assert!(tensor_affine_count(&full) >= INTERIOR * INTERIOR);
+    // Each interior stencil output reads exactly three adjacent states.
+    assert_eq!(tensor_affine_count(&full), 3 * INTERIOR);
 }
 
 #[test]
