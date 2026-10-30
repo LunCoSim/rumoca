@@ -16,13 +16,15 @@ use crate::RuntimeSolveError;
 /// One schedule prepared for the interpreter: its segments as programs and
 /// the solver slot of every output, in segment order.
 pub(crate) struct InterpretedSchedule {
+    sequence: solve::RefreshSequenceId,
     block: PreparedEvaluationBlock,
     shared: solve::SharedAssignmentSchedule,
 }
 
 /// The prepared schedules of one runtime, by refresh sequence. Construction
-/// proves each issued schedule once and retains it for interpreter and native
-/// preparation; a sequence without an issued schedule has no entry.
+/// proves each distinct ordered program identity once and shares it across
+/// issued sequences for interpreter and native preparation. A sequence without
+/// an issued schedule has no entry.
 #[derive(Default)]
 pub(crate) struct InterpretedSchedules {
     prepared: FxHashMap<solve::RefreshSequenceId, Rc<InterpretedSchedule>>,
@@ -40,6 +42,16 @@ impl Clone for InterpretedSchedules {
 }
 
 impl InterpretedSchedules {
+    /// The first issued sequence with this exact ordered program identity.
+    pub(super) fn canonical_sequence(
+        &self,
+        sequence: solve::RefreshSequenceId,
+    ) -> Option<solve::RefreshSequenceId> {
+        self.prepared
+            .get(&sequence)
+            .map(|schedule| schedule.sequence)
+    }
+
     pub(super) fn shared(
         &self,
         sequence: solve::RefreshSequenceId,
@@ -54,9 +66,27 @@ impl InterpretedSchedules {
         let continuous = &model.problem.continuous;
         let owners = &continuous.refresh_owners;
         let mut prepared = FxHashMap::default();
+        // Program IDs bind source, targets and provenance within these owners.
+        // Equal ordered IDs therefore need one construction proof and one
+        // native preparation, while each issued sequence retains its lookup.
+        let mut unique = FxHashMap::<
+            &[solve::ExactRefreshAssignmentProgramId],
+            Rc<InterpretedSchedule>,
+        >::default();
         for schedule in owners.exact_assignment_schedules() {
-            let interpreted = prepare_schedule(schedule, &continuous.implicit_rhs, owners)?;
-            prepared.insert(schedule.sequence_id(), Rc::new(interpreted));
+            let interpreted = match unique.entry(schedule.program_ids()) {
+                std::collections::hash_map::Entry::Occupied(entry) => Rc::clone(entry.get()),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let interpreted = Rc::new(prepare_schedule(
+                        schedule,
+                        &continuous.implicit_rhs,
+                        owners,
+                    )?);
+                    entry.insert(Rc::clone(&interpreted));
+                    interpreted
+                }
+            };
+            prepared.insert(schedule.sequence_id(), interpreted);
         }
         Ok(Self {
             prepared,
@@ -66,8 +96,8 @@ impl InterpretedSchedules {
 }
 
 impl SolveRuntime {
-    /// How many issued exact assignment schedules the interpreter proved and
-    /// prepared when this runtime was built.
+    /// How many issued exact assignment sequences have prepared execution
+    /// in this runtime. Identical ordered program IDs share preparation.
     #[must_use]
     pub fn interpreted_schedule_count(&self) -> usize {
         self.interpreted_assignment_schedules.prepared.len()
@@ -121,5 +151,9 @@ fn prepare_schedule(
         Err(error) => return Err(invalid(error.to_string())),
     };
     let block = PreparedEvaluationBlock::new(shared.block().clone())?;
-    Ok(InterpretedSchedule { block, shared })
+    Ok(InterpretedSchedule {
+        sequence: schedule.sequence_id(),
+        block,
+        shared,
+    })
 }

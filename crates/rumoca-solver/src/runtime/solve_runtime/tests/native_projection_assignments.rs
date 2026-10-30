@@ -313,3 +313,63 @@ fn singular_coefficients_preserve_the_projection_decline() {
     assert_eq!(backend.compilations.get(), 1);
     assert_eq!(backend.calls.get(), 4);
 }
+
+#[test]
+fn identical_issued_schedules_share_preparation_within_one_runtime() {
+    let model = warm_start_test_model();
+    let runtime = SolveRuntime::new_fixture(&model).unwrap();
+    let mut programs = FxHashMap::default();
+    let backend = AssignmentBackend::default();
+    let mut repeated = 0;
+    for schedule in runtime
+        .model
+        .problem
+        .continuous
+        .refresh_owners
+        .exact_assignment_schedules()
+    {
+        let block = runtime
+            .interpreted_assignment_schedules
+            .shared(schedule.sequence_id())
+            .unwrap()
+            .block();
+        let storage = block.programs().as_ptr();
+        assert!(
+            runtime
+                .compiled_assignment_schedule(&backend, schedule.sequence_id())
+                .is_none()
+        );
+        if let Some(previous) = programs.insert(schedule.program_ids().to_vec(), storage) {
+            repeated += 1;
+            assert_eq!(
+                storage, previous,
+                "identical issued program order prepares once"
+            );
+        }
+    }
+    assert!(repeated > 0, "fixture must issue a repeated schedule");
+    assert_eq!(
+        backend.schedule_blocks.borrow().len(),
+        programs.len(),
+        "native preparation runs once for each exact ordered program identity"
+    );
+    let other = SolveRuntime::new_fixture(&model).unwrap();
+    for schedule in other
+        .model
+        .problem
+        .continuous
+        .refresh_owners
+        .exact_assignment_schedules()
+    {
+        let block = other
+            .interpreted_assignment_schedules
+            .shared(schedule.sequence_id())
+            .unwrap()
+            .block();
+        assert_ne!(
+            block.programs().as_ptr(),
+            programs[schedule.program_ids()],
+            "program IDs are scoped to their immutable model and runtime"
+        );
+    }
+}

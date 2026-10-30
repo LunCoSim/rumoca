@@ -654,11 +654,14 @@ impl SolveRuntime {
         Ok(true)
     }
 
-    fn compiled_assignment_schedule(
+    pub(super) fn compiled_assignment_schedule(
         &self,
         backend: &dyn SolveExecutionBackend,
         sequence: solve::RefreshSequenceId,
     ) -> Option<Rc<dyn CompiledSolveAssignmentSchedule>> {
+        let sequence = self
+            .interpreted_assignment_schedules
+            .canonical_sequence(sequence)?;
         if let Some(cached) = self
             .compiled_assignment_schedules
             .borrow()
