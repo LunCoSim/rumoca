@@ -346,9 +346,9 @@ impl ManifoldProjectionModel for RuntimeManifoldProjection<'_> {
 pub(super) enum ProjectionJacobian<'a> {
     SolverY {
         block: &'a PreparedComputeBlock,
-        scalar: &'a PreparedScalarProgramBlock,
+        scalar: &'a PreparedEvaluationBlock,
     },
-    SolverYAndParameters(&'a PreparedScalarProgramBlock),
+    SolverYAndParameters(&'a PreparedEvaluationBlock),
 }
 
 impl<'a> ProjectionJacobian<'a> {
@@ -366,7 +366,7 @@ impl<'a> ProjectionJacobian<'a> {
         }
     }
 
-    fn scalar(self) -> &'a PreparedScalarProgramBlock {
+    fn scalar(self) -> &'a PreparedEvaluationBlock {
         match self {
             Self::SolverY { scalar, .. } | Self::SolverYAndParameters(scalar) => scalar,
         }

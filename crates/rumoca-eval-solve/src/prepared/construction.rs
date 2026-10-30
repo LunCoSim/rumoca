@@ -340,6 +340,37 @@ impl PreparedEvaluationBlock {
         self.0.eval_with_context(y, p, t, context, out)
     }
 
+    /// Number of scalar outputs in the evaluated block.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The program and output offset of one flattened scalar output.
+    #[must_use]
+    pub fn row_output_position(&self, output: usize) -> Option<(usize, usize)> {
+        self.0.row_output_position(output)
+    }
+
+    /// [`PreparedScalarProgramBlock::eval_row_output_unchecked_with_context`].
+    pub fn eval_row_output_unchecked_with_context(
+        &self,
+        row_idx: usize,
+        output_offset: usize,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        context: RowEvalContext<'_>,
+    ) -> Result<f64, EvalSolveError> {
+        self.0
+            .eval_row_output_unchecked_with_context(row_idx, output_offset, y, p, t, context)
+    }
+
     /// [`PreparedScalarProgramBlock::reverse_vjp`].
     pub fn reverse_vjp(
         &self,

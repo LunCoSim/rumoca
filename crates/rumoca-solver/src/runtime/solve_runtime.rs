@@ -351,7 +351,7 @@ pub struct SolveRuntime {
     pub solver_count: usize,
     implicit_rhs: PreparedComputeBlock,
     implicit_projection_jacobian_v: PreparedComputeBlock,
-    implicit_projection_scalar_jacobian_v: PreparedScalarProgramBlock,
+    implicit_projection_scalar_jacobian_v: PreparedEvaluationBlock,
     implicit_scalar_rhs: PreparedScalarProgramBlock,
     /// Tangent plan of each algebraic projection block's tearing, aligned
     /// with the block list; `None` for an untorn block or one without a plan.
@@ -390,7 +390,7 @@ pub struct SolveRuntime {
     /// Per-row forward-mode AD Jacobian-vector product of `implicit_rhs`
     /// (`d(residual_row)/d[y|p]·v`). Used to propagate state and parameter seeds
     /// through the algebraic projection row by row.
-    implicit_jacobian_v: PreparedScalarProgramBlock,
+    implicit_jacobian_v: PreparedEvaluationBlock,
     continuous_structural: solve::ContinuousStructuralArtifacts,
     initialization_structural: solve::InitializationStructuralArtifacts,
     algebraic_newton_caches: Vec<RefCell<crate::runtime::projection::SparseNewtonCache>>,
@@ -604,8 +604,8 @@ impl SolveRuntime {
             &model.artifacts.continuous.implicit_jacobian_v,
             &continuous_structural,
         )?;
-        let projection_reuse = BlockReuse::of(
-            primary.map(|primary| &primary.implicit_projection_scalar_jacobian_v),
+        let projection_reuse = BlockReuse::of_programs(
+            primary.map(|primary| primary.implicit_projection_scalar_jacobian_v.block()),
             &implicit_projection_scalar_jacobian,
         );
         let compiled_implicit_projection_jacobian_v = projection_reuse.jacobian(
@@ -624,8 +624,8 @@ impl SolveRuntime {
             .continuous
             .implicit_jacobian_v_scalar
             .clone();
-        let full_reuse = BlockReuse::of(
-            primary.map(|primary| &primary.implicit_jacobian_v),
+        let full_reuse = BlockReuse::of_programs(
+            primary.map(|primary| primary.implicit_jacobian_v.block()),
             &implicit_full_jacobian_v,
         );
         let compiled_implicit_full_jacobian_v = full_reuse.jacobian(
@@ -881,7 +881,7 @@ impl SolveRuntime {
             block_splits,
             active_split: std::cell::Cell::new(None),
             split_row_scratch: std::cell::RefCell::new(Vec::new()),
-            implicit_projection_scalar_jacobian_v: projection_reuse.prepared(
+            implicit_projection_scalar_jacobian_v: projection_reuse.prepared_evaluation(
                 primary.map(|primary| &primary.implicit_projection_scalar_jacobian_v),
                 implicit_projection_scalar_jacobian,
             )?,
@@ -919,7 +919,7 @@ impl SolveRuntime {
                 |primary| &primary.derivative_scalar,
                 derivative_scalar_rhs,
             )?,
-            implicit_jacobian_v: full_reuse.prepared(
+            implicit_jacobian_v: full_reuse.prepared_evaluation(
                 primary.map(|primary| &primary.implicit_jacobian_v),
                 implicit_full_jacobian_v,
             )?,

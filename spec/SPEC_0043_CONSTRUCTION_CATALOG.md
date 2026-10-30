@@ -410,9 +410,11 @@ falls back to its steps one by one.
 
 Run admission constructs and checks each candidate once without sharing values
 of a discarded candidate. Executable chains still share values through the
-checked transformation. Chain-output and directional-JVP evaluators use the
-evaluation-only prepared block: assignment certificates belong to their source
-residual owner, and neither consumer queries assignments of its output program.
+checked transformation. Chain-output, directional-JVP, projection Jacobian and
+state-manifold Jacobian evaluators use the evaluation-only prepared block. Its
+selected-output reads retain source validation and output ordering; assignment
+certificates belong to the source residual owner. These output evaluators do
+not query assignments of their output programs.
 
 A projection block's residual split constructs from the block's checked row
 programs and its unknown set (`y_indices`), once per (block, program). The

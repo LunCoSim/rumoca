@@ -145,10 +145,27 @@ fn evaluation_blocks_evaluate_the_residual_block_outputs() {
         .eval_with_context(&y, &p, 0.0, RowEvalContext::default(), &mut full)
         .unwrap();
     let mut evaluation = vec![0.0; INTERIOR];
-    PreparedEvaluationBlock::new(stencil_block())
-        .unwrap()
+    let block = PreparedEvaluationBlock::new(stencil_block()).unwrap();
+    block
         .eval_with_context(&y, &p, 0.0, RowEvalContext::default(), &mut evaluation)
         .unwrap();
+    assert_eq!(block.len(), INTERIOR);
+    assert!(!block.is_empty());
+    for (output, expected) in expected.iter().enumerate() {
+        let (row, offset) = block.row_output_position(output).unwrap();
+        let selected = block
+            .eval_row_output_unchecked_with_context(
+                row,
+                offset,
+                &y,
+                &p,
+                0.0,
+                RowEvalContext::default(),
+            )
+            .unwrap();
+        assert_eq!(selected.to_bits(), expected.to_bits());
+    }
+    assert_eq!(block.row_output_position(INTERIOR), None);
     let mut compute = vec![0.0; INTERIOR];
     PreparedComputeBlock::new(&ComputeBlock {
         nodes: vec![ComputeNode::ScalarPrograms(stencil_block())],

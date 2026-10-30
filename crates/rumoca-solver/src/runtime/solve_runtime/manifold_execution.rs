@@ -5,7 +5,7 @@ use super::*;
 pub(super) struct PreparedManifoldProjection {
     residual: PreparedComputeBlock,
     directional: PreparedComputeBlock,
-    directional_scalar: PreparedScalarProgramBlock,
+    directional_scalar: PreparedEvaluationBlock,
     output_scratch: RefCell<Vec<f64>>,
     compiled_residual: Option<Rc<dyn CompiledSolveExpression>>,
     compiled_directional: Option<Rc<dyn CompiledSolveJacobianExpression>>,
@@ -43,7 +43,7 @@ impl PreparedManifoldProjection {
                 directional,
                 "runtime_manifold_jacobian_v",
             )?,
-            directional_scalar: PreparedScalarProgramBlock::new(to_scalar_program_block(
+            directional_scalar: PreparedEvaluationBlock::new(to_scalar_program_block(
                 directional,
             )?)?,
             output_scratch: RefCell::default(),
