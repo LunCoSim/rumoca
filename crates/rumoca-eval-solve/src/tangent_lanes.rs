@@ -85,9 +85,10 @@ pub struct TornTangentJacobian {
     pub recovered: Vec<f64>,
 }
 
-/// Answers one JVP program of a one-direction plan: `(program, seed, out)`,
-/// `false` to decline.
-pub type DirectionCall<'a> = dyn FnMut(usize, &[f64], &mut Vec<f64>) -> bool + 'a;
+/// Answers one prepared tangent program: `(program, seed, out)`. A decline
+/// precedes execution; an admitted execution error must propagate.
+pub type TangentProgramCall<'a> =
+    dyn FnMut(usize, &[f64], &mut Vec<f64>) -> Result<bool, EvalSolveError> + 'a;
 
 /// A [`TornTangentPlan`] prepared for repeated evaluation.
 pub struct TornTangentEvaluator {
@@ -149,17 +150,17 @@ impl TornTangentEvaluator {
         &self,
         point: TangentPoint<'_>,
     ) -> Result<Option<TornTangentJacobian>, EvalSolveError> {
-        self.eval_through(point, &mut |_, _, _| false)
+        self.eval_through(point, &mut |_, _, _| Ok(false))
     }
 
-    /// [`Self::eval`] with `call` answering a one-direction plan's JVP
+    /// [`Self::eval`] with `call` answering the plan's prepared tangent
     /// programs: `call(program, seed, out)` writes the program's outputs under
     /// `seed` and returns `true`, or returns `false` to leave the program to
     /// the prepared evaluator. It must give the prepared evaluator's values.
     pub fn eval_through(
         &self,
         point: TangentPoint<'_>,
-        call: &mut DirectionCall<'_>,
+        call: &mut TangentProgramCall<'_>,
     ) -> Result<Option<TornTangentJacobian>, EvalSolveError> {
         if let Some(directions) = &self.directions {
             return self.eval_directions(directions, point, call);
@@ -178,7 +179,7 @@ impl TornTangentEvaluator {
             if step.group > 0 {
                 let group = &steps[index..index + step.group];
                 seed_group(&mut seed, group, (lanes, tears), 1.0);
-                outputs = self.eval_lanes(point, &seed, step.source.program, &mut out)?;
+                outputs = self.eval_lanes(point, &seed, step.source.program, &mut out, call)?;
                 seed_group(&mut seed, group, (lanes, tears), 0.0);
             }
             let tangent = |lane: usize| out[lane * outputs + step.source.output];
@@ -195,7 +196,7 @@ impl TornTangentEvaluator {
         let mut residual = vec![0.0; tears * tears];
         for (row, entry) in self.plan.residuals().iter().enumerate() {
             if entry.group > 0 {
-                outputs = self.eval_lanes(point, &seed, entry.source.program, &mut out)?;
+                outputs = self.eval_lanes(point, &seed, entry.source.program, &mut out, call)?;
             }
             for lane in 0..tears {
                 residual[row * tears + lane] = out[lane * outputs + entry.source.output];
@@ -215,14 +216,14 @@ impl TornTangentEvaluator {
         &self,
         directions: &crate::PreparedScalarProgramBlock,
         point: TangentPoint<'_>,
-        call: &mut DirectionCall<'_>,
+        call: &mut TangentProgramCall<'_>,
     ) -> Result<Option<TornTangentJacobian>, EvalSolveError> {
         let tears = self.plan.lanes() - 1;
         let steps = self.plan.steps();
         let mut seed = vec![0.0; point.y.len()];
         let mut out = Vec::new();
         let mut direction = |seed: &[f64], program: usize, out: &mut Vec<f64>| {
-            if call(program, seed, out) {
+            if call(program, seed, out)? {
                 return Ok(());
             }
             directions.eval_row_outputs_unchecked_with_context(
@@ -293,10 +294,14 @@ impl TornTangentEvaluator {
         seed: &[f64],
         program: usize,
         out: &mut Vec<f64>,
+        call: &mut TangentProgramCall<'_>,
     ) -> Result<usize, EvalSolveError> {
         let prepared = &self.programs[program];
         let outputs = prepared.program().lane_outputs();
         out.resize(self.plan.lanes() * outputs, 0.0);
+        if call(program, seed, out)? {
+            return Ok(outputs);
+        }
         prepared.eval(
             point.y,
             point.p,
