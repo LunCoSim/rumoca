@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::{LinearOp, TargetAssignmentShape};
 
@@ -74,7 +75,7 @@ fn collect_y_load_indices(program: &[LinearOp], indices: &mut BTreeSet<usize>) {
 /// refresh construction consumes that owner instead of maintaining another
 /// interpretation of compact tensor and call operations.
 pub struct ScalarProgramYDependency<'a> {
-    dependencies: Option<Vec<Option<BTreeSet<usize>>>>,
+    dependencies: Option<Vec<Option<Arc<BTreeSet<usize>>>>>,
     program: std::marker::PhantomData<&'a [LinearOp]>,
 }
 
@@ -94,7 +95,7 @@ impl<'a> ScalarProgramYDependency<'a> {
             .as_ref()
             .and_then(|dependencies| dependencies.get(register as usize))
             .and_then(Option::as_ref)
-            .cloned()
+            .map(|dependencies| dependencies.as_ref().clone())
     }
 
     pub fn depends_on(&self, register: u32, target: usize) -> bool {

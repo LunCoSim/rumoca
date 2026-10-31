@@ -1,0 +1,61 @@
+{
+  "base": "ff830339c5086e6223177c895c989f7ba52c6e1b",
+  "candidate": "shared dependency sets working tree",
+  "cohort": "fixed 20-model canary, not full parity",
+  "totals": {
+    "total_models": {
+      "before": 20,
+      "after": 20
+    },
+    "compiled_models": {
+      "before": 14,
+      "after": 14
+    },
+    "sim_ok": {
+      "before": 12,
+      "after": 12
+    },
+    "sim_solver_fail": {
+      "before": 2,
+      "after": 2
+    },
+    "sim_timeout": {
+      "before": 0,
+      "after": 0
+    },
+    "sim_nan": {
+      "before": 0,
+      "after": 0
+    },
+    "error_code_counts": {
+      "before": {
+        "ED001": 1,
+        "ED010": 1,
+        "ED013": 1,
+        "ED019": 2,
+        "ED020": 1,
+        "EL005": 2
+      },
+      "after": {
+        "ED001": 1,
+        "ED010": 1,
+        "ED013": 1,
+        "ED019": 2,
+        "ED020": 1,
+        "EL005": 2
+      }
+    }
+  },
+  "status_deltas": {},
+  "band_deltas": {},
+  "comparison": {
+    "models_compared": 12,
+    "missing_trace_models": 0,
+    "skipped_models": 0,
+    "agreement_bands": {
+      "high_agreement": 12,
+      "minor_agreement": 0,
+      "deviation": 0
+    }
+  }
+}

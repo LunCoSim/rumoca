@@ -1,6 +1,7 @@
 // SPEC_0021 file-size exception - split plan: split the derivation walk by construction owner (scalar-JVP derivation into structural_pattern/scalar_jvp.rs, seed/output dependency derivation into structural_pattern/dependency.rs, wire records into structural_pattern/wire.rs), leaving construction + provenance here; tracked as the pattern-authority follow-up slice (SPEC_0021 follow-up).
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use rumoca_core::{Span, StructuredIndexDomain};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -848,10 +849,7 @@ impl StructuralPattern {
             DependencySource::SolverP,
         )?
         .into_iter()
-        .map(|dependencies| {
-            let DependencyState::Known(indices) = dependencies;
-            Ok(indices)
-        })
+        .map(|dependencies| Ok(dependencies.into_set()))
         .collect()
     }
 
@@ -863,10 +861,7 @@ impl StructuralPattern {
     ) -> Result<Vec<BTreeSet<usize>>, StructuralPatternError> {
         program_output_dependencies(program, span)?
             .into_iter()
-            .map(|dependencies| {
-                let DependencyState::Known(indices) = dependencies;
-                Ok(indices)
-            })
+            .map(|dependencies| Ok(dependencies.into_set()))
             .collect()
     }
 
@@ -1471,7 +1466,9 @@ fn banded_nonzero_count(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DependencyState {
-    Known(BTreeSet<usize>),
+    // Register copies share immutable sets through construction and refresh
+    // queries. Union detaches before mutation; public result sets remain owned.
+    Known(Arc<BTreeSet<usize>>),
 }
 
 #[derive(Clone, Copy)]
@@ -1499,17 +1496,22 @@ fn derive_output_dependency_presence(
 
 impl DependencyState {
     fn empty() -> Self {
-        Self::Known(BTreeSet::new())
+        Self::Known(Arc::new(BTreeSet::new()))
     }
 
     fn singleton(index: usize) -> Self {
-        Self::Known(BTreeSet::from([index]))
+        Self::Known(Arc::new(BTreeSet::from([index])))
     }
 
     fn union(self, other: Self) -> Self {
         match (self, other) {
             (Self::Known(mut lhs), Self::Known(rhs)) => {
-                lhs.extend(rhs);
+                if lhs.is_empty() {
+                    return Self::Known(rhs);
+                }
+                if !rhs.is_empty() && !Arc::ptr_eq(&lhs, &rhs) {
+                    Arc::make_mut(&mut lhs).extend(rhs.iter().copied());
+                }
                 Self::Known(lhs)
             }
         }
@@ -1517,7 +1519,7 @@ impl DependencyState {
 
     fn into_set(self) -> BTreeSet<usize> {
         let Self::Known(indices) = self;
-        indices
+        Arc::unwrap_or_clone(indices)
     }
 }
 
@@ -1559,10 +1561,7 @@ fn program_output_y_dependencies(
         DependencySource::SolverY,
     )?
     .into_iter()
-    .map(|dependencies| {
-        let DependencyState::Known(indices) = dependencies;
-        Ok(indices)
-    })
+    .map(|dependencies| Ok(dependencies.into_set()))
     .collect()
 }
 
@@ -1571,7 +1570,7 @@ fn program_output_y_dependencies(
 /// consumed fail-closed by refresh construction.
 pub(crate) fn program_register_y_dependencies(
     program: &[LinearOp],
-) -> Result<Vec<Option<BTreeSet<usize>>>, StructuralPatternError> {
+) -> Result<Vec<Option<Arc<BTreeSet<usize>>>>, StructuralPatternError> {
     let mut walk = DependencyWalk {
         registers: Vec::new(),
         outputs: Vec::new(),
@@ -1877,7 +1876,8 @@ impl DependencyWalk<'_> {
         let mut dependencies = self.get(index)?;
         if matches!(self.source, DependencySource::SolverP) {
             let end = checked_indexed_seed_end(base, count, self.span)?;
-            dependencies = dependencies.union(DependencyState::Known((base..end).collect()));
+            dependencies =
+                dependencies.union(DependencyState::Known(Arc::new((base..end).collect())));
         }
         self.set(dst, dependencies);
         Ok(())
@@ -2046,7 +2046,8 @@ impl DependencyWalk<'_> {
         let mut dependencies = self.get(index)?;
         if matches!(self.source, DependencySource::Seed) {
             let end = checked_indexed_seed_end(base, count, self.span)?;
-            dependencies = dependencies.union(DependencyState::Known((base..end).collect()));
+            dependencies =
+                dependencies.union(DependencyState::Known(Arc::new((base..end).collect())));
         }
         self.set(dst, dependencies);
         Ok(())
@@ -3184,6 +3185,71 @@ impl<'de> Deserialize<'de> for StructuralPattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_register_copies_preserve_independent_unions() {
+        let program = [
+            LinearOp::LoadY { dst: 0, index: 0 },
+            LinearOp::Move { dst: 1, src: 0 },
+            LinearOp::LoadY { dst: 2, index: 1 },
+            LinearOp::Binary {
+                dst: 0,
+                op: BinaryOp::Add,
+                lhs: 0,
+                rhs: 2,
+            },
+            LinearOp::StoreOutput { src: 1 },
+            LinearOp::StoreOutput { src: 0 },
+        ];
+        assert_eq!(
+            program_output_y_dependencies(&program, None).unwrap(),
+            vec![BTreeSet::from([0]), BTreeSet::from([0, 1])]
+        );
+        assert!(
+            program_output_y_dependencies(&[LinearOp::Move { dst: 0, src: 99 }], None).is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic timing for immutable dependency propagation"]
+    fn dependency_register_copy_diagnostic() {
+        for width in [1u32, 64, 256] {
+            let mut program = vec![LinearOp::LoadY { dst: 0, index: 0 }];
+            for index in 1..width {
+                program.push(LinearOp::LoadY {
+                    dst: index,
+                    index: index as usize,
+                });
+                program.push(LinearOp::Binary {
+                    dst: 0,
+                    op: BinaryOp::Add,
+                    lhs: 0,
+                    rhs: index,
+                });
+            }
+            for offset in 0..1024 {
+                program.push(LinearOp::Move {
+                    dst: width + offset,
+                    src: 0,
+                });
+            }
+            program.push(LinearOp::StoreOutput { src: width + 1023 });
+            let expected = vec![(0..width as usize).collect::<BTreeSet<_>>()];
+            let mut durations = Vec::new();
+            for _ in 0..7 {
+                let start = std::time::Instant::now();
+                let actual =
+                    program_output_y_dependencies(std::hint::black_box(&program), None).unwrap();
+                durations.push(start.elapsed().as_nanos());
+                assert_eq!(actual, expected);
+            }
+            durations.sort_unstable();
+            println!(
+                "width={width} dependency_ns={durations:?} median_ns={}",
+                durations[3]
+            );
+        }
+    }
 
     fn provenance() -> PatternProvenance {
         PatternProvenance::derived(
