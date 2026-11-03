@@ -55,9 +55,20 @@ roster digest and the explicitly aggregate delta are retained in
 `rumoca-canary-evidence/`. This is partial Tier 1 evidence, not a 566-model
 cohort or full-workspace claim.
 
-The full pre-landing/coverage, workspace Clippy/tests/docs, full MSL,
-ModelicaTest and pinned external corpus gates have not run in this consumer
-repair session. They remain landing gates under SPEC_0025.
+The combined revision `64d99750f850ed1134588ad0ea1fcfd8728d28f4` also includes
+the native torn-tangent branch and all seven newer main commits. All local and
+fetched origin branch commits dated October 2026 or later are ancestors of that
+revision. Older April–June branches remain separate. The combined tangent
+filter passes 12 tests across evaluator, native execution and solver owners;
+all seven initial-state tests pass. Its repeated fixed canary compares the same
+12 traces with high agreement and no deviations.
+
+The full pre-landing gate passed formatting and entered Clippy, then was stopped:
+its runner hardcodes eight jobs and documents approximately 50 GB for coverage,
+exceeding the consumer's four-job limit and available disk space. No full
+Clippy/coverage/workspace, full MSL, ModelicaTest or pinned external corpus pass
+is claimed. These remain landing gates under SPEC_0025 unless explicitly waived
+by the integrating maintainer.
 
 Performance scope is explicit: initialization-only avoids the integration plugin
 and consumer metadata/telemetry publication, but `SolveRuntime::construct` still
