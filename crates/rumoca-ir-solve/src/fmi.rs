@@ -39,6 +39,7 @@ mod indicator_plan;
 mod initial_state_constraints;
 mod max_step_duration;
 mod metadata;
+mod parameter_events;
 mod parameter_updates;
 mod root_location;
 mod scalar_events;
@@ -67,6 +68,7 @@ pub use metadata::{
     FmiCausality, FmiDeclaredCausality, FmiInitial, FmiStorageColumn, FmiStorageRun,
     FmiValueBacking, FmiVariability, FmiVariable, FmiVariableInput,
 };
+pub use parameter_events::FmiParameterEventError;
 pub use root_location::{RootLocationPlan, RootTieBreak};
 
 /// Configuration-Mode capability declared by the checked FMI component.

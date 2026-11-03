@@ -1,6 +1,6 @@
-//! Admission proof for parameter-determined event partitions in generated C.
+//! Shared admission proof for parameter-determined event partitions.
 //!
-//! The C profile executes a model's events only where every one is fixed
+//! Continuous-step hosts and C codegen admit events only where every one is fixed
 //! between parameter changes: error assertions whose predicates, their
 //! condition memories, and every discrete equation depend on parameters and
 //! constants alone. Such a partition changes nothing between events, so the
@@ -52,15 +52,15 @@ pub(super) fn validate(model: &SolveModel) -> Result<DiscreteOrder, &'static str
             .any(|slot| !matches!(slot, ScalarSlot::P { .. }))
     {
         return Err(
-            "the C profile executes only parameter-determined discrete equations; runtime, guarded, structured, or transactional discrete updates need event iteration",
+            "only parameter-determined discrete equations are supported; runtime, guarded, structured, or transactional discrete updates need event iteration",
         );
     }
     if discrete.row_roles.contains(&DiscreteRowRole::EventAction) {
-        return Err("the C profile cannot execute event-edge discrete actions");
+        return Err("event-edge discrete actions need event iteration");
     }
     let pre = &problem.solve_layout.pre_param_bindings;
     if pre.iter().any(|binding| binding.clock_schedule.is_some()) {
-        return Err("the C profile cannot execute clocked previous() history");
+        return Err("clocked previous() history needs clock event handling");
     }
     memory_reads::validate(model)?;
     let mut y = vec![false; problem.layout.y_scalars()];
@@ -141,9 +141,13 @@ fn discrete_order(
     }
     let unsettled = vec![false; y.len()];
     let calls = &model.pure_calls;
-    let equations = scalar_dependencies::dependency_order(calls, programs, &equations, &outputs, &unsettled, p)
-        .map(|(order, _)| order)
-        .map_err(|_| "a discrete equation depends on time, a state, an input, an algebraic, or a pre() value")?;
+    let equations = scalar_dependencies::dependency_order(
+        calls, programs, &equations, &outputs, &unsettled, p,
+    )
+    .map(|(order, _)| order)
+    .map_err(|_| {
+        "a discrete equation depends on time, a state, an input, an algebraic, or a pre() value"
+    })?;
     static_algebraics(model, y, p)?;
     let memories = scalar_dependencies::dependency_order(calls, programs, &memories, &outputs, y, p)
         .map(|(order, _)| order)

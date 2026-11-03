@@ -87,6 +87,11 @@ not conformance. Each artifact profile requires the following evidence:
 FMI Model Exchange event inventory has this additional checked-lowering
 obligation:
 
+`FmiRuntimeView::validate_parameter_only_events` exposes the ME-EVENT-003
+admission proof to continuous-step hosts. It borrows the checked component and
+uses the same predicate-dependency owner as C codegen and indicator construction;
+it does not execute or discard assertions.
+
 | Obligation ID | Obligation | Owner | Required evidence |
 |---|---|---|---|
 | ME-EVENT-001 | `rumoca-phase-solve::fmi` constructs the ordered `FmiComponent` indicator inventory from continuously monitored non-scheduled Solve roots and continuously state-dependent dynamic-time rows; periodic-clock roots and parameter/discrete-only time events are excluded and announced through `nextEventTime` | checked FMI lowering | Linked state-dependent indicators change FMI domain; parameter-only and periodic events appear only as time events; constructor ablations reject missing, extra, reordered, duplicate, or scheduled indicator sources |

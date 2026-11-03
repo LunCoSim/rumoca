@@ -67,7 +67,7 @@ fn a_discrete_row_writing_solver_storage_is_refused() {
     );
     let refused = validate(&model).map(|_| ()).unwrap_err();
     assert!(
-        refused.starts_with("the C profile executes only parameter-determined discrete equations"),
+        refused.starts_with("only parameter-determined discrete equations are supported"),
         "{refused}"
     );
 }
@@ -86,7 +86,7 @@ fn equations_and_memories_admit_in_their_own_orders() {
     assert_eq!(order.memories, vec![0]);
 }
 
-const EVENT_ITERATION: &str = "the C profile executes only parameter-determined discrete equations";
+const EVENT_ITERATION: &str = "only parameter-determined discrete equations are supported";
 
 fn assert_event_iteration(mutate: impl FnOnce(&mut crate::DiscreteSolveSystem)) {
     let mut model = partition(

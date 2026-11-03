@@ -61,7 +61,7 @@ impl SolveVisitor for MemoryReads<'_> {
         };
         if reads {
             Err(
-                "the continuous kernel reads a condition memory or a pre() value the C profile updates only at events",
+                "the continuous kernel reads a condition memory or a pre() value updated only at events",
             )
         } else {
             Ok(())

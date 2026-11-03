@@ -132,7 +132,7 @@ fn one_discrete_row(model: &mut SolveModel, role: DiscreteRowRole) {
 #[test]
 fn event_edge_actions_are_refused() {
     assert_refused(
-        "the C profile cannot execute event-edge discrete actions",
+        "event-edge discrete actions need event iteration",
         |model| {
             static_partition(model);
             one_discrete_row(model, DiscreteRowRole::EventAction);
@@ -143,7 +143,7 @@ fn event_edge_actions_are_refused() {
 #[test]
 fn clocked_previous_history_is_refused() {
     assert_refused(
-        "the C profile cannot execute clocked previous() history",
+        "clocked previous() history needs clock event handling",
         |model| {
             static_partition(model);
             model.problem.solve_layout.pre_param_bindings = vec![PreParamBinding {
@@ -230,6 +230,35 @@ fn assertion_on_parameter(model: &mut SolveModel) {
         },
         LinearOp::StoreOutput { src: 2 },
     ]]);
+}
+
+/// Continuous-step hosts use the same dependency proof without selecting a
+/// code-generation target or consuming the checked component.
+#[test]
+fn runtime_parameter_event_admission_checks_predicate_dependencies() {
+    for (operation, state, admitted) in [
+        (LinearOp::LoadP { dst: 0, index: 1 }, false, true),
+        (LinearOp::LoadP { dst: 0, index: 0 }, false, false),
+        (LinearOp::LoadTime { dst: 0 }, false, false),
+        (LinearOp::LoadY { dst: 0, index: 0 }, true, false),
+    ] {
+        let (mut model, input) = if state {
+            super::max_step_duration_local::delay_bearing_model_with_one_state()
+        } else {
+            super::max_step_duration_local::delay_bearing_model_with_one_run()
+        };
+        model.problem.events.delays = SolveDelayPartition::default();
+        assertion_on_parameter(&mut model);
+        model.problem.events.action_conditions =
+            rows(vec![vec![operation, LinearOp::StoreOutput { src: 0 }]]);
+        let component = FmiComponent::construct(model, vec![input]).unwrap();
+        let result = component.runtime_view().validate_parameter_only_events();
+        assert_eq!(result.is_ok(), admitted);
+        if let Err(error) = result {
+            assert!(error.to_string().contains("assertion depends on"));
+        }
+        assert_eq!(component.into_codegen_view().try_c().is_ok(), admitted);
+    }
 }
 
 /// SPEC_0044 ME-PARAM-001: an assertion condition is a read that keeps a
