@@ -540,6 +540,43 @@ impl MeHostState {
         observe_current(&self.kernel)
     }
 
+    pub(super) fn observe_named(&self, names: &[String]) -> Result<Vec<f64>, MeSessionError> {
+        if self.terminated {
+            return Err(MeSessionError::Contract {
+                reason: "initialization terminated; no further FMI observation is legal".into(),
+            });
+        }
+        let kernel = self.kernel.borrow();
+        for name in names {
+            if !kernel.model_description().output_names.contains(name) {
+                return Err(MeSessionError::Contract {
+                    reason: format!("unknown initialization output `{name}`"),
+                });
+            }
+        }
+        let observation = kernel.observe()?;
+        let selected = kernel.get_named_outputs(&observation, names)?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(names.len())
+            .map_err(|_| MeSessionError::Allocation {
+                context: "initialization observations",
+                entries: names.len(),
+            })?;
+        for name in names {
+            let value = selected
+                .get(name)
+                .copied()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| MeSessionError::Contract {
+                    reason: format!("initialization output `{name}` has no finite value"),
+                })?;
+            values.push(value);
+        }
+        kernel.report_warnings(&observation)?;
+        Ok(values)
+    }
+
     pub(super) fn refresh_retained_indicators(&mut self) -> Result<(), MeSessionError> {
         if self.indicator_count == 0 {
             self.retained_indicators.clear();

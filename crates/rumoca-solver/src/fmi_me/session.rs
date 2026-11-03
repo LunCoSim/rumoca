@@ -231,6 +231,14 @@ pub struct MeComponentHost<'lease> {
 }
 
 impl MeComponentHost<'_> {
+    /// Read finite requested outputs at the settled initial coordinate, in
+    /// request order, without attaching an integrator. Unknown names and a
+    /// terminated initialization are rejected. Each requested output's owning
+    /// expression program is evaluated once; grouped programs remain atomic.
+    pub fn initial_output_values(&self, names: &[String]) -> Result<Vec<f64>, MeSessionError> {
+        self.host.observe_named(names)
+    }
+
     /// The checked numerical configuration a plugin may scale with.
     ///
     /// The host validated these nominals for its own root policy; the plugin

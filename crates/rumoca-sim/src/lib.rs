@@ -37,7 +37,11 @@ pub mod bulk;
 #[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
 mod error;
 #[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
+mod initialization;
+#[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
 mod me_backend;
+#[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
+pub use initialization::initialize_fmi_component;
 pub mod row_eval_trace;
 pub mod sim_trace_compare;
 #[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]

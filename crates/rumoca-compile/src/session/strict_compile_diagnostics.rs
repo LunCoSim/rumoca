@@ -88,11 +88,17 @@ pub struct StrictCompileFailure {
     pub error_code: Option<String>,
     pub balance_detail: Option<Box<rumoca_phase_dae::balance::BalanceDetail>>,
     pub failures: Vec<ModelFailureDiagnostic>,
+    /// Source identities and text from this exact failed compile attempt.
+    pub source_map: SourceMap,
 }
 
 impl StrictCompileFailure {
     /// Failure that never reached a model phase (parse/resolve stage).
-    pub(super) fn pre_phase(summary: String, failures: Vec<ModelFailureDiagnostic>) -> Self {
+    pub(super) fn pre_phase(
+        summary: String,
+        failures: Vec<ModelFailureDiagnostic>,
+        source_map: SourceMap,
+    ) -> Self {
         let error_code = first_error_code(&failures);
         Self {
             summary,
@@ -100,6 +106,7 @@ impl StrictCompileFailure {
             error_code,
             balance_detail: None,
             failures,
+            source_map,
         }
     }
 
@@ -108,6 +115,7 @@ impl StrictCompileFailure {
         summary: String,
         result: &DaePhaseResult,
         failures: Vec<ModelFailureDiagnostic>,
+        source_map: SourceMap,
     ) -> Self {
         match result {
             DaePhaseResult::Failed {
@@ -121,6 +129,7 @@ impl StrictCompileFailure {
                 error_code: error_code.as_deref().map(short_error_code),
                 balance_detail: balance_detail.clone(),
                 failures,
+                source_map,
             },
             // A missing `inner` is diagnosed by instantiation, so the model did
             // reach a model phase. Reporting `phase: None` here would render as
@@ -131,8 +140,9 @@ impl StrictCompileFailure {
                 error_code: first_error_code(&failures),
                 balance_detail: None,
                 failures,
+                source_map,
             },
-            DaePhaseResult::Success(_) => Self::pre_phase(summary, failures),
+            DaePhaseResult::Success(_) => Self::pre_phase(summary, failures, source_map),
         }
     }
 
@@ -487,6 +497,7 @@ mod tests {
             "model needs inner declarations: world".to_string(),
             &result,
             Vec::new(),
+            SourceMap::default(),
         );
         assert_eq!(failure.phase, Some(FailedPhase::Instantiate));
         assert_eq!(failure.phase_name(), "Instantiate");

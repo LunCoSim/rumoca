@@ -1,5 +1,46 @@
 use super::*;
 
+#[test]
+fn requested_component_reference_facts_preserve_scope_prefixes_and_indices() {
+    let mut session = Session::default();
+    session
+        .add_document(
+            "references.mo",
+            r#"
+record Settings
+  Real gain;
+end Settings;
+model References
+  parameter Settings settings(gain=2);
+  parameter Real gains[2]={1,2};
+  parameter Real 'quoted.gain'=3;
+end References;
+"#,
+        )
+        .expect("valid source");
+    let nested = session
+        .class_component_reference_query("References", "settings.gain")
+        .expect("resolved record member");
+    assert!(matches!(
+        nested.effective_variability,
+        rumoca_core::Variability::Parameter(_)
+    ));
+    let indexed = session
+        .class_component_reference_query("References", "gains[2]")
+        .expect("requested array-element declaration");
+    assert!(indexed.is_indexed);
+    let quoted = session
+        .class_component_reference_query("References", "'quoted.gain'")
+        .expect("quoted identifier remains one declaration");
+    assert_eq!(quoted.declaration.component.name, "'quoted.gain'");
+    assert!(!quoted.is_indexed);
+    assert!(
+        session
+            .class_component_reference_query("References", "settings.absent")
+            .is_none()
+    );
+}
+
 fn assert_typecheck_failure(result: PhaseResult, expected_code: &str) {
     match result {
         PhaseResult::Failed {

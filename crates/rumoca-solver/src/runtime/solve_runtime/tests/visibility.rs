@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn selected_grouped_outputs_do_not_evaluate_unrequested_programs() {
+    let grouped = vec![
+        solve::LinearOp::Const { dst: 0, value: 4.0 },
+        solve::LinearOp::Const { dst: 1, value: 5.0 },
+        solve::LinearOp::StoreOutput { src: 0 },
+        solve::LinearOp::StoreOutput { src: 1 },
+    ];
+    let model = solve::SolveModel {
+        visible_names: vec!["a".into(), "b".into(), "unrequested".into()],
+        visible_value_rows: spanned_block(
+            vec![grouped, direct_y_visible_value_row(99)],
+            "selected_grouped_observation.mo",
+        ),
+        ..Default::default()
+    };
+    let runtime = SolveRuntime::new_fixture(&model).expect("prepare grouped observations");
+    let values = runtime
+        .visible_values_for_names(&[], &[], 0.0, &["b".into(), "a".into()])
+        .expect("the unrequested program must not read its absent coordinate");
+    assert_eq!(
+        values.into_iter().collect::<Vec<_>>(),
+        vec![("b".into(), 5.0), ("a".into(), 4.0)]
+    );
+}
+
+#[test]
 fn visible_values_for_names_preserves_requested_order() {
     let model = solve::SolveModel {
         visible_names: vec!["b".to_string(), "a".to_string()],

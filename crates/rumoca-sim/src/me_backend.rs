@@ -8,7 +8,7 @@ use rumoca_solver::{
     fmi_me::{
         MeExecutionBackend, MeInstanceConfig, MeIntegratorBackend, MeModelSource, MeNumericalSetup,
         driver::{advance_live_session, batch_session_options, live_session_options},
-        session::{MeRetainedComponent, MeSimulationSession},
+        session::{MeComponentHost, MeRetainedComponent, MeSimulationSession},
     },
 };
 
@@ -38,25 +38,7 @@ impl BackendSimulationSession {
         instance_name: &'static str,
         integrator: IntegratorFactory,
     ) -> Result<Self, SimError> {
-        let execution_backend = rumoca_solver::fmi_me::admit_execution_backend(
-            opts.execution_policy,
-            execution_backend,
-        )?;
-        let root_location = source.root_location();
-        let retained = MeRetainedComponent::instantiate(
-            source,
-            &instance_config(instance_name, opts, None)?,
-            execution_backend,
-        )?;
-        let options = live_session_options(
-            &root_location,
-            opts.t_start,
-            opts.rtol,
-            opts.atol,
-            live_scan_scale(opts),
-            opts.max_wall_seconds,
-        )?;
-        let host = retained.into_lease(options)?;
+        let host = initialized_host(source, opts, execution_backend, instance_name)?;
         let variable_names = host.output_names();
         let plugin = plugin_for_host(&host, opts, integrator)?;
         let session = host.into_session(plugin)?;
@@ -114,6 +96,31 @@ impl BackendSimulationSession {
     pub(crate) fn variable_names(&self) -> &[String] {
         &self.variable_names
     }
+}
+
+pub(crate) fn initialized_host(
+    source: MeModelSource<'_>,
+    opts: &SimOptions,
+    execution_backend: Option<MeExecutionBackend>,
+    instance_name: &'static str,
+) -> Result<MeComponentHost<'static>, SimError> {
+    let execution_backend =
+        rumoca_solver::fmi_me::admit_execution_backend(opts.execution_policy, execution_backend)?;
+    let root_location = source.root_location();
+    let retained = MeRetainedComponent::instantiate(
+        source,
+        &instance_config(instance_name, opts, None)?,
+        execution_backend,
+    )?;
+    let options = live_session_options(
+        &root_location,
+        opts.t_start,
+        opts.rtol,
+        opts.atol,
+        live_scan_scale(opts),
+        opts.max_wall_seconds,
+    )?;
+    retained.into_lease(options).map_err(Into::into)
 }
 
 #[cfg(feature = "solver-rk45")]

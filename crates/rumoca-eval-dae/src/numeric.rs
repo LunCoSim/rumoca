@@ -59,6 +59,9 @@ pub struct NumericEvaluator<'dae, F = fn(dae::VariableView<'dae>, usize) -> Opti
     function_fold_values: Vec<(dae::FunctionFoldId<'dae>, Vec<Vec<f64>>)>,
     domain_points: Vec<(dae::DomainId<'dae>, Vec<i64>)>,
     override_value: F,
+    /// Attribute preparation must not turn initialization start guesses into
+    /// settled parameter values.
+    parameter_bindings_only: bool,
 }
 
 impl<'dae> NumericEvaluator<'dae> {
@@ -82,7 +85,17 @@ where
             function_fold_values: Vec::new(),
             domain_points: Vec::new(),
             override_value,
+            parameter_bindings_only: false,
         }
+    }
+
+    /// Evaluate parameter-dependent attributes using bindings and admitted
+    /// tunable overrides. Parameters without bindings remain missing values;
+    /// their initialization starts are never used as numerical evidence.
+    pub fn with_parameter_bindings(view: dae::DaeView<'dae>, override_value: F) -> Self {
+        let mut evaluator = Self::with_overrides(view, override_value);
+        evaluator.parameter_bindings_only = true;
+        evaluator
     }
 
     /// Evaluate an expression whose only coordinates are static parameters.
@@ -669,14 +682,27 @@ where
                 variable.declaration().span(),
             ));
         }
-        let expression = variable.binding().or(variable.start()).ok_or_else(|| {
+        let expression = if self.parameter_bindings_only {
+            variable.binding()
+        } else {
+            variable.binding().or(variable.start())
+        }
+        .ok_or_else(|| {
             failure(
                 NumericEvaluationErrorKind::MissingValue,
-                format!(
-                    "{} `{}` has neither a binding nor an initial value",
-                    role_name(variable.role()),
-                    variable.name()
-                ),
+                if self.parameter_bindings_only {
+                    format!(
+                        "{} `{}` has no settled binding value",
+                        role_name(variable.role()),
+                        variable.name()
+                    )
+                } else {
+                    format!(
+                        "{} `{}` has neither a binding nor an initial value",
+                        role_name(variable.role()),
+                        variable.name()
+                    )
+                },
                 variable.declaration().span(),
             )
         })?;

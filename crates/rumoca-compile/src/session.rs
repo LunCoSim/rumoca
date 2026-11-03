@@ -49,6 +49,17 @@ pub struct ClassComponentDeclaration {
     pub has_type_dimensions: bool,
 }
 
+/// Scoped declaration facts for one requested component reference. Array
+/// indices are parsed but their rank/bounds remain instantiation checks.
+#[derive(Debug, Clone)]
+pub struct ClassComponentReferenceDeclaration {
+    pub declaration: ClassComponentDeclaration,
+    pub effective_variability: rumoca_core::Variability,
+    pub is_indexed: bool,
+    pub is_protected: bool,
+    pub is_final: bool,
+}
+
 mod lru_cache;
 mod parsed_source_document;
 mod session_impl;

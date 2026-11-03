@@ -67,6 +67,7 @@ mod tests {
             error_code: Some("ED001".to_string()),
             balance_detail: Some(Box::new(detail)),
             failures: Vec::new(),
+            source_map: Default::default(),
         };
         let row = strict_compile_failure_row("M", &failure);
         assert_eq!(row.phase_reached, "ToDae");
@@ -106,6 +107,7 @@ mod tests {
             error_code: Some("ED004".to_string()),
             balance_detail: Some(Box::new(detail)),
             failures: Vec::new(),
+            source_map: Default::default(),
         };
         let row = strict_compile_failure_row("M", &failure);
         assert_eq!(row.is_balanced, Some(true));
@@ -123,6 +125,7 @@ mod tests {
             error_code: Some("ER003".to_string()),
             balance_detail: None,
             failures: Vec::new(),
+            source_map: Default::default(),
         };
         let row = strict_compile_failure_row("M", &failure);
         assert_eq!(row.phase_reached, "Resolve");

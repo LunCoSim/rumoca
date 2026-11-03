@@ -1272,7 +1272,8 @@ fn resolve_component_causality(
     })
 }
 
-fn resolve_effective_variability(
+/// Resolve a component prefix within its enclosing instance variability.
+pub fn resolve_effective_variability(
     comp: &ast::Component,
     inherited_variability: Option<&rumoca_core::Variability>,
 ) -> rumoca_core::Variability {

@@ -12,11 +12,12 @@ const STRICT_MAX_RELATED: usize = 8;
 fn strict_pre_phase_failure(
     model_name: &str,
     failures: Vec<ModelFailureDiagnostic>,
+    source_map: SourceMap,
 ) -> StrictCompileFailure {
     let requested = requested_missing_result_message(model_name, &failures);
     let summary =
         format_strict_failure_summary(model_name, requested, &failures, STRICT_MAX_RELATED);
-    StrictCompileFailure::pre_phase(summary, failures)
+    StrictCompileFailure::pre_phase(summary, failures, source_map)
 }
 
 fn resolve_error_diagnostic_failure(diagnostic: &CommonDiagnostic) -> ModelFailureDiagnostic {
@@ -553,7 +554,9 @@ impl Session {
         let target_source_files =
             collect_target_source_files(planning_tree, &closure.reachable_classes);
         let retained_names = reachable_definition_names(planning_tree, &closure.reachable_classes);
-        let source_map = planning_tree.source_map.clone();
+        // Resolution planning is reusable across root-modifier changes, but
+        // synthetic literal provenance belongs to the current compile request.
+        let source_map = self.session_source_map();
         let failures =
             collect_parse_failures_for_files(&self.documents, &source_map, &target_source_files);
         if !failures.is_empty() {
@@ -1200,9 +1203,13 @@ impl Session {
         &mut self,
         model_name: &str,
     ) -> std::result::Result<Box<DaeCompilationResult>, Box<StrictCompileFailure>> {
-        let target = self
-            .resolve_strict_target(model_name)
-            .map_err(|failure| Box::new(strict_pre_phase_failure(model_name, failure.failures)))?;
+        let target = self.resolve_strict_target(model_name).map_err(|failure| {
+            Box::new(strict_pre_phase_failure(
+                model_name,
+                failure.failures,
+                *failure.source_map,
+            ))
+        })?;
         let tree = target.resolved.inner();
         let mut failures = Vec::new();
 
@@ -1224,6 +1231,7 @@ impl Session {
                 summary,
                 &requested_result,
                 failures,
+                tree.source_map.clone(),
             )));
         }
 
@@ -1245,6 +1253,7 @@ impl Session {
                         .to_string(),
                     &requested_result,
                     Vec::new(),
+                    tree.source_map.clone(),
                 )))
             }
         }

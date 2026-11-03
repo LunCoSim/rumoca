@@ -16,6 +16,7 @@ mod compute_block_tests;
 mod continuous_wire;
 mod feature_query;
 pub mod fmi;
+pub use fmi::InitialStateConstraint;
 mod initialization;
 mod layout;
 mod linear_op;

@@ -1198,6 +1198,51 @@ impl Session {
         declarations
     }
 
+    /// Resolve a requested scalar-reference declaration through the session's
+    /// scoped class/type owner. This does not evaluate dimensions, conditions,
+    /// or instance redeclarations; checked DAE identity validates scalar use.
+    pub fn class_component_reference_query(
+        &mut self,
+        class_name: &str,
+        reference: &str,
+    ) -> Option<ClassComponentReferenceDeclaration> {
+        let mut class_name = class_name.to_owned();
+        let mut variability = None;
+        let mut indexed = false;
+        let mut protected = false;
+        let mut final_ = false;
+        let mut result = None;
+        for segment in rumoca_core::qualified_name_segments(reference) {
+            let name = if let Some(scalar) = rumoca_core::parse_scalar_name(segment) {
+                indexed = true;
+                scalar.base
+            } else {
+                segment
+            };
+            let declarations = self.class_component_declarations_query(&class_name)?;
+            let declaration = declarations
+                .iter()
+                .find(|entry| entry.component.name == name)?
+                .clone();
+            let component = &declaration.component;
+            variability = Some(rumoca_phase_instantiate::resolve_effective_variability(
+                component,
+                variability.as_ref(),
+            ));
+            protected |= component.is_protected;
+            final_ |= component.is_final;
+            class_name = declaration.type_name.clone();
+            result = Some(declaration);
+        }
+        Some(ClassComponentReferenceDeclaration {
+            declaration: result?,
+            effective_variability: variability?,
+            is_indexed: indexed,
+            is_protected: protected,
+            is_final: final_,
+        })
+    }
+
     fn class_component_declarations_uncached(
         &mut self,
         class_name: &str,

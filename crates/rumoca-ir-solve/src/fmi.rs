@@ -36,6 +36,7 @@ mod c_codegen;
 mod co_simulation;
 mod event_free;
 mod indicator_plan;
+mod initial_state_constraints;
 mod max_step_duration;
 mod metadata;
 mod parameter_updates;
@@ -53,6 +54,10 @@ pub use event_free::{FmiEventFreeCodegenView, FmiEventFreeError};
 pub use indicator_plan::{
     FmiIndicatorPlan, IndicatorEntry, IndicatorPlanError, IndicatorPlanInputs,
     IndicatorPlanRejection, IndicatorReading, IndicatorZeroSide,
+};
+pub use initial_state_constraints::{
+    FmiInitialStateConstraintError, InitialStateConstraint, InitialStateConstraintError,
+    InitialStateConstraintFeatures,
 };
 pub use max_step_duration::{
     MAX_STEP_DURATION_DESCRIPTION, MAX_STEP_DURATION_NAME, MAX_STEP_DURATION_UNCONSTRAINED,
@@ -162,7 +167,7 @@ impl FmiEventIndicatorSource {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FmiEventIndicatorInventory {
     sources: Box<[FmiEventIndicatorSource]>,
     /// The positional reading of `sources` every executor uses: where each
@@ -331,7 +336,7 @@ fn dependency_backed_indicator_sources(
 ///
 /// Deliberately not `Serialize`: a render context holds the proved type-state
 /// of [`FmiCodegenView::try_event_free`], never this inventory itself.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FmiMetadata {
     variables: Vec<FmiVariable>,
     state_variable_indices: Vec<usize>,
@@ -391,7 +396,7 @@ impl FmiMetadata {
 /// Deliberately not `Clone`. A second owner of the aggregate would be a second
 /// place the FMI inventory could drift from its kernel; consumers borrow the
 /// views below, and codegen consumes the whole thing into [`FmiCodegenView`].
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FmiComponent {
     construction_inputs: Vec<FmiVariableInput>,
     metadata: FmiMetadata,

@@ -1042,67 +1042,51 @@ impl SolveRuntime {
         t: f64,
         names: &[String],
     ) -> Result<IndexMap<String, f64>, RuntimeSolveError> {
-        if self.visible_value_rows.len() == self.model.visible_names.len() {
-            return self.visible_values_for_names_from_rows(y, params, t, names);
-        }
-        let all_values = self.visible_values(y, params, t)?;
+        let mut programs = BTreeMap::new();
         let mut values = IndexMap::new();
         reserve_runtime_index_map_capacity(&mut values, names.len(), "visible name values")?;
         for name in names {
             let Some(idx) = self.visible_name_index.get(name).copied() else {
                 continue;
             };
-            let value = all_values.get(idx).copied().ok_or_else(|| {
-                visible_value_index_error(name, idx, all_values.len(), "visible values")
+            let (program, offset) = self
+                .visible_value_rows
+                .row_output_position(idx)
+                .ok_or_else(|| {
+                    RuntimeSolveError::solve_ir(format!(
+                        "visible output `{name}` has no owning program"
+                    ))
+                })?;
+            if let std::collections::btree_map::Entry::Vacant(entry) = programs.entry(program) {
+                let mut outputs = Vec::new();
+                if self.visible_value_rows.row_output_count(program) == Some(1) {
+                    outputs.push(self.visible_value_rows.eval_row_with_context(
+                        program,
+                        y,
+                        params,
+                        t,
+                        self.row_eval_context(),
+                    )?);
+                } else {
+                    self.visible_value_rows
+                        .eval_row_outputs_unchecked_with_context(
+                            program,
+                            y,
+                            params,
+                            t,
+                            self.row_eval_context(),
+                            &mut outputs,
+                        )?;
+                }
+                entry.insert(outputs);
+            }
+            let outputs = &programs[&program];
+            let value = outputs.get(offset).copied().ok_or_else(|| {
+                visible_value_index_error(name, offset, outputs.len(), "visible program outputs")
             })?;
             values.insert(name.clone(), value);
         }
         Ok(values)
-    }
-
-    pub(super) fn visible_values_for_names_from_rows(
-        &self,
-        y: &[f64],
-        params: &[f64],
-        t: f64,
-        names: &[String],
-    ) -> Result<IndexMap<String, f64>, RuntimeSolveError> {
-        let mut values = IndexMap::new();
-        reserve_runtime_index_map_capacity(&mut values, names.len(), "visible row name values")?;
-        for name in names {
-            if let Some(value) = self.visible_value_from_row(name, y, params, t)? {
-                values.insert(name.clone(), value);
-            }
-        }
-        Ok(values)
-    }
-
-    pub(super) fn visible_value_from_row(
-        &self,
-        name: &str,
-        y: &[f64],
-        params: &[f64],
-        t: f64,
-    ) -> Result<Option<f64>, RuntimeSolveError> {
-        let Some(idx) = self.visible_name_index.get(name).copied() else {
-            return Ok(None);
-        };
-        if idx >= self.visible_value_rows.len() {
-            return Err(visible_value_index_error(
-                name,
-                idx,
-                self.visible_value_rows.len(),
-                "visible value rows",
-            ));
-        }
-        let value = self.visible_value_rows.eval_row_with_context(
-            idx,
-            y,
-            params,
-            t,
-            self.row_eval_context(),
-        )?;
-        Ok(Some(value))
     }
 
     pub(super) fn populate_solver_y_from_state(

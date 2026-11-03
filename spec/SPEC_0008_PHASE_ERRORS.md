@@ -20,6 +20,10 @@ cross-phase error dependencies and keep code ranges consistent as features grow.
 creates AST spans from lexer locations, and the same identity must be used when
 the source text is added to a `SourceMap`.
 
+The session's detailed strict DAE failure carries the `SourceMap` from the
+same failed compile attempt as its diagnostic labels. Consumers must render
+those retained diagnostics; they must not recompile to recover source locations.
+
 `SourceMap` is a rendering/lookup table for diagnostics. It must not be relied
 on to repair parser spans after parse, merge, or source-root collection. Phase
 code may use `Span::DUMMY` only for genuinely source-free diagnostics or

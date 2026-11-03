@@ -727,6 +727,23 @@ impl SolveMeKernel {
         Ok(())
     }
 
+    pub(crate) fn get_named_outputs(
+        &self,
+        observation: &MeObservation,
+        names: &[String],
+    ) -> Result<indexmap::IndexMap<String, f64>, MeError> {
+        self.require_active_lifecycle("get_named_outputs")?;
+        self.require_observation_brand(observation)?;
+        self.runtime
+            .visible_values_for_names(
+                &observation.solver_y,
+                &observation.parameters,
+                observation.time(),
+                names,
+            )
+            .map_err(MeError::from)
+    }
+
     pub(crate) fn set_float64(
         &mut self,
         refs: &[MeValueRef],

@@ -108,6 +108,13 @@ impl Session {
         // instantiation so a repeated compile cannot reuse the old structure.
         self.query_state.flat = Default::default();
         self.query_state.dae = Default::default();
+        // Standard compilation consumes the resolved tree's source map directly.
+        // Strict compilation retains its planning tree and attaches the current
+        // source map when resolving the requested definition closure.
+        self.query_state
+            .resolved
+            .builds
+            .clear_mode(super::ResolveBuildMode::Standard);
     }
 
     pub(in crate::session) fn register_structural_override_sources(
@@ -146,6 +153,65 @@ mod tests {
             .compile_model_strict("M")
             .expect("second structural variant should compile");
         assert_eq!(state_scalar_count(second.result()), 4);
+    }
+
+    #[test]
+    fn structural_override_provenance_tracks_current_request_after_resolution_reuse() {
+        for strict in [false, true] {
+            let mut session = Session::new(SessionConfig::default());
+            session.add_document(
+                "conditional.mo",
+                "model M parameter Boolean enabled=true; Real x[if enabled then 2 else 1]; equation der(x)=-x; end M;",
+            ).expect("fixture should parse");
+            let compile = |session: &mut Session| {
+                if strict {
+                    session
+                        .compile_model_dae_strict_reachable_uncached_with_recovery("M")
+                        .expect("strict variant should compile")
+                        .dae
+                } else {
+                    session
+                        .compile_model("M")
+                        .expect("standard variant should compile")
+                        .dae
+                }
+            };
+            compile(&mut session);
+            let source_name =
+                structural_override_source_name(&QualifiedName::from_dotted("enabled"));
+            let source_id = rumoca_core::SourceId::from_source_name(&source_name);
+            let mut retained = Vec::new();
+            for enabled in [false, true, false] {
+                session.set_structural_overrides(&[(
+                    "enabled".into(),
+                    StructuralOverride::Bool(enabled),
+                )]);
+                let dae = compile(&mut session);
+                let content = enabled.to_string();
+                assert_eq!(
+                    dae.source_map().get_source(source_id),
+                    Some((source_name.as_str(), content.as_str()))
+                );
+                let count = dae.inspect(|view| {
+                    view.variables()
+                        .find_map(|(_, variable)| {
+                            (variable.name().as_str() == "x").then(|| variable.scalar_count())
+                        })
+                        .expect("fixture state should exist")
+                });
+                assert_eq!(count, if enabled { 2 } else { 1 });
+                retained.push((dae, content));
+            }
+            for (dae, content) in retained {
+                assert_eq!(
+                    dae.source_map().get_source(source_id),
+                    Some((source_name.as_str(), content.as_str()))
+                );
+            }
+            session.set_structural_overrides(&[]);
+            let restored = compile(&mut session);
+            assert!(restored.source_map().get_source(source_id).is_none());
+        }
     }
 
     fn state_scalar_count(result: &crate::session::CompilationResult) -> usize {

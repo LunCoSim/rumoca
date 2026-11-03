@@ -10,6 +10,43 @@ use rumoca_ir_dae::{
 use super::NumericEvaluator;
 
 #[test]
+fn parameter_binding_evaluation_does_not_publish_an_initialization_start() {
+    let text = "parameter Real limit(start=7,fixed=false);";
+    let mut source_map = SourceMap::new();
+    let source = source_map.add("bound.mo", text);
+    let at = DaeProvenance::source(Span::from_offsets(source, 0, text.len())).unwrap();
+    let dae = Dae::construct(source_map, |dae| {
+        let real = dae.types(|types| types.derived(ValueType::scalar(ScalarType::Real), at))?;
+        let start =
+            dae.expressions(|expressions| expressions.at(at).literal(DaeLiteral::Real(7.0)))?;
+        dae.variables(|variables| {
+            variables.parameter(
+                VarName::new("limit"),
+                real,
+                at,
+                rumoca_ir_dae::VariableAttributes {
+                    start: Some(start),
+                    fixed: Some(vec![false]),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
+    })
+    .unwrap();
+    dae.inspect(|view| {
+        let mut evaluator = NumericEvaluator::with_parameter_bindings(view, |_, _| None);
+        let error = evaluator
+            .initial_value(view.variable_id(0).unwrap())
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            super::NumericEvaluationErrorKind::MissingValue
+        );
+    });
+}
+
+#[test]
 fn integer_builtin_floors_negative_fractional_dae_values() {
     let mut source_map = SourceMap::new();
     let source = source_map.add("integer.mo", "integer(-1.8)");

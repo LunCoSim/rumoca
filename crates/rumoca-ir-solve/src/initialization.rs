@@ -172,6 +172,24 @@ impl InitializationSolveSystem {
     pub fn given_state_indices(&self) -> &[usize] {
         &self.given_state_indices
     }
+
+    /// State coordinates with no initialization writer. Their declaration
+    /// starts remain guesses unless an admitted initial constraint owns them.
+    pub fn free_state_indices(&self, state_count: usize) -> Vec<usize> {
+        let mut owned: BTreeSet<_> = self.given_state_indices.iter().copied().collect();
+        owned.extend(
+            self.projection_unknowns
+                .iter()
+                .chain(&self.update_targets)
+                .filter_map(|slot| match slot {
+                    ScalarSlot::Y { index, .. } => Some(*index),
+                    _ => None,
+                }),
+        );
+        (0..state_count)
+            .filter(|index| !owned.contains(index))
+            .collect()
+    }
     pub fn manifold_row_count(&self) -> usize {
         self.manifold_row_count
     }
