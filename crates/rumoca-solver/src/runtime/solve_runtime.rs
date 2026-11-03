@@ -99,7 +99,9 @@ use support::{
     validate_finite_runtime_output, validate_runtime_output_len, visible_value_index_error,
     zero_runtime_values,
 };
-use tangent_evaluators::{colored_tangent_evaluators, torn_tangent_evaluators};
+use tangent_evaluators::{
+    PreparedTornTangent, colored_tangent_evaluators, torn_tangent_evaluators,
+};
 
 /// Backend-neutral callable produced from one checked Solve-IR expression
 /// block. Native execution adapters implement this contract; the runtime
@@ -355,7 +357,7 @@ pub struct SolveRuntime {
     implicit_scalar_rhs: PreparedScalarProgramBlock,
     /// Tangent plan of each algebraic projection block's tearing, aligned
     /// with the block list; `None` for an untorn block or one without a plan.
-    torn_tangents: Rc<[Option<rumoca_eval_solve::TornTangentEvaluator>]>,
+    torn_tangents: Rc<[Option<PreparedTornTangent>]>,
     /// Colored tangent plan of each algebraic projection block, aligned with
     /// the block list and its structural artifacts.
     colored_tangents: Rc<[Option<rumoca_eval_solve::ColoredTangentEvaluator>]>,
@@ -866,8 +868,9 @@ impl SolveRuntime {
             torn_tangents: torn_tangent_evaluators(
                 &model.problem.continuous.algebraic_projection_plan,
                 &implicit_projection_scalar_jacobian,
-                compiled_implicit_projection_jacobian_v.is_some(),
-            ),
+                execution_backend.as_ref(),
+                compiled_implicit_projection_jacobian_v.as_ref(),
+            )?,
             // A backend-compiled JVP evaluates the colors natively, so the
             // colored lanes are built only for the interpreted runtime.
             colored_tangents: if compiled_implicit_projection_jacobian_v.is_some() {
@@ -1289,25 +1292,28 @@ impl SolveRuntime {
                 .is_some_and(|block| block.tearing.as_ref() == Some(tearing)),
             "a torn block index names the plan block that owns its tearing"
         );
-        let evaluator = self.torn_tangents.get(index).and_then(Option::as_ref);
-        let Some(evaluator) = evaluator else {
+        let prepared = self.torn_tangents.get(index).and_then(Option::as_ref);
+        let Some(prepared) = prepared else {
             return Ok(None);
         };
         let tables = self.model.external_tables.as_slice();
-        let compiled = self.compiled_implicit_projection_jacobian_v.as_deref();
-        let mut call = |program: usize, seed: &[f64], out: &mut Vec<f64>| {
-            compiled.is_some_and(|compiled| {
-                compiled
-                    .call_program_outputs(
-                        program,
-                        solve_eval::JacobianEvalInputs { y, p, t, seed },
-                        tables,
-                        out,
-                    )
-                    .unwrap_or(false)
-            })
+        let compiled = prepared.compiled.as_deref();
+        let mut call = |program: usize, seed: &[f64], out: &mut Vec<f64>| match compiled {
+            None => Ok(false),
+            Some(compiled) => compiled
+                .call_program_outputs(
+                    program,
+                    solve_eval::JacobianEvalInputs { y, p, t, seed },
+                    tables,
+                    out,
+                )
+                .map_err(|message| EvalSolveError::InvalidRow {
+                    message,
+                    span: None,
+                }),
         };
-        evaluator
+        prepared
+            .evaluator
             .eval_through(
                 rumoca_eval_solve::TangentPoint {
                     y,

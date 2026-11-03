@@ -521,6 +521,7 @@ mod tests {
     mod register_constants;
     mod selected_jvp;
     mod selected_residual;
+    mod torn_tangent;
 
     use super::*;
     use rumoca_ir_solve::{LinearOp, ScalarProgramBlock};

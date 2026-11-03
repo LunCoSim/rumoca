@@ -351,7 +351,14 @@ per tear and one coefficient lane) when that lane count is below
 `MAX_TENSOR_LANES` and every program widens; otherwise it takes the
 directional form, which evaluates every step's coefficient first and then one
 tear column at a time through the one-direction JVP programs, equal to the
-multi-lane form bit for bit. Consecutive causal steps of one program whose
+multi-lane form bit for bit. Native runtime preparation compiles the checked
+multi-lane programs through the existing Jacobian entry point when that
+backend accepts their operation and tensor-lane widths. Otherwise preparation
+selects the checked directional form with the already admitted native JVP
+owner. The compiled programs retain their canonical row source spans.
+A prepared evaluator may decline a native program before execution; an
+admitted execution error propagates and cannot select reference evaluation.
+Consecutive causal steps of one program whose
 outputs depend on no other member's target (the program's exact per-output
 seed dependencies) form a group that one evaluation answers, its coefficient
 lane or direction seeding every member target; consecutive reduced rows of one
