@@ -524,7 +524,13 @@ impl SolveMeKernel {
         execution_backend: Option<Rc<dyn crate::SolveExecutionBackend>>,
     ) -> Result<Self, MeError> {
         let root_location = source.root_location();
-        let (model, indicator_plan, max_step_duration_value_reference, configuration) = source
+        let (
+            model,
+            indicator_plan,
+            max_step_duration_value_reference,
+            configuration,
+            parameter_variables,
+        ) = source
             .into_parts()
             .map_err(|error| contract(error.to_string()))?;
         let delay_bearing = !model.problem.events.delays.delay_time_rhs.is_empty();
@@ -615,6 +621,7 @@ impl SolveMeKernel {
             last_projection_changed: false,
             termination: None,
             output_meta,
+            parameter_variables,
             settled_initialization_y: None,
         })
     }

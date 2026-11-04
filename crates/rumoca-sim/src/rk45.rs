@@ -226,6 +226,11 @@ impl SimulationSession {
         })
     }
 
+    /// Initialized numeric parameter values from the common ME session owner.
+    pub fn parameter_values(&self) -> Result<IndexMap<String, f64>, SimError> {
+        self.inner.parameter_values()
+    }
+
     pub fn values_for(&self, names: &[String]) -> Result<IndexMap<String, f64>, SimError> {
         self.inner.values_for(names)
     }

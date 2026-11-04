@@ -202,6 +202,7 @@ pub struct SolveMeKernel {
     last_projection_changed: bool,
     termination: Option<SimTermination>,
     output_meta: Vec<SimVariableMeta>,
+    parameter_variables: Vec<rumoca_ir_solve::fmi::FmiVariable>,
     /// The settled full solver vector `exit_initialization_mode` produced, so
     /// the initial `update_discrete_states` continues from the same vector
     /// instead of rebuilding one.
@@ -804,6 +805,14 @@ impl SolveMeKernel {
                 values.len()
             )));
         }
+        let parameter_observation = if refs
+            .iter()
+            .any(|reference| matches!(reference.backing, MeFloat64Backing::Parameter(_)))
+        {
+            Some(self.observe()?)
+        } else {
+            None
+        };
         for (reference, value) in refs.iter().zip(values) {
             if !Rc::ptr_eq(&reference.instance_brand, &self.instance_brand) {
                 return Err(contract(
@@ -816,6 +825,9 @@ impl SolveMeKernel {
                     .get(index)
                     .copied()
                     .ok_or_else(|| float64_param_out_of_range(index, self.params.len()))?,
+                MeFloat64Backing::Parameter(index) => parameter_observation.as_ref()
+                    .and_then(|observation| observation.parameters.get(index)).copied()
+                    .ok_or_else(|| contract(format!("parameter value reference {index} is outside the initialized observation")))?,
                 MeFloat64Backing::MaxStepDuration(value_reference)
                     if self.max_step_duration_value_reference == Some(value_reference) =>
                 {
@@ -830,6 +842,52 @@ impl SolveMeKernel {
             };
         }
         Ok(())
+    }
+
+    /// Read the checked FMI parameter inventory at this instance's accepted
+    /// coordinate. References are read-only and use the metadata's own storage
+    /// runs; callers never reconstruct parameter positions from names.
+    pub(crate) fn parameter_values(&self) -> Result<indexmap::IndexMap<String, f64>, MeError> {
+        use rumoca_ir_solve::fmi::FmiStorageColumn;
+        let mut names = Vec::new();
+        let mut references = Vec::new();
+        for variable in &self.parameter_variables {
+            let storage = variable
+                .storage()
+                .ok_or_else(|| contract("parameter has no FMI storage"))?;
+            if storage.column() != FmiStorageColumn::P
+                || storage.scalar_count() != variable.scalar_names().len()
+            {
+                return Err(contract(
+                    "parameter inventory does not match its checked FMI storage",
+                ));
+            }
+            for (offset, name) in variable.scalar_names().iter().enumerate() {
+                let index = storage
+                    .base()
+                    .checked_add(offset)
+                    .ok_or_else(|| contract("parameter value-reference index overflow"))?;
+                names.push(name.clone());
+                references.push(MeValueRef {
+                    backing: MeFloat64Backing::Parameter(index),
+                    instance_brand: Rc::clone(&self.instance_brand),
+                });
+            }
+        }
+        let mut values = vec![0.0; references.len()];
+        self.get_float64(&references, &mut values)?;
+        let mut result = indexmap::IndexMap::with_capacity(names.len());
+        for (name, value) in names.into_iter().zip(values) {
+            if !value.is_finite() {
+                return Err(contract(format!(
+                    "initialized parameter '{name}' is not finite"
+                )));
+            }
+            if result.insert(name.clone(), value).is_some() {
+                return Err(contract(format!("parameter inventory duplicates '{name}'")));
+            }
+        }
+        Ok(result)
     }
 
     pub(crate) fn fmu_state(&self) -> MeFmuState {

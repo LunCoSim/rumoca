@@ -397,6 +397,14 @@ impl MeSimulationSession<'_, '_> {
         Ok(visible)
     }
 
+    /// Current initialized numeric parameters, including dependent and
+    /// inherited values, read through this session's checked FMI inventory.
+    /// Outputs, inputs and constants remain in their own inventories.
+    pub fn parameter_values(&self) -> Result<IndexMap<String, f64>, MeSessionError> {
+        self.require_live()?;
+        Ok(self.host.kernel.borrow().parameter_values()?)
+    }
+
     /// Whether `name` is a declared **input** of this component.
     ///
     /// Causality comes from the model description's input

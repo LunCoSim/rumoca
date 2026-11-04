@@ -19,6 +19,15 @@ in the shared runtime layer, and solver backends are thin adapters.
 
 ## Shared Responsibilities
 
+`MeSimulationSession::parameter_values()` reads initialized numeric parameters
+through the component's checked FMI variable inventory and read-only value
+references. It includes inherited, array and initialization-solved values at
+the current accepted coordinate. Inputs, outputs and constants retain their
+separate inventories. A terminated or failed session rejects the observation.
+The live `rumoca_sim::rk45::SimulationSession` forwards this common-host API.
+`crates/rumoca-sim/tests/initialized_parameters.rs` exercises dependent defaults,
+an initial-equation parameter, an override, reset and rejected parameter writes.
+
 These belong in the shared runtime/solver API layer, never duplicated in a
 backend:
 

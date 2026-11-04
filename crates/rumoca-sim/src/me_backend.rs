@@ -76,6 +76,11 @@ impl BackendSimulationSession {
     }
 
     #[cfg(feature = "solver-rk45")]
+    pub(crate) fn parameter_values(&self) -> Result<IndexMap<String, f64>, SimError> {
+        self.session.parameter_values().map_err(Into::into)
+    }
+
+    #[cfg(feature = "solver-rk45")]
     pub(crate) fn values_for(&self, names: &[String]) -> Result<IndexMap<String, f64>, SimError> {
         let visible = self.visible_values()?;
         Ok(names

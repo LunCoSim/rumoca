@@ -116,12 +116,13 @@ enum MeModelSourceInner<'a> {
 
 /// The checked pieces an [`MeModelSource`] resolves to: the Solve model, the
 /// ordered event-indicator inventory, the optional max-step value reference,
-/// and the structural-configuration capability.
+/// the structural-configuration capability and checked numeric parameter inventory.
 type MeModelParts<'a> = (
     &'a rumoca_ir_solve::SolveModel,
     rumoca_ir_solve::fmi::FmiIndicatorPlan,
     Option<u32>,
     lifecycle::MeConfigurationCapability,
+    Vec<rumoca_ir_solve::fmi::FmiVariable>,
 );
 
 impl<'a> MeModelSource<'a> {
@@ -204,6 +205,17 @@ impl<'a> MeModelSource<'a> {
                         .max_step_duration()
                         .map(rumoca_ir_solve::fmi::FmiVariable::value_reference_fmi3),
                     configuration,
+                    metadata
+                        .variables()
+                        .iter()
+                        .filter(|variable| {
+                            variable.role()
+                                == Some(rumoca_ir_solve::SolveVariableStorageRole::Parameter)
+                                && variable.value_kind()
+                                    != rumoca_ir_solve::SolveVariableValueKind::String
+                        })
+                        .cloned()
+                        .collect(),
                 ))
             }
             #[cfg(test)]
@@ -218,6 +230,7 @@ impl<'a> MeModelSource<'a> {
                     .clone(),
                 max_step_duration_value_reference,
                 configuration,
+                Vec::new(),
             )),
         }
     }
@@ -624,6 +637,7 @@ pub struct MeValueRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MeFloat64Backing {
     InputParameter(usize),
+    Parameter(usize),
     MaxStepDuration(u32),
 }
 
