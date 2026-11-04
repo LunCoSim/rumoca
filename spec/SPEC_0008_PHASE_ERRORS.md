@@ -39,6 +39,12 @@ these endpoints from retained grammar tokens, including delimiters; consumers
 must not scan surrounding source to repair a declaration range. Name and
 end-name token locations remain separate exact identifier spans.
 
+Parsed `Expression::span()` covers the complete expression syntax, including a
+leading `if`, parentheses, array constructor delimiters, a qualified reference's
+leading dot, and trailing subscript delimiters. Endpoints come from retained
+grammar tokens; source editors must not scan surrounding text to repair them.
+`Expression::get_location()` remains the first-token location, not an edit range.
+
 ### Fail-Fast Error Semantics
 
 | Rule | Owner/Where | Brief Justification |

@@ -2687,8 +2687,10 @@ pub struct ArrayPrimaryOpt {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ArraySubscripts {
+    pub l_bracket: crate::ParserToken, /* [ */
     pub subscript: rumoca_ir_ast::Subscript,
     pub array_subscripts_list: Vec<ArraySubscriptsList>,
+    pub r_bracket: crate::ParserToken, /* ] */
 }
 
 ///
@@ -3053,7 +3055,7 @@ pub struct ComponentReference {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ComponentReferenceList {
-    pub component_ref_part: rumoca_ir_ast::ComponentRefPart,
+    pub component_ref_part: ComponentRefPart,
 }
 
 ///
@@ -3061,7 +3063,9 @@ pub struct ComponentReferenceList {
 ///
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct ComponentReferenceOpt {}
+pub struct ComponentReferenceOpt {
+    pub dot: crate::ParserToken, /* . */
+}
 
 ///
 /// Type derived for non-terminal component_referenceOpt0
@@ -4301,6 +4305,7 @@ pub struct IfEquationOptList {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct IfExpression {
+    pub r#if: If,
     pub expression: rumoca_ir_ast::Expression,
     pub expression0: rumoca_ir_ast::Expression,
     pub if_expression_list: Vec<IfExpressionList>,
@@ -4886,8 +4891,10 @@ pub struct Pure {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RangePrimary {
+    pub l_bracket: crate::ParserToken, /* [ */
     pub expression_list: ExpressionList,
     pub range_primary_list: Vec<RangePrimaryList>,
+    pub r_bracket: crate::ParserToken, /* ] */
 }
 
 ///
@@ -13907,7 +13914,7 @@ impl<'t, 'u> ModelicaGrammarAuto<'t, 'u> {
 
     /// Semantic action for production 367:
     ///
-    /// `if_expression: if^ /* Clipped */ expression then^ /* Clipped */ expression if_expressionList /* Vec */ else^ /* Clipped */ expression;`
+    /// `if_expression: if expression then^ /* Clipped */ expression if_expressionList /* Vec */ else^ /* Clipped */ expression;`
     ///
     #[parol_runtime::function_name::named]
     fn if_expression(
@@ -13929,8 +13936,9 @@ impl<'t, 'u> ModelicaGrammarAuto<'t, 'u> {
         let expression0 = pop_item!(self, expression0, Expression, context);
         self.pop(context);
         let expression = pop_item!(self, expression, Expression, context);
-        self.pop(context);
+        let r#if = pop_item!(self, r#if, If, context);
         let if_expression_built = IfExpression {
+            r#if,
             expression: (&expression)
                 .try_into()
                 .map_err(parol_runtime::ParolError::UserError)?,
@@ -15378,24 +15386,34 @@ impl<'t, 'u> ModelicaGrammarAuto<'t, 'u> {
 
     /// Semantic action for production 434:
     ///
-    /// `range_primary: '['^ /* Clipped */ expression_list range_primaryList /* Vec */ ']'^ /* Clipped */;`
+    /// `range_primary: '[' expression_list range_primaryList /* Vec */ ']';`
     ///
     #[parol_runtime::function_name::named]
     fn range_primary(
         &mut self,
-        _l_bracket: &ParseTreeType<'t>,
+        l_bracket: &ParseTreeType<'t>,
         _expression_list: &ParseTreeType<'t>,
         _range_primary_list: &ParseTreeType<'t>,
-        _r_bracket: &ParseTreeType<'t>,
+        r_bracket: &ParseTreeType<'t>,
     ) -> Result<()> {
         let context = function_name!();
         trace!("{}", self.trace_item_stack(context));
+        let l_bracket = l_bracket
+            .token()?
+            .try_into()
+            .map_err(parol_runtime::ParolError::UserError)?;
+        let r_bracket = r_bracket
+            .token()?
+            .try_into()
+            .map_err(parol_runtime::ParolError::UserError)?;
         let range_primary_list =
             pop_and_reverse_item!(self, range_primary_list, RangePrimaryList, context);
         let expression_list = pop_item!(self, expression_list, ExpressionList, context);
         let range_primary_built = RangePrimary {
+            l_bracket,
             expression_list,
             range_primary_list,
+            r_bracket,
         };
         // Calling user action here
         self.user_grammar.range_primary(&range_primary_built)?;
@@ -15865,11 +15883,7 @@ impl<'t, 'u> ModelicaGrammarAuto<'t, 'u> {
             context
         );
         let component_ref_part = pop_item!(self, component_ref_part, ComponentRefPart, context);
-        let component_reference_list_0_built = ComponentReferenceList {
-            component_ref_part: (&component_ref_part)
-                .try_into()
-                .map_err(parol_runtime::ParolError::UserError)?,
-        };
+        let component_reference_list_0_built = ComponentReferenceList { component_ref_part };
         // Add an element to the vector
         component_reference_list.push(component_reference_list_0_built);
         self.push(
@@ -15930,13 +15944,17 @@ impl<'t, 'u> ModelicaGrammarAuto<'t, 'u> {
 
     /// Semantic action for production 459:
     ///
-    /// `component_referenceOpt /* Option<T>::Some */: '.'^ /* Clipped */;`
+    /// `component_referenceOpt /* Option<T>::Some */: '.';`
     ///
     #[parol_runtime::function_name::named]
-    fn component_reference_opt_0(&mut self, _dot: &ParseTreeType<'t>) -> Result<()> {
+    fn component_reference_opt_0(&mut self, dot: &ParseTreeType<'t>) -> Result<()> {
         let context = function_name!();
         trace!("{}", self.trace_item_stack(context));
-        let component_reference_opt_0_built = ComponentReferenceOpt {};
+        let dot = dot
+            .token()?
+            .try_into()
+            .map_err(parol_runtime::ParolError::UserError)?;
+        let component_reference_opt_0_built = ComponentReferenceOpt { dot };
         self.push(
             ASTType::ComponentReferenceOpt(Some(component_reference_opt_0_built)),
             context,
@@ -17124,26 +17142,36 @@ impl<'t, 'u> ModelicaGrammarAuto<'t, 'u> {
 
     /// Semantic action for production 509:
     ///
-    /// `array_subscripts: '['^ /* Clipped */ subscript array_subscriptsList /* Vec */ ']'^ /* Clipped */;`
+    /// `array_subscripts: '[' subscript array_subscriptsList /* Vec */ ']';`
     ///
     #[parol_runtime::function_name::named]
     fn array_subscripts(
         &mut self,
-        _l_bracket: &ParseTreeType<'t>,
+        l_bracket: &ParseTreeType<'t>,
         _subscript: &ParseTreeType<'t>,
         _array_subscripts_list: &ParseTreeType<'t>,
-        _r_bracket: &ParseTreeType<'t>,
+        r_bracket: &ParseTreeType<'t>,
     ) -> Result<()> {
         let context = function_name!();
         trace!("{}", self.trace_item_stack(context));
+        let l_bracket = l_bracket
+            .token()?
+            .try_into()
+            .map_err(parol_runtime::ParolError::UserError)?;
+        let r_bracket = r_bracket
+            .token()?
+            .try_into()
+            .map_err(parol_runtime::ParolError::UserError)?;
         let array_subscripts_list =
             pop_and_reverse_item!(self, array_subscripts_list, ArraySubscriptsList, context);
         let subscript = pop_item!(self, subscript, Subscript, context);
         let array_subscripts_built = ArraySubscripts {
+            l_bracket,
             subscript: (&subscript)
                 .try_into()
                 .map_err(parol_runtime::ParolError::UserError)?,
             array_subscripts_list,
+            r_bracket,
         };
         // Calling user action here
         self.user_grammar

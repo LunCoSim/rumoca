@@ -102,6 +102,7 @@ pub(crate) fn required_expression_list_span(
 /// Handles both simple arrays like {1, 2, 3} and array comprehensions like {i for i in 1:10}
 pub(crate) fn collect_array_elements(
     args: &modelica_grammar_trait::ArrayArguments,
+    span: Span,
 ) -> anyhow::Result<rumoca_ir_ast::Expression> {
     // Check if this is an array comprehension or a simple array
     if let Some(opt) = &args.array_arguments_opt {
@@ -112,7 +113,6 @@ pub(crate) fn collect_array_elements(
                 // Simple array: collect all elements
                 let mut elements = vec![args.expression.clone()];
                 collect_array_non_first(&comma_args.array_arguments_non_first, &mut elements);
-                let span = required_expression_list_span(&elements, "array arguments")?;
                 Ok(rumoca_ir_ast::Expression::Array {
                     span,
                     elements,
@@ -129,7 +129,7 @@ pub(crate) fn collect_array_elements(
                     .as_ref()
                     .map(|opt| Arc::new(opt.expression.clone()));
                 Ok(rumoca_ir_ast::Expression::ArrayComprehension {
-                    span: args.expression.span(),
+                    span,
                     expr: Arc::new(args.expression.clone()),
                     indices,
                     filter,
@@ -139,7 +139,7 @@ pub(crate) fn collect_array_elements(
     } else {
         // Single element array
         Ok(rumoca_ir_ast::Expression::Array {
-            span: args.expression.span(),
+            span,
             elements: vec![args.expression.clone()],
             kind: rumoca_core::ArrayConstructor::Array,
         })

@@ -8459,7 +8459,7 @@ pub const PRODUCTIONS: &[Production; 523] = &[
         lhs: 140,
         production: &[ParseType::N(191)],
     },
-    // 367 - if_expression: if^ /* Clipped */ expression : rumoca_ir_ast::Expression  then^ /* Clipped */ expression : rumoca_ir_ast::Expression  if_expressionList /* Vec */ else^ /* Clipped */ expression : rumoca_ir_ast::Expression ;
+    // 367 - if_expression: if expression : rumoca_ir_ast::Expression  then^ /* Clipped */ expression : rumoca_ir_ast::Expression  if_expressionList /* Vec */ else^ /* Clipped */ expression : rumoca_ir_ast::Expression ;
     Production {
         lhs: 191,
         production: &[
@@ -8813,7 +8813,7 @@ pub const PRODUCTIONS: &[Production; 523] = &[
         lhs: 243,
         production: &[],
     },
-    // 434 - range_primary: '['^ /* Clipped */ expression_list range_primaryList /* Vec */ ']'^ /* Clipped */;
+    // 434 - range_primary: '[' expression_list range_primaryList /* Vec */ ']';
     Production {
         lhs: 252,
         production: &[
@@ -8928,7 +8928,7 @@ pub const PRODUCTIONS: &[Production; 523] = &[
             ParseType::N(64),
         ],
     },
-    // 455 - component_referenceList: component_ref_part : rumoca_ir_ast::ComponentRefPart  component_referenceList;
+    // 455 - component_referenceList: component_ref_part component_referenceList;
     Production {
         lhs: 63,
         production: &[ParseType::N(63), ParseType::N(60)],
@@ -8948,7 +8948,7 @@ pub const PRODUCTIONS: &[Production; 523] = &[
         lhs: 65,
         production: &[],
     },
-    // 459 - component_referenceOpt: '.'^ /* Clipped */;
+    // 459 - component_referenceOpt: '.';
     Production {
         lhs: 64,
         production: &[ParseType::T(80)],
@@ -9204,7 +9204,7 @@ pub const PRODUCTIONS: &[Production; 523] = &[
         lhs: 142,
         production: &[],
     },
-    // 509 - array_subscripts: '['^ /* Clipped */ subscript : rumoca_ir_ast::Subscript  array_subscriptsList /* Vec */ ']'^ /* Clipped */;
+    // 509 - array_subscripts: '[' subscript : rumoca_ir_ast::Subscript  array_subscriptsList /* Vec */ ']';
     Production {
         lhs: 26,
         production: &[

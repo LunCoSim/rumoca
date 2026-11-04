@@ -606,6 +606,9 @@ mod source_class_query_tests;
 mod class_source_span_tests;
 
 #[cfg(test)]
+mod expression_source_span_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rumoca_ir_ast as ast;
