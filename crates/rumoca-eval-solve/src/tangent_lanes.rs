@@ -96,32 +96,97 @@ pub struct TornTangentEvaluator {
     programs: Vec<PreparedTangentLaneProgram>,
     /// The JVP rows a one-direction plan evaluates.
     directions: Option<std::rc::Rc<crate::PreparedEvaluationBlock>>,
+    workspace: std::rc::Rc<RefCell<TornTangentWorkspace>>,
 }
 
-impl TornTangentEvaluator {
-    /// Prepare `plan` over the JVP rows `jvp` it was derived from.
-    pub fn new(
-        plan: TornTangentPlan,
-        jvp: &rumoca_ir_solve::ScalarProgramBlock,
-    ) -> Result<Self, EvalSolveError> {
-        Self::sharing_directions(plan, jvp, &mut None)
+/// Prepare torn blocks over one immutable JVP source, sharing its directional
+/// program preparation and one checked-out evaluation workspace.
+pub struct TornTangentPreparation<'a> {
+    jvp: &'a rumoca_ir_solve::ScalarProgramBlock,
+    directions: Option<std::rc::Rc<crate::PreparedEvaluationBlock>>,
+    workspace: std::rc::Rc<RefCell<TornTangentWorkspace>>,
+}
+
+#[derive(Default)]
+struct TornTangentWorkspace {
+    seed: Vec<f64>,
+    seed_writes: Vec<std::ops::Range<usize>>,
+    out: Vec<f64>,
+    coefficients: Vec<f64>,
+}
+
+impl TornTangentWorkspace {
+    fn prepare(
+        &mut self,
+        plan: &TornTangentPlan,
+        coordinates: usize,
+        lanes: usize,
+    ) -> Result<usize, EvalSolveError> {
+        for range in self.seed_writes.drain(..) {
+            self.seed[range].fill(0.0);
+        }
+        let len = coordinates
+            .checked_mul(lanes)
+            .ok_or_else(|| EvalSolveError::ShapeContract {
+                message: "torn tangent seed extent overflows".into(),
+                span: None,
+            })?;
+        if len > self.seed.len() {
+            self.seed
+                .try_reserve_exact(len - self.seed.len())
+                .map_err(|_| EvalSolveError::ShapeContract {
+                    message: "torn tangent seed allocation failed".into(),
+                    span: None,
+                })?;
+            self.seed.resize(len, 0.0);
+        }
+        self.out.clear();
+        self.coefficients.clear();
+        // Register every possible seed write before evaluation, so even an
+        // interrupted sweep is cleared before another plan uses these buffers.
+        let targets = plan
+            .tear_targets()
+            .iter()
+            .copied()
+            .chain(plan.steps().iter().map(|step| step.target));
+        for target in targets {
+            if target >= coordinates {
+                return Err(EvalSolveError::MissingInput {
+                    vector: "y",
+                    index: target,
+                    len: coordinates,
+                    span: None,
+                });
+            }
+            self.seed_writes.push(target * lanes..(target + 1) * lanes);
+        }
+        Ok(len)
+    }
+}
+
+impl<'a> TornTangentPreparation<'a> {
+    #[must_use]
+    pub fn new(jvp: &'a rumoca_ir_solve::ScalarProgramBlock) -> Self {
+        Self {
+            jvp,
+            directions: None,
+            workspace: std::rc::Rc::new(RefCell::new(TornTangentWorkspace::default())),
+        }
     }
 
-    /// [`Self::new`] for one of several evaluators over the same JVP rows
-    /// `jvp`: the first one-direction plan prepares them into `shared`, and
-    /// every later one reads that same preparation.
-    pub fn sharing_directions(
+    /// Prepare `plan` over this group's JVP rows. Evaluators retain the shared
+    /// preparation and workspace independently of this construction scope.
+    pub fn prepare(
+        &mut self,
         plan: TornTangentPlan,
-        jvp: &rumoca_ir_solve::ScalarProgramBlock,
-        shared: &mut Option<std::rc::Rc<crate::PreparedEvaluationBlock>>,
-    ) -> Result<Self, EvalSolveError> {
+    ) -> Result<TornTangentEvaluator, EvalSolveError> {
         let directions = if plan.directional() {
-            if shared.is_none() {
-                *shared = Some(std::rc::Rc::new(crate::PreparedEvaluationBlock::new(
-                    jvp.clone(),
+            if self.directions.is_none() {
+                self.directions = Some(std::rc::Rc::new(crate::PreparedEvaluationBlock::new(
+                    self.jvp.clone(),
                 )?));
             }
-            shared.clone()
+            self.directions.clone()
         } else {
             None
         };
@@ -131,11 +196,22 @@ impl TornTangentEvaluator {
             .cloned()
             .map(PreparedTangentLaneProgram::new)
             .collect();
-        Ok(Self {
+        Ok(TornTangentEvaluator {
             plan,
             programs,
             directions,
+            workspace: self.workspace.clone(),
         })
+    }
+}
+
+impl TornTangentEvaluator {
+    /// Prepare one standalone plan over the JVP rows it was derived from.
+    pub fn new(
+        plan: TornTangentPlan,
+        jvp: &rumoca_ir_solve::ScalarProgramBlock,
+    ) -> Result<Self, EvalSolveError> {
+        TornTangentPreparation::new(jvp).prepare(plan)
     }
 
     #[must_use]
@@ -162,25 +238,40 @@ impl TornTangentEvaluator {
         point: TangentPoint<'_>,
         call: &mut TangentProgramCall<'_>,
     ) -> Result<Option<TornTangentJacobian>, EvalSolveError> {
-        if let Some(directions) = &self.directions {
-            return self.eval_directions(directions, point, call);
-        }
+        // A callback can reenter this evaluator. Keep each invocation's buffers
+        // outside the cell until its evaluation has returned.
+        let mut workspace = self.workspace.take();
+        let result = match &self.directions {
+            Some(directions) => self.eval_directions(directions, point, call, &mut workspace),
+            None => self.eval_multilane(point, call, &mut workspace),
+        };
+        self.workspace.replace(workspace);
+        result
+    }
+
+    fn eval_multilane(
+        &self,
+        point: TangentPoint<'_>,
+        call: &mut TangentProgramCall<'_>,
+        workspace: &mut TornTangentWorkspace,
+    ) -> Result<Option<TornTangentJacobian>, EvalSolveError> {
         let lanes = self.plan.lanes();
         let tears = lanes - 1;
         let steps = self.plan.steps();
-        let mut seed = vec![0.0; point.y.len() * lanes];
+        let seed_len = workspace.prepare(&self.plan, point.y.len(), lanes)?;
+        let TornTangentWorkspace { seed, out, .. } = workspace;
+        let seed = &mut seed[..seed_len];
         for (column, &target) in self.plan.tear_targets().iter().enumerate() {
             seed[target * lanes + column] = 1.0;
         }
         let mut recovered = Vec::with_capacity(steps.len() * tears);
-        let mut out = Vec::new();
         let mut outputs = 0;
         for (index, step) in steps.iter().enumerate() {
             if step.group > 0 {
                 let group = &steps[index..index + step.group];
-                seed_group(&mut seed, group, (lanes, tears), 1.0);
-                outputs = self.eval_lanes(point, &seed, step.source.program, &mut out, call)?;
-                seed_group(&mut seed, group, (lanes, tears), 0.0);
+                seed_group(seed, group, (lanes, tears), 1.0);
+                outputs = self.eval_lanes(point, seed, step.source.program, out, call)?;
+                seed_group(seed, group, (lanes, tears), 0.0);
             }
             let tangent = |lane: usize| out[lane * outputs + step.source.output];
             let coefficient = tangent(tears);
@@ -196,7 +287,7 @@ impl TornTangentEvaluator {
         let mut residual = vec![0.0; tears * tears];
         for (row, entry) in self.plan.residuals().iter().enumerate() {
             if entry.group > 0 {
-                outputs = self.eval_lanes(point, &seed, entry.source.program, &mut out, call)?;
+                outputs = self.eval_lanes(point, seed, entry.source.program, out, call)?;
             }
             for lane in 0..tears {
                 residual[row * tears + lane] = out[lane * outputs + entry.source.output];
@@ -217,11 +308,18 @@ impl TornTangentEvaluator {
         directions: &crate::PreparedEvaluationBlock,
         point: TangentPoint<'_>,
         call: &mut TangentProgramCall<'_>,
+        workspace: &mut TornTangentWorkspace,
     ) -> Result<Option<TornTangentJacobian>, EvalSolveError> {
         let tears = self.plan.lanes() - 1;
         let steps = self.plan.steps();
-        let mut seed = vec![0.0; point.y.len()];
-        let mut out = Vec::new();
+        let seed_len = workspace.prepare(&self.plan, point.y.len(), 1)?;
+        let TornTangentWorkspace {
+            seed,
+            out,
+            coefficients,
+            ..
+        } = workspace;
+        let seed = &mut seed[..seed_len];
         let mut direction = |seed: &[f64], program: usize, out: &mut Vec<f64>| {
             if call(program, seed, out)? {
                 return Ok(());
@@ -238,15 +336,14 @@ impl TornTangentEvaluator {
                 out,
             )
         };
-        let mut coefficients = Vec::with_capacity(steps.len());
         for (index, step) in steps.iter().enumerate() {
             if step.group == 0 {
                 continue;
             }
             let group = &steps[index..index + step.group];
-            seed_group(&mut seed, group, (1, 0), 1.0);
-            direction(&seed, step.source.program, &mut out)?;
-            seed_group(&mut seed, group, (1, 0), 0.0);
+            seed_group(seed, group, (1, 0), 1.0);
+            direction(seed, step.source.program, out)?;
+            seed_group(seed, group, (1, 0), 0.0);
             coefficients.extend(group.iter().map(|member| out[member.source.output]));
             if coefficients[index..]
                 .iter()
@@ -262,7 +359,7 @@ impl TornTangentEvaluator {
             for (index, step) in steps.iter().enumerate() {
                 let fresh = step.group > 0;
                 fresh
-                    .then(|| direction(&seed, step.source.program, &mut out))
+                    .then(|| direction(seed, step.source.program, out))
                     .transpose()?;
                 let value = -out[step.source.output] / coefficients[index];
                 seed[step.target] = value;
@@ -271,7 +368,7 @@ impl TornTangentEvaluator {
             for (row, entry) in self.plan.residuals().iter().enumerate() {
                 let fresh = entry.group > 0;
                 fresh
-                    .then(|| direction(&seed, entry.source.program, &mut out))
+                    .then(|| direction(seed, entry.source.program, out))
                     .transpose()?;
                 residual[row * tears + column] = out[entry.source.output];
             }

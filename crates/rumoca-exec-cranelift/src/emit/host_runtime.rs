@@ -8,6 +8,7 @@ use std::cell::Cell;
 
 use super::{CompileError, to_backend_err};
 
+mod power_cache;
 #[cfg(test)]
 mod tests;
 
@@ -183,7 +184,7 @@ extern "C" fn rumoca_host_trunc(x: f64) -> f64 {
     x.trunc()
 }
 extern "C" fn rumoca_host_powf(x: f64, y: f64) -> f64 {
-    x.powf(y)
+    power_cache::powf(x, y)
 }
 
 pub(super) extern "C" fn rumoca_host_table_bounds_min(table_id: f64) -> f64 {

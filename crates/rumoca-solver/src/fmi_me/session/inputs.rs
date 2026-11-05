@@ -1,6 +1,6 @@
 //! Input transactions belong to the common master (SPEC_0044 ME-HOST-001/ME-BUF-001).
 
-use super::{MeSessionError, MeSessionLoss, MeSimulationSession};
+use super::{MeSessionError, MeSessionLoss, MeSimulationSession, host_state::RecordedInput};
 use crate::fmi_me::{MeTime, MeValueRef};
 
 impl MeSimulationSession<'_, '_> {
@@ -70,11 +70,26 @@ impl MeSimulationSession<'_, '_> {
     }
 
     fn record_inputs(&mut self, inputs: &[(&str, f64)]) {
-        self.host.inputs.extend(
-            inputs
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), *value)),
-        );
+        for &(name, value) in inputs {
+            if let Some(current) = self.host.inputs.get_mut(name) {
+                current.value = value;
+            } else {
+                let kernel = self.host.kernel.borrow();
+                let output_index = kernel
+                    .model_description()
+                    .output_names
+                    .iter()
+                    .rposition(|output| output == name);
+                self.host.inputs.insert(
+                    name.to_owned(),
+                    RecordedInput {
+                        value,
+                        output_index,
+                        label: rumoca_core::VarName::intern(name),
+                    },
+                );
+            }
+        }
     }
 
     fn correlate_inputs(&mut self, inputs: &[(&str, f64)]) -> Result<(), MeSessionError> {

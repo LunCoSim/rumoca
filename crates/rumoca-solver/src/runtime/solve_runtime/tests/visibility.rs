@@ -1,5 +1,134 @@
 use super::*;
 
+fn grouped_selection_diagnostic_runtime() -> SolveRuntime {
+    let programs = (0..512)
+        .map(|index| {
+            vec![
+                solve::LinearOp::Const {
+                    dst: 0,
+                    value: index as f64 + 0.5,
+                },
+                solve::LinearOp::Const {
+                    dst: 1,
+                    value: -0.0,
+                },
+                solve::LinearOp::StoreOutput { src: 0 },
+                solve::LinearOp::StoreOutput { src: 1 },
+            ]
+        })
+        .collect();
+    let model = solve::SolveModel {
+        visible_names: (0..1024).map(|index| format!("v{index}")).collect(),
+        visible_value_rows: spanned_block(programs, "grouped_selection.mo"),
+        ..Default::default()
+    };
+    SolveRuntime::new_fixture(&model).expect("grouped selection fixture is valid")
+}
+
+#[test]
+fn selected_output_workspace_preserves_order_and_rejects_invalid_selection() {
+    let runtime = grouped_selection_diagnostic_runtime();
+    let rows = native_specialization::SpecializedRows {
+        block: &runtime.visible_value_rows,
+        cache: &runtime.compiled_visible_rows,
+        failed: &runtime.failed_visible_rows,
+    };
+    let point = native_specialization::RowEvalPoint {
+        y: &[],
+        p: &[],
+        t: 0.0,
+    };
+    let evaluate = |selected: &[usize], values: &mut [f64]| {
+        runtime.eval_selected_outputs_with_native(rows, selected, point, values)
+    };
+    let mut values = vec![99.0; 1024];
+    evaluate(&(0..1024).rev().collect::<Vec<_>>(), &mut values).unwrap();
+    let allocation = runtime.selected_output_scratch.borrow().as_ptr();
+    let mut short = [99.0];
+    let error = evaluate(&[1, 0], &mut short).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("selected expression output 1 is outside output length 1")
+    );
+    assert_eq!(short, [99.0], "each program retains request order");
+    evaluate(&[0, 1], &mut short).unwrap_err();
+    assert_eq!(
+        short,
+        [0.5],
+        "a valid earlier requested output is copied first"
+    );
+    values.fill(99.0);
+    evaluate(&[3, 0, 3], &mut values).unwrap();
+    assert_eq!(values[0], 0.5);
+    assert_eq!(values[3].to_bits(), (-0.0_f64).to_bits());
+    assert!(
+        values
+            .iter()
+            .enumerate()
+            .all(|(index, &value)| index == 0 || index == 3 || value == 99.0)
+    );
+    values.fill(99.0);
+    let error = evaluate(&[0, usize::MAX], &mut values).unwrap_err();
+    assert!(error.to_string().contains("has no owning program"));
+    assert!(
+        values.iter().all(|&value| value == 99.0),
+        "selection admission precedes evaluation"
+    );
+    evaluate(&[], &mut values).unwrap();
+    assert!(values.iter().all(|&value| value == 99.0));
+    assert_eq!(
+        runtime.selected_output_scratch.borrow().as_ptr(),
+        allocation
+    );
+}
+
+#[test]
+#[ignore = "diagnostic: compare independent optimized producer executables"]
+fn selected_output_grouping_diagnostic() {
+    let runtime = grouped_selection_diagnostic_runtime();
+    let rows = native_specialization::SpecializedRows {
+        block: &runtime.visible_value_rows,
+        cache: &runtime.compiled_visible_rows,
+        failed: &runtime.failed_visible_rows,
+    };
+    let point = native_specialization::RowEvalPoint {
+        y: &[],
+        p: &[],
+        t: 0.0,
+    };
+    let mut values = vec![f64::NAN; 1024];
+    for reversed in [false, true] {
+        let mut selected = (0..1024).collect::<Vec<_>>();
+        if reversed {
+            selected.reverse();
+        }
+        selected.extend([1, 0, 1]);
+        runtime
+            .eval_selected_outputs_with_native(rows, &selected, point, &mut values)
+            .unwrap();
+        let began = std::time::Instant::now();
+        for _ in 0..512 {
+            runtime
+                .eval_selected_outputs_with_native(rows, &selected, point, &mut values)
+                .unwrap();
+            std::hint::black_box(&values);
+        }
+        let elapsed = began.elapsed().as_nanos();
+        for (index, value) in values.iter().enumerate() {
+            let expected = if index % 2 == 0 {
+                (index / 2) as f64 + 0.5
+            } else {
+                -0.0
+            };
+            assert_eq!(value.to_bits(), expected.to_bits());
+        }
+        println!(
+            "selected_output_grouping reversed={reversed} reads=512 values=1024 elapsed_ns={elapsed}"
+        );
+    }
+}
+
 #[test]
 fn selected_grouped_outputs_do_not_evaluate_unrequested_programs() {
     let grouped = vec![

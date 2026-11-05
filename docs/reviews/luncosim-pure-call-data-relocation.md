@@ -16,15 +16,17 @@ marker; runtime result cells and evaluator state never enter artifact storage.
 reference and disables colocation assumptions. The maintained Cranelift cache
 and module relocation path bind that reference to the current arena. Native
 helpers retain their two-pointer ABI. Complete input-bit comparison, seed
-inclusion, miss invalidation, publish-after-success and caller-observed
-assertion predicates are unchanged. The retired heap-cell buffers and retained
-per-table result-buffer vector are removed, with no second execution path.
+inclusion, selected-entry invalidation, publish-after-success and caller-observed
+assertion predicates remain part of the complete result tuple.
 
 This preserves the closed-input/native-owner storage contract recorded in
 SPEC_0043 §6a and the target adapter ownership of SPEC_0029/SPEC_0041. It changes
 native representation, not IR semantics or numerical policy. No hook, cache-key
 normalization, source-language rule, dependency, compiler flag or tolerance is
 introduced.
+
+The current bounded result-storage contract and its application timing are
+recorded in [native input result reuse](native-input-result-reuse-2026-11-04.md).
 
 ## Reproduction and focused verification
 

@@ -81,6 +81,14 @@ impl BackendSimulationSession {
     }
 
     #[cfg(feature = "solver-rk45")]
+    pub(crate) fn visit_visible_values(
+        &self,
+        visit: impl FnMut(&rumoca_core::VarName, f64),
+    ) -> Result<(), SimError> {
+        self.session.visit_visible_values(visit).map_err(Into::into)
+    }
+
+    #[cfg(feature = "solver-rk45")]
     pub(crate) fn values_for(&self, names: &[String]) -> Result<IndexMap<String, f64>, SimError> {
         let visible = self.visible_values()?;
         Ok(names

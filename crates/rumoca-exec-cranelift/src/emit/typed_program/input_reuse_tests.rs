@@ -58,6 +58,52 @@ fn native_pure_call_reuses_only_identical_complete_input_bits() {
 }
 
 #[test]
+fn native_pure_call_retains_interleaved_input_coordinates() {
+    let table = unary_owner(solve::SolveUnaryOperator::Sin);
+    let compiled = CompiledPureCallTable::compile(&table).unwrap();
+    let site = table.owners()[0].call_site();
+    take_sin_calls();
+    for x in [0.7_f64, -0.7, 0.7, -0.7] {
+        let mut output = [0];
+        compiled
+            .call_cells(
+                rumoca_eval_solve::PureCallInvocation::Primal(&site),
+                &[x.to_bits()],
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(output, [x.sin().to_bits()]);
+    }
+    assert_eq!(
+        take_sin_calls(),
+        2,
+        "interleaved coordinates retain their own completed results"
+    );
+}
+
+#[test]
+fn colliding_native_input_coordinates_keep_exact_results() {
+    let table = unary_owner(solve::SolveUnaryOperator::Sin);
+    let compiled = CompiledPureCallTable::compile(&table).unwrap();
+    let site = table.owners()[0].call_site();
+    // More distinct coordinates than retained entries force replacement.
+    for pass in 0..2 {
+        for index in 0..257 {
+            let x = (index as f64 + pass as f64 * 0.25) / 32.0;
+            let mut output = [0];
+            compiled
+                .call_cells(
+                    rumoca_eval_solve::PureCallInvocation::Primal(&site),
+                    &[x.to_bits()],
+                    &mut output,
+                )
+                .unwrap();
+            assert_eq!(output, [x.sin().to_bits()]);
+        }
+    }
+}
+
+#[test]
 fn directional_input_reuse_includes_seed_and_is_separate_from_primal() {
     let table = unary_owner(solve::SolveUnaryOperator::Sin);
     let compiled = CompiledPureCallTable::compile(&table).unwrap();
@@ -174,6 +220,7 @@ fn failed_native_evaluation_never_publishes_a_result() {
     let site = table.owners()[0].call_site();
     take_sin_calls();
     for a in [2.0_f64, 0.0, 0.0, 2.0, 2.0] {
+        take_sin_calls();
         let input = [a, 0.0, 0.0, 3.0, 0.1, 0.2].map(f64::to_bits);
         let mut output = [0; 3];
         let result = compiled.call_cells(
@@ -183,16 +230,16 @@ fn failed_native_evaluation_never_publishes_a_result() {
         );
         if a == 0.0 {
             assert!(result.unwrap_err().to_string().contains("linear solve"));
+            assert_eq!(
+                take_sin_calls(),
+                2,
+                "each failed coordinate is evaluated again"
+            );
         } else {
             result.unwrap();
             assert_eq!(output[0], (0.1_f64.sin() / a).to_bits());
         }
     }
-    assert_eq!(
-        take_sin_calls(),
-        8,
-        "two failed calls rerun, and success after failure recomputes"
-    );
 }
 
 #[test]

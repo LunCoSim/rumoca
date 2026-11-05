@@ -231,6 +231,14 @@ impl SimulationSession {
         self.inner.parameter_values()
     }
 
+    /// Visit the common ME host's complete observation with applied inputs.
+    pub fn visit_visible_values(
+        &self,
+        visit: impl FnMut(&rumoca_core::VarName, f64),
+    ) -> Result<(), SimError> {
+        self.inner.visit_visible_values(visit)
+    }
+
     pub fn values_for(&self, names: &[String]) -> Result<IndexMap<String, f64>, SimError> {
         self.inner.values_for(names)
     }

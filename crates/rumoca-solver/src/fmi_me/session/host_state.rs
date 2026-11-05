@@ -13,6 +13,7 @@ use std::{
 };
 
 use indexmap::IndexMap;
+use rumoca_core::VarName;
 
 use super::{MeSessionError, MeSessionLoss, MeSessionOptions, try_copied, try_filled};
 use crate::{
@@ -143,6 +144,13 @@ fn read_outputs(kernel: &SolveMeKernel) -> Result<Vec<f64>, MeError> {
     Ok(values)
 }
 
+/// One admitted input and its position in immutable component output metadata.
+pub(super) struct RecordedInput {
+    pub(super) value: f64,
+    pub(super) output_index: Option<usize>,
+    pub(super) label: VarName,
+}
+
 /// Everything the master algorithm owns except the numerical plugin.
 pub(super) struct MeHostState {
     pub(super) kernel: Rc<RefCell<SolveMeKernel>>,
@@ -174,7 +182,9 @@ pub(super) struct MeHostState {
     pub(super) state_count: usize,
     pub(super) indicator_count: usize,
     pub(super) input_names: Vec<String>,
-    pub(super) inputs: IndexMap<String, f64>,
+    /// Immutable output labels held through the canonical variable-name owner.
+    pub(super) output_labels: Box<[VarName]>,
+    pub(super) inputs: IndexMap<String, RecordedInput>,
     pub(super) pristine: MeFmuState,
     pub(super) event_streak_time: Option<f64>,
     pub(super) event_streak_count: usize,

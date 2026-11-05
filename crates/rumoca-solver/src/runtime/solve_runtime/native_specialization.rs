@@ -3,16 +3,16 @@
 //! Every row an event pass evaluates more than a handful of times is compiled
 //! once through the execution backend and replayed; the reference interpreter
 //! stays the fallback and the oracle, never the plan. The cache and the failure
-//! set are passed in, so one mechanism serves the discrete rows, the root
-//! conditions, the visible-value rows, and the SOLVE-C57 clock-partition
-//! intermediates without any of them re-deriving compilation policy.
+//! set are passed in, so one mechanism serves discrete rows, visible-value
+//! rows and SOLVE-C57 clock-partition intermediates without re-deriving
+//! compilation policy.
 
 use super::*;
 
 /// One prepared scalar program block together with the compiled
 /// specializations and the refusals already recorded for its rows.
 ///
-/// The discrete rows, the root conditions, the visible-value rows, and the
+/// The discrete rows, visible-value rows, and the
 /// clock-partition intermediates each own a block, a cache, and a failure set;
 /// naming the trio keeps one compilation policy serving all of them.
 #[derive(Clone, Copy)]
@@ -31,6 +31,39 @@ pub(super) struct RowEvalPoint<'a> {
     pub(super) y: &'a [f64],
     pub(super) p: &'a [f64],
     pub(super) t: f64,
+}
+
+/// One selected output in deterministic program and request order.
+#[derive(Clone)]
+pub(super) struct SelectedProgramOutput {
+    pub(super) program: usize,
+    request_order: usize,
+    pub(super) output: usize,
+    pub(super) offset: usize,
+}
+
+pub(super) fn prepare_selected_program_outputs(
+    selected: &mut Vec<SelectedProgramOutput>,
+    block: &PreparedScalarProgramBlock,
+    output_indices: &[usize],
+) -> Result<(), RuntimeSolveError> {
+    selected.clear();
+    reserve_runtime_vec_capacity(selected, output_indices.len(), "selected program outputs")?;
+    for (request_order, &output) in output_indices.iter().enumerate() {
+        let (program, offset) = block.row_output_position(output).ok_or_else(|| {
+            RuntimeSolveError::solve_ir(format!(
+                "selected expression output {output} has no owning program"
+            ))
+        })?;
+        selected.push(SelectedProgramOutput {
+            program,
+            request_order,
+            output,
+            offset,
+        });
+    }
+    selected.sort_unstable_by_key(|row| (row.program, row.request_order));
+    Ok(())
 }
 
 impl SolveRuntime {
@@ -161,22 +194,17 @@ impl SolveRuntime {
             cache,
             failed,
         } = rows;
-        let mut programs = BTreeMap::<usize, Vec<(usize, usize)>>::new();
-        for &output in output_indices {
-            let (program, offset) = block.row_output_position(output).ok_or_else(|| {
-                RuntimeSolveError::solve_ir(format!(
-                    "selected expression output {output} has no owning program"
-                ))
-            })?;
-            programs.entry(program).or_default().push((output, offset));
-        }
-        for (program, selected) in programs {
-            if self.try_compiled_program_outputs(cache, program, &selected, point, out)? {
+        let mut selection = self.selected_output_scratch.borrow_mut();
+        prepare_selected_program_outputs(&mut selection, block, output_indices)?;
+        for group in selection.chunk_by(|left, right| left.program == right.program) {
+            let program = group[0].program;
+            let selected = group.iter().map(|row| (row.output, row.offset));
+            if self.try_compiled_program_outputs(cache, program, selected.clone(), point, out)? {
                 continue;
             }
             failed.borrow_mut().remove(&program);
             self.compile_cached_row(rows, program);
-            if self.try_compiled_program_outputs(cache, program, &selected, point, out)? {
+            if self.try_compiled_program_outputs(cache, program, selected.clone(), point, out)? {
                 continue;
             }
             let mut values = Vec::new();
@@ -188,7 +216,7 @@ impl SolveRuntime {
                 self.row_eval_context(),
                 &mut values,
             )?;
-            copy_interpreted_program_outputs(&values, program, &selected, out)?;
+            copy_interpreted_program_outputs(&values, program, selected, out)?;
             self.compile_cached_row(rows, program);
         }
         Ok(())
@@ -198,7 +226,7 @@ impl SolveRuntime {
         &self,
         cache: &RefCell<FxHashMap<usize, Vec<CompiledDiscreteSpecialization>>>,
         program: usize,
-        selected: &[(usize, usize)],
+        selected: impl Iterator<Item = (usize, usize)> + Clone,
         point: RowEvalPoint<'_>,
         out: &mut [f64],
     ) -> Result<bool, RuntimeSolveError> {
@@ -237,7 +265,7 @@ impl SolveRuntime {
             if !valid {
                 continue;
             }
-            copy_compiled_program_outputs(&scratch, program, selected, out)?;
+            copy_compiled_program_outputs(&scratch, program, selected.clone(), out)?;
             drop(scratch);
             if variant_index + 1 != compiled_variants.len() {
                 let compiled = compiled_variants.remove(variant_index);
@@ -361,10 +389,10 @@ impl SolveRuntime {
 fn copy_interpreted_program_outputs(
     values: &[f64],
     program: usize,
-    selected: &[(usize, usize)],
+    selected: impl Iterator<Item = (usize, usize)>,
     out: &mut [f64],
 ) -> Result<(), RuntimeSolveError> {
-    for &(output, offset) in selected {
+    for (output, offset) in selected {
         let value = values.get(offset).copied().ok_or_else(|| {
             RuntimeSolveError::solve_ir(format!(
                 "selected expression output {output} offset {offset} is outside program {program}"
@@ -384,10 +412,10 @@ fn copy_interpreted_program_outputs(
 fn copy_compiled_program_outputs(
     values: &[f64],
     program: usize,
-    selected: &[(usize, usize)],
+    selected: impl Iterator<Item = (usize, usize)>,
     out: &mut [f64],
 ) -> Result<(), RuntimeSolveError> {
-    for &(output, offset) in selected {
+    for (output, offset) in selected {
         let value = values.get(offset).copied().ok_or_else(|| {
             RuntimeSolveError::solve_ir(format!(
                 "compiled expression output {offset} is outside program {program}"

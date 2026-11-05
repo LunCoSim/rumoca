@@ -1048,6 +1048,18 @@ impl ImplicitProjectionModel for RefreshProjectionModel<'_> {
     }
 }
 
+#[cfg(any(debug_assertions, test))]
+fn same_f64_bits(reference: &[f64], batched: &[f64]) -> bool {
+    reference.len() == batched.len()
+        && reference
+            .iter()
+            .zip(batched)
+            .fold(0_u64, |different, (a, b)| {
+                different | (a.to_bits() ^ b.to_bits())
+            })
+            == 0
+}
+
 impl RefreshProjectionModel<'_> {
     /// Debug-only strict-refinement guard: replay the sweep through the
     /// per-row reference path from the same entry point and require the same
@@ -1079,19 +1091,12 @@ impl RefreshProjectionModel<'_> {
             "batched torn sweep disagrees with the per-row sweep on declining"
         );
         if reference_completed && batched_completed {
-            let bits_equal = |reference: &[f64], batched: &[f64]| {
-                reference.len() == batched.len()
-                    && reference
-                        .iter()
-                        .zip(batched)
-                        .all(|(a, b)| a.to_bits() == b.to_bits())
-            };
             debug_assert!(
-                bits_equal(&workspace.reference_y, batched_y),
+                same_f64_bits(&workspace.reference_y, batched_y),
                 "batched torn sweep diverged from the per-row sweep in solver values"
             );
             debug_assert!(
-                bits_equal(&workspace.reference_residuals, batched_residual),
+                same_f64_bits(&workspace.reference_residuals, batched_residual),
                 "batched torn sweep diverged from the per-row sweep in residual values"
             );
         }

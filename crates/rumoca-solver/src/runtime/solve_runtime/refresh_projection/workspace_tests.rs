@@ -4,6 +4,37 @@ use crate::runtime::solve_runtime::tests::{
 };
 use std::cell::Cell;
 
+#[test]
+fn strict_refinement_compares_every_f64_bit() {
+    let special = [
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(1),
+        f64::from_bits(0x7ff0_0000_0000_0001),
+        f64::from_bits(0x7ff8_0000_0000_0001),
+        f64::from_bits(0xfff8_0000_0000_0001),
+    ];
+    for len in 0..=67 {
+        let reference: Vec<_> = (0..len).map(|i| special[i % special.len()]).collect();
+        let mut batched = reference.clone();
+        assert!(same_f64_bits(&reference, &batched));
+        for index in 0..len {
+            batched[index] = f64::from_bits(reference[index].to_bits() ^ 1);
+            assert!(
+                !same_f64_bits(&reference, &batched),
+                "len={len}, index={index}"
+            );
+            batched[index] = reference[index];
+        }
+        batched.push(0.0);
+        assert!(!same_f64_bits(&reference, &batched));
+        assert!(!same_f64_bits(&batched, &reference));
+    }
+    assert!(!same_f64_bits(&[0.0], &[-0.0]));
+}
+
 fn rows() -> Vec<Vec<solve::LinearOp>> {
     use solve::BinaryOp::{Add, Sub};
     use solve::LinearOp::{Binary, LoadTime, LoadY, StoreOutput};
