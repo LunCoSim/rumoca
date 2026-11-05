@@ -84,7 +84,8 @@ pub use table_runtime::{
 };
 pub use tangent_lanes::{
     ColoredTangentEvaluator, PreparedTangentLaneProgram, TangentPoint, TangentProgramCall,
-    TornTangentEvaluator, TornTangentJacobian, causal_coefficient_is_finite,
+    TornTangentEvaluator, TornTangentJacobian, TornTangentPreparation,
+    causal_coefficient_is_finite,
 };
 pub use typed_program::{
     TypedProgramEvalError, TypedValue, TypedValueConstructionError, eval_pure_call,

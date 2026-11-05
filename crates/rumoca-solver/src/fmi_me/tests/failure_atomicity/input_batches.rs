@@ -26,6 +26,9 @@ fn unchanged_inputs_preserve_history_even_before_the_first_host_write() {
         session.visible_values().is_err(),
         "failed correlation ends the session"
     );
+    let mut visited = 0;
+    assert!(session.visit_visible_values(|_, _| visited += 1).is_err());
+    assert_eq!(visited, 0, "a failed observation publishes no values");
 }
 
 #[test]
@@ -89,4 +92,82 @@ fn a_whole_input_batch_restarts_once_and_invalid_batches_change_nothing() {
         session.verification_component_point(),
         session.verification_session_point()
     );
+    let expected: Vec<_> = session
+        .visible_values()
+        .unwrap()
+        .into_iter()
+        .map(|(name, value)| (name, value.to_bits()))
+        .collect();
+    let mut actual = Vec::new();
+    session
+        .visit_visible_values(|name, value| actual.push((name.clone(), value.to_bits())))
+        .unwrap();
+    assert_eq!(
+        actual
+            .iter()
+            .map(|(name, value)| (name.to_string(), *value))
+            .collect::<Vec<_>>(),
+        expected,
+        "the ordered visitor includes hidden inputs and signed zero"
+    );
+    assert_eq!(actual.last().unwrap().0.as_str(), "v");
+    assert_eq!(actual.last().unwrap().1, (-0.0_f64).to_bits());
+    let mut repeated = Vec::new();
+    session
+        .visit_visible_values(|name, value| repeated.push((name.clone(), value.to_bits())))
+        .unwrap();
+    assert_eq!(actual, repeated);
+    for ((first, _), (second, _)) in actual.iter().zip(&repeated) {
+        assert_eq!(first.as_str().as_ptr(), second.as_str().as_ptr());
+    }
+    session.reset(0.0).unwrap();
+    let mut reset = Vec::new();
+    session
+        .visit_visible_values(|name, value| reset.push((name.to_string(), value.to_bits())))
+        .unwrap();
+    assert!(
+        !reset.iter().any(|(name, _)| name == "v"),
+        "reset retires applied-input metadata"
+    );
+}
+
+#[test]
+#[ignore = "manual complete input transaction measurement"]
+fn repeated_input_transaction_diagnostic() {
+    for width in [1, 8, 32, 128] {
+        let mut model = branch_component_with_input();
+        model.problem.solve_layout.compiled_parameter_len = width;
+        for index in 1..width {
+            model
+                .problem
+                .solve_layout
+                .input_scalar_names
+                .push(format!("input_{index}"));
+            model.parameters.push(1.0);
+        }
+        let model = refresh_owned(model);
+        let mut retained = retained_branch_component(&model);
+        let mut session = plugin_session(&mut retained, FaultyPlugin::new(PluginFault::Healthy));
+        let names = session.input_names();
+        assert_eq!(names.len(), width);
+        let inputs: Vec<_> = names.iter().map(|name| (name.as_str(), 1.0)).collect();
+        session.set_inputs(&inputs).unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..4_000 {
+            session.set_inputs(std::hint::black_box(&inputs)).unwrap();
+        }
+        let elapsed = started.elapsed();
+        let values = session.visible_values().unwrap();
+        for name in names {
+            assert_eq!(values[&name].to_bits(), 1.0_f64.to_bits());
+        }
+        assert_eq!(
+            session.verification_component_point(),
+            session.verification_session_point()
+        );
+        println!(
+            "input_transaction width={width} batches=4000 elapsed_ns={}",
+            elapsed.as_nanos()
+        );
+    }
 }

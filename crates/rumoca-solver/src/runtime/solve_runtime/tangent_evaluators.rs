@@ -15,8 +15,7 @@ pub(super) fn torn_tangent_evaluators(
     backend: Option<&Rc<dyn SolveExecutionBackend>>,
     directional: Option<&Rc<dyn CompiledSolveJacobianExpression>>,
 ) -> Result<Rc<[Option<PreparedTornTangent>]>, EvalSolveError> {
-    // One-direction plans all read the same JVP rows; prepare them once.
-    let mut shared = None;
+    let mut shared = rumoca_eval_solve::TornTangentPreparation::new(jvp);
     plan.blocks
         .iter()
         .map(|block| {
@@ -40,11 +39,7 @@ pub(super) fn torn_tangent_evaluators(
                     compiled = directional.cloned();
                 }
             }
-            let evaluator = rumoca_eval_solve::TornTangentEvaluator::sharing_directions(
-                plan,
-                jvp,
-                &mut shared,
-            )?;
+            let evaluator = shared.prepare(plan)?;
             Ok(Some(PreparedTornTangent {
                 evaluator,
                 compiled,

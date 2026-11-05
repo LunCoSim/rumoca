@@ -15,6 +15,7 @@
 mod error;
 mod host_state;
 mod inputs;
+mod observations;
 mod options;
 
 use std::{
@@ -158,6 +159,10 @@ fn build_host_state(
             borrowed.max_step_duration_value_reference(),
         )
     };
+    let output_labels = names
+        .iter()
+        .map(|name| rumoca_core::VarName::intern(name))
+        .collect();
     let capacity = trace_capacity(&options);
     let mut trace = MeTraceRecorder::new(names, meta, state_count, capacity)?;
     let outcome =
@@ -192,6 +197,7 @@ fn build_host_state(
         state_count,
         indicator_count,
         input_names,
+        output_labels,
         inputs: IndexMap::new(),
         pristine,
         event_streak_time: None,
@@ -369,32 +375,6 @@ impl MeSimulationSession<'_, '_> {
 
     pub fn output_meta(&self) -> Vec<SimVariableMeta> {
         self.host.output_meta()
-    }
-
-    /// Batched `fmi3GetFloat64` over every output at the current coordinate.
-    pub fn output_values(&self) -> Result<Vec<f64>, MeSessionError> {
-        self.require_live()?;
-        Ok(self.host.observe_current()?)
-    }
-
-    /// Current visible values keyed by name, including host-applied inputs.
-    pub fn visible_values(&self) -> Result<IndexMap<String, f64>, MeSessionError> {
-        let names = self.output_names();
-        let values = self.output_values()?;
-        if names.len() != values.len() {
-            return Err(MeSessionError::Contract {
-                reason: format!(
-                    "the component returned {} output values for {} declared outputs",
-                    values.len(),
-                    names.len()
-                ),
-            });
-        }
-        let mut visible: IndexMap<String, f64> = names.into_iter().zip(values).collect();
-        for (name, value) in &self.host.inputs {
-            visible.insert(name.clone(), *value);
-        }
-        Ok(visible)
     }
 
     /// Current initialized numeric parameters, including dependent and

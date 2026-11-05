@@ -2,6 +2,7 @@
 
 mod native_manifold;
 mod native_projection_residual;
+mod root_batches;
 mod seed_linearization;
 mod state_jacobian_pattern;
 
