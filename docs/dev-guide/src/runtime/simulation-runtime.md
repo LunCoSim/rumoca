@@ -148,38 +148,51 @@ admitted selection, drops with the runtime, and is independently owned by a
 runtime clone. Every reader refills it before use, including after a failed
 selection or numerical reset.
 
+## Fixed output execution
+
+`SolveRuntime`'s private `PreparedOutputSelection` owns checked preparation and
+execution of fixed expression memberships. Both `PreparedRootConditionPlan` and
+`PreparedVisibleValuePlan` contain this executable selection with their semantic
+metadata. A runtime cannot install a fixed plan without its prepared selection;
+root and visible readers have no per-row specialization cache or raw selection
+argument. They dispatch through the same owner.
+
+Selected complete source programs retain ascending program order, original
+operations and source spans. Their complete outputs feed a retained map back to
+selected global positions, including grouped, sparse and repeated requests.
+Visible direct sources and deduplicated expression groups retain their existing
+semantics; grouped visible programs use the same prepared selector. The standard
+whole-block backend receives one dispatch per nonempty selection and owns kernel
+chunking. The checked interpreter consumes that same projection if compilation
+is declined. Admitted native execution errors propagate without interpreter retry.
+Destination extents are checked before execution, and failed execution publishes
+no selected values.
+
+Only structurally equal immutable programs share code across identical selections
+or alternate charts. Changed selections compile independently and cannot execute
+superseded programs through an overlay. Numerical scratch remains runtime-owned
+and is overwritten for every evaluation. Current state, parameters, time, external
+tables and evaluator context are read on every call; no numerical value or COM
+term is memoized. Dynamic guarded event/discrete memberships retain their own
+specialization mechanism, using the common selected-program/output admission
+helper. Their membership and guard decisions are not fixed observation plans.
+
+The solver's `fixed_outputs` and `prepared_outputs::tests` cover native dispatch
+cardinality, terminal native errors, compilation decline, alternate replacement,
+grouped/sparse/duplicate ownership, signed zero and invalid destinations. The
+native adapter's `native_execution::tests::root_batches` diagnostics measure
+complete root and visible selections at 384 outputs over 512 fresh-time reads,
+asserting every f64 bit. Pair independent executables with a fixed MSL canary
+and production Rhai observation, initialization, reset and fault gates. Fixture
+throughput is not whole-worker or FPS acceptance.
+
 ## Root condition execution
 
-The existing root plan owns the public and root-search memberships, including
-announced-time and continuously static defaults. `SolveRuntime` prepares each
-fixed selection as a checked `ScalarProgramBlock` at construction. Selected
-source programs retain ascending program order, original operations and source
-spans; their complete outputs feed a retained map back to the selected global
-positions. Unselected programs do not execute. Grouped, sparse and repeated
-output requests retain their declared identity and f64 bits.
-
-The standard whole-block native expression backend receives one dispatch for
-each nonempty selection; backend kernel chunking remains its own mechanism.
-Identical public/search selections and alternate-chart programs share immutable
-code only after structural equality. Changed selections compile independently,
-so a replacement cannot execute a superseded program through an overlay.
-Numerical buffers remain runtime-owned and are overwritten at every evaluation.
-Current state, parameters, time, external tables and evaluator context are read
-for every call; no input-dependent value or COM term is memoized.
-
-A backend compilation decline uses the prepared interpreter over the same
-selected programs. An admitted native execution error propagates without
-recompilation or interpreter retry. Destination extents are checked before
-execution, and failed evaluation publishes no selected values. The state/root
-refresh, root-location algorithm and indicator-default rules are unchanged.
-
-The solver's `root_batches` and `root_condition_batches::tests` cover native
-batch cardinality, terminal errors, grouped/sparse/duplicate ownership, signed
-zero, skipped programs and invalid destinations. The native adapter's ignored
-`native_execution::tests::root_batches::fixed_root_selection_diagnostic` measures
-384 complete root values over 512 fresh-time evaluations and asserts every f64
-bit. Pair that diagnostic with the fixed MSL canary and a source-matched
-production co-simulation run; it is not whole-worker or FPS acceptance.
+The root plan owns public and root-search memberships, including announced-time
+and continuously static defaults. Its prepared form carries those entries and
+both fixed output selections together. Identical public/search memberships share
+immutable preparation. The state/root refresh, root-location algorithm and
+indicator-default rules remain with their existing owners.
 
 ## Incremental visible observations
 

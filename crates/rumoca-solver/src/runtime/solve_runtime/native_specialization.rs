@@ -7,6 +7,7 @@
 //! rows and SOLVE-C57 clock-partition intermediates without re-deriving
 //! compilation policy.
 
+use super::prepared_outputs::prepare_selected_program_outputs;
 use super::*;
 
 /// One prepared scalar program block together with the compiled
@@ -31,39 +32,6 @@ pub(super) struct RowEvalPoint<'a> {
     pub(super) y: &'a [f64],
     pub(super) p: &'a [f64],
     pub(super) t: f64,
-}
-
-/// One selected output in deterministic program and request order.
-#[derive(Clone)]
-pub(super) struct SelectedProgramOutput {
-    pub(super) program: usize,
-    request_order: usize,
-    pub(super) output: usize,
-    pub(super) offset: usize,
-}
-
-pub(super) fn prepare_selected_program_outputs(
-    selected: &mut Vec<SelectedProgramOutput>,
-    block: &PreparedScalarProgramBlock,
-    output_indices: &[usize],
-) -> Result<(), RuntimeSolveError> {
-    selected.clear();
-    reserve_runtime_vec_capacity(selected, output_indices.len(), "selected program outputs")?;
-    for (request_order, &output) in output_indices.iter().enumerate() {
-        let (program, offset) = block.row_output_position(output).ok_or_else(|| {
-            RuntimeSolveError::solve_ir(format!(
-                "selected expression output {output} has no owning program"
-            ))
-        })?;
-        selected.push(SelectedProgramOutput {
-            program,
-            request_order,
-            output,
-            offset,
-        });
-    }
-    selected.sort_unstable_by_key(|row| (row.program, row.request_order));
-    Ok(())
 }
 
 impl SolveRuntime {

@@ -61,21 +61,28 @@ pub(super) struct RootConditionPlan {
 
 pub(super) fn visible_value_plan(model: &solve::SolveModel) -> Option<VisibleValuePlan> {
     let rows = &model.visible_value_rows;
-    if rows.row_count() != model.visible_names.len()
-        || rows.output_count() != model.visible_names.len()
+    if rows.output_count() != model.visible_names.len()
         || !rows.uses_local_contiguous_output_indices()
     {
         return None;
+    }
+    if rows.row_count() != model.visible_names.len()
+        || rows
+            .programs()
+            .iter()
+            .any(|row| solve::ScalarProgramBlock::program_output_count(row) != 1)
+    {
+        return Some(VisibleValuePlan {
+            entries: vec![VisibleValuePlanEntry::Expression; model.visible_names.len()],
+            expression_rows: (0..model.visible_names.len()).collect(),
+            expression_groups: Vec::new(),
+        });
     }
     let mut entries = Vec::with_capacity(rows.row_count());
     let mut expression_rows = Vec::new();
     let mut expression_groups = Vec::new();
     let mut expression_groups_by_fingerprint = FxHashMap::<u64, Vec<usize>>::default();
     for (row_idx, row) in rows.programs().iter().enumerate() {
-        let output_count = solve::ScalarProgramBlock::program_output_count(row);
-        if output_count != 1 {
-            return None;
-        }
         if let Some(source) = direct_visible_source(row, rows.program_span(row_idx)) {
             entries.push(VisibleValuePlanEntry::Direct(source));
             continue;
@@ -288,10 +295,10 @@ pub(super) fn direct_time_root_time(
 }
 
 pub(super) fn copy_grouped_expression_values(
-    plan: &VisibleValuePlan,
+    groups: &[VisibleExpressionGroup],
     values: &mut [f64],
 ) -> Result<(), RuntimeSolveError> {
-    for group in &plan.expression_groups {
+    for group in groups {
         let value = values
             .get(group.row_index)
             .copied()

@@ -1008,7 +1008,7 @@ impl SolveRuntime {
 
     pub(super) fn write_planned_visible_values(
         &self,
-        plan: &VisibleValuePlan,
+        plan: &PreparedVisibleValuePlan,
         y: &[f64],
         params: &[f64],
         t: f64,
@@ -1019,19 +1019,9 @@ impl SolveRuntime {
                 *slot = direct_visible_value(source, y, params, t)?;
             }
         }
-        if !plan.expression_rows.is_empty() {
-            self.eval_single_output_rows_with_native(
-                SpecializedRows {
-                    block: &self.visible_value_rows,
-                    cache: &self.compiled_visible_rows,
-                    failed: &self.failed_visible_rows,
-                },
-                &plan.expression_rows,
-                RowEvalPoint { y, p: params, t },
-                values,
-            )?;
-            copy_grouped_expression_values(plan, values)?;
-        }
+        plan.expressions
+            .evaluate(self, RowEvalPoint { y, p: params, t }, values)?;
+        copy_grouped_expression_values(&plan.expression_groups, values)?;
         Ok(())
     }
 

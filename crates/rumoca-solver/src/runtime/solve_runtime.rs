@@ -59,9 +59,10 @@ mod interpreted_schedules;
 mod manifold_execution;
 mod native_projection_assignments;
 mod native_specialization;
-mod root_condition_batches;
+mod prepared_outputs;
+mod prepared_plans;
 use native_specialization::{RowEvalPoint, SpecializedRows};
-use root_condition_batches::RootConditionBatches;
+use prepared_plans::{PreparedRootConditionPlan, PreparedVisibleValuePlan};
 mod plans;
 mod refresh_batch;
 mod refresh_execution;
@@ -87,9 +88,9 @@ pub use initial_event::{
     ProjectedPostInitialEventInput,
 };
 use plans::{
-    RootConditionPlan, RootConditionPlanEntry, VisibleValuePlan, VisibleValuePlanEntry,
-    copy_grouped_expression_values, direct_time_root_search_default, direct_time_root_value,
-    direct_visible_value, root_condition_plan, total_root_condition_count, visible_value_plan,
+    RootConditionPlanEntry, VisibleValuePlanEntry, copy_grouped_expression_values,
+    direct_time_root_search_default, direct_time_root_value, direct_visible_value,
+    root_condition_plan, total_root_condition_count, visible_value_plan,
 };
 use refresh_execution::static_refresh_parameter_indices;
 use refresh_projection::*;
@@ -418,8 +419,7 @@ pub struct SolveRuntime {
     compiled_root_conditions: Option<Rc<dyn CompiledSolveExpression>>,
     event_action_conditions: PreparedScalarProgramBlock,
     event_action_active_row_indices: RefCell<Vec<usize>>,
-    root_condition_plan: Option<RootConditionPlan>,
-    root_condition_batches: Option<RootConditionBatches>,
+    root_condition_plan: Option<PreparedRootConditionPlan>,
     discrete_rhs: PreparedScalarProgramBlock,
     /// Compiler-selected scalar rows for public observation, indexed once.
     observation_refresh_scalar_rows: Box<[usize]>,
@@ -444,7 +444,7 @@ pub struct SolveRuntime {
     structured_discrete_rows: PreparedStructuredDiscreteRows,
     visible_name_index: FxHashMap<String, usize>,
     visible_value_rows: PreparedScalarProgramBlock,
-    visible_value_plan: Option<VisibleValuePlan>,
+    visible_value_plan: Option<PreparedVisibleValuePlan>,
     visible_scratch: RefCell<Vec<f64>>,
     refresh_snapshot_scratch: RefCell<Vec<f64>>,
     refresh_probe_scratch: RefCell<Vec<f64>>,
@@ -476,8 +476,6 @@ pub struct SolveRuntime {
     compiled_event_transactions: Vec<Option<Rc<dyn CompiledSolveEventTransaction>>>,
     event_transaction_input_scratch: RefCell<Vec<f64>>,
     event_transaction_output_scratch: RefCell<Vec<Vec<f64>>>,
-    compiled_visible_rows: RefCell<FxHashMap<usize, Vec<CompiledDiscreteSpecialization>>>,
-    failed_visible_rows: RefCell<BTreeSet<usize>>,
     compiled_event_action_rows: RefCell<FxHashMap<usize, Vec<CompiledDiscreteSpecialization>>>,
     failed_event_action_rows: RefCell<BTreeSet<usize>>,
     /// Warning-level assertion sites reported so far (MLS §8.3.7).
@@ -488,7 +486,7 @@ pub struct SolveRuntime {
     interpreted_assignment_schedules: interpreted_schedules::InterpretedSchedules,
     native_projection_assignments: native_projection_assignments::NativeProjectionAssignments,
     compiled_output_scratch: RefCell<Vec<f64>>,
-    selected_output_scratch: RefCell<Vec<native_specialization::SelectedProgramOutput>>,
+    selected_output_scratch: RefCell<Vec<prepared_outputs::SelectedProgramOutput>>,
     clock_activation_cache: RefCell<ClockActivationCache>,
 }
 
@@ -781,20 +779,29 @@ impl SolveRuntime {
             });
         }
         trace_reverse_projection_coverage(model, &implicit_scalar_rhs);
-        let visible_value_plan = visible_value_plan(model);
-        let root_condition_plan = root_condition_plan(model);
+        let visible_value_rows = prepare(
+            |primary| &primary.visible_value_rows,
+            model.visible_value_rows.clone(),
+        )?;
+        let visible_value_plan = visible_value_plan(model)
+            .map(|plan| {
+                plan.prepare(
+                    &visible_value_rows,
+                    execution_backend.as_ref(),
+                    primary.and_then(|runtime| runtime.visible_value_plan.as_ref()),
+                )
+            })
+            .transpose()?;
         let root_condition_rows = prepare(
             |primary| &primary.root_condition_rows,
             model.problem.events.root_conditions.clone(),
         )?;
-        let root_condition_batches = root_condition_plan
-            .as_ref()
+        let root_condition_plan = root_condition_plan(model)
             .map(|plan| {
-                RootConditionBatches::new(
+                plan.prepare(
                     &root_condition_rows,
-                    plan,
                     execution_backend.as_ref(),
-                    primary.and_then(|runtime| runtime.root_condition_batches.as_ref()),
+                    primary.and_then(|runtime| runtime.root_condition_plan.as_ref()),
                 )
             })
             .transpose()?;
@@ -969,7 +976,6 @@ impl SolveRuntime {
             )?,
             event_action_active_row_indices: RefCell::new(Vec::new()),
             root_condition_plan,
-            root_condition_batches,
             discrete_rhs: prepare(
                 |primary| &primary.discrete_rhs,
                 model.problem.discrete.rhs.clone(),
@@ -999,10 +1005,7 @@ impl SolveRuntime {
             update_values_scratch: RefCell::new(Vec::new()),
             structured_discrete_rows,
             visible_name_index: build_visible_name_index(model),
-            visible_value_rows: prepare(
-                |primary| &primary.visible_value_rows,
-                model.visible_value_rows.clone(),
-            )?,
+            visible_value_rows,
             visible_value_plan,
             visible_scratch: RefCell::new(Vec::new()),
             refresh_snapshot_scratch: RefCell::new(Vec::new()),
@@ -1029,8 +1032,6 @@ impl SolveRuntime {
             compiled_event_transactions,
             event_transaction_input_scratch: RefCell::new(Vec::new()),
             event_transaction_output_scratch: RefCell::new(event_transaction_output_scratch),
-            compiled_visible_rows: RefCell::new(FxHashMap::default()),
-            failed_visible_rows: RefCell::new(BTreeSet::new()),
             compiled_event_action_rows: RefCell::new(FxHashMap::default()),
             failed_event_action_rows: RefCell::new(BTreeSet::new()),
             warning_log: RefCell::new(warnings::WarningLog::default()),
@@ -1654,7 +1655,7 @@ impl SolveRuntime {
             && self
                 .root_condition_plan
                 .as_ref()
-                .is_none_or(|plan| !plan.search_rows.is_empty());
+                .is_none_or(|plan| !plan.search.is_empty());
         if model_roots_need_refresh || self.delay_runtime.event_root_count() > 0 {
             self.refresh_slots_with_plan(
                 &self.root_refresh,
@@ -1684,7 +1685,7 @@ impl SolveRuntime {
                 return validate_finite_runtime_output("root search output", out);
             };
             self.validate_root_plan_output_len(plan, model_out)?;
-            if plan.search_rows.is_empty() {
+            if plan.search.is_empty() {
                 self.write_planned_root_search_defaults(plan, params, t, model_out)?;
             } else {
                 self.write_planned_root_search_conditions(plan, solver_y, params, t, model_out)?;
@@ -1751,7 +1752,7 @@ impl SolveRuntime {
         if model_root_count > 0 {
             let model_out = &mut out[..model_root_count];
             match &self.root_condition_plan {
-                Some(plan) if plan.search_rows.is_empty() => {
+                Some(plan) if plan.search.is_empty() => {
                     self.validate_root_plan_output_len(plan, model_out)?;
                     self.write_planned_root_search_defaults(plan, params, t, model_out)?;
                 }
@@ -1800,7 +1801,7 @@ impl SolveRuntime {
 
     fn write_planned_root_conditions(
         &self,
-        plan: &RootConditionPlan,
+        plan: &PreparedRootConditionPlan,
         y: &[f64],
         params: &[f64],
         t: f64,
@@ -1816,36 +1817,26 @@ impl SolveRuntime {
                 RootConditionPlanEntry::Dynamic => 0.0,
             };
         }
-        self.root_condition_batches
-            .as_ref()
-            .ok_or_else(|| {
-                RuntimeSolveError::solve_ir("root plan has no prepared evaluation selection")
-            })?
-            .evaluated
+        plan.evaluated
             .evaluate(self, RowEvalPoint { y, p: params, t }, out)
     }
 
     fn write_planned_root_search_conditions(
         &self,
-        plan: &RootConditionPlan,
+        plan: &PreparedRootConditionPlan,
         y: &[f64],
         params: &[f64],
         t: f64,
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         self.write_planned_root_search_defaults(plan, params, t, out)?;
-        self.root_condition_batches
-            .as_ref()
-            .ok_or_else(|| {
-                RuntimeSolveError::solve_ir("root plan has no prepared search selection")
-            })?
-            .search
+        plan.search
             .evaluate(self, RowEvalPoint { y, p: params, t }, out)
     }
 
     fn write_planned_root_search_defaults(
         &self,
-        plan: &RootConditionPlan,
+        plan: &PreparedRootConditionPlan,
         params: &[f64],
         t: f64,
         out: &mut [f64],
@@ -1864,7 +1855,7 @@ impl SolveRuntime {
 
     fn validate_root_plan_output_len(
         &self,
-        plan: &RootConditionPlan,
+        plan: &PreparedRootConditionPlan,
         out: &[f64],
     ) -> Result<(), RuntimeSolveError> {
         if out.len() >= plan.entries.len() {

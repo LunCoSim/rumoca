@@ -28,10 +28,12 @@ fn grouped_selection_diagnostic_runtime() -> SolveRuntime {
 #[test]
 fn selected_output_workspace_preserves_order_and_rejects_invalid_selection() {
     let runtime = grouped_selection_diagnostic_runtime();
+    let cache = RefCell::new(FxHashMap::default());
+    let failed = RefCell::new(BTreeSet::new());
     let rows = native_specialization::SpecializedRows {
         block: &runtime.visible_value_rows,
-        cache: &runtime.compiled_visible_rows,
-        failed: &runtime.failed_visible_rows,
+        cache: &cache,
+        failed: &failed,
     };
     let point = native_specialization::RowEvalPoint {
         y: &[],
@@ -87,10 +89,12 @@ fn selected_output_workspace_preserves_order_and_rejects_invalid_selection() {
 #[ignore = "diagnostic: compare independent optimized producer executables"]
 fn selected_output_grouping_diagnostic() {
     let runtime = grouped_selection_diagnostic_runtime();
+    let cache = RefCell::new(FxHashMap::default());
+    let failed = RefCell::new(BTreeSet::new());
     let rows = native_specialization::SpecializedRows {
         block: &runtime.visible_value_rows,
-        cache: &runtime.compiled_visible_rows,
-        failed: &runtime.failed_visible_rows,
+        cache: &cache,
+        failed: &failed,
     };
     let point = native_specialization::RowEvalPoint {
         y: &[],
@@ -248,10 +252,7 @@ fn visible_value_plan_deduplicates_equal_expression_rows() {
         ..Default::default()
     };
     let runtime = SolveRuntime::new_fixture(&model).expect("valid runtime should prepare");
-    let plan = runtime
-        .visible_value_plan
-        .as_ref()
-        .expect("visible value plan should build");
+    let plan = visible_value_plan(&runtime.model).expect("visible value plan should build");
 
     assert_eq!(plan.expression_rows, vec![1, 2]);
     assert_eq!(plan.expression_groups.len(), 2);
@@ -292,10 +293,7 @@ fn root_condition_plan_keeps_full_values_but_neutralizes_search_roots() {
         ..Default::default()
     };
     let runtime = SolveRuntime::new_fixture(&model).expect("valid runtime should prepare");
-    let plan = runtime
-        .root_condition_plan
-        .as_ref()
-        .expect("root condition plan should build");
+    let plan = root_condition_plan(&runtime.model).expect("root condition plan should build");
 
     assert_eq!(plan.evaluated_rows, vec![0, 2, 3, 4]);
     assert_eq!(plan.search_rows, vec![4]);
@@ -366,10 +364,8 @@ fn root_condition_plan_preserves_grouped_output_ownership() {
         ..Default::default()
     };
     let runtime = SolveRuntime::new_fixture(&model).expect("valid runtime should prepare");
-    let plan = runtime
-        .root_condition_plan
-        .as_ref()
-        .expect("grouped root condition plan should build");
+    let plan =
+        root_condition_plan(&runtime.model).expect("grouped root condition plan should build");
 
     assert_eq!(plan.evaluated_rows, vec![0, 1, 2, 3]);
     assert_eq!(plan.search_rows, vec![2, 3]);
@@ -654,10 +650,7 @@ fn root_evaluation_rejects_non_finite_surfaces() {
 fn root_condition_plan_neutralizes_parameter_static_algebraic_outputs() {
     let model = algebraic_output_root_model(assignment_residual_row());
     let runtime = SolveRuntime::new_fixture(&model).expect("valid runtime should prepare");
-    let plan = runtime
-        .root_condition_plan
-        .as_ref()
-        .expect("root condition plan should build");
+    let plan = root_condition_plan(&runtime.model).expect("root condition plan should build");
 
     assert_eq!(plan.evaluated_rows, vec![0]);
     assert!(plan.search_rows.is_empty());
@@ -678,10 +671,7 @@ fn root_condition_plan_neutralizes_parameter_static_algebraic_outputs() {
 fn root_condition_plan_keeps_state_dependent_algebraic_outputs_dynamic() {
     let model = algebraic_output_root_model(add_assignment_residual_row(1, 0, 1.0));
     let runtime = SolveRuntime::new_fixture(&model).expect("valid runtime should prepare");
-    let plan = runtime
-        .root_condition_plan
-        .as_ref()
-        .expect("root condition plan should build");
+    let plan = root_condition_plan(&runtime.model).expect("root condition plan should build");
 
     assert_eq!(plan.evaluated_rows, vec![0]);
     assert_eq!(plan.search_rows, vec![0]);

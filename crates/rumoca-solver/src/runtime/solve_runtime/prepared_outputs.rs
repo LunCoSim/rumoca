@@ -1,62 +1,65 @@
-//! Immutable root selections execute complete selected programs in source order.
+//! Checked fixed output selections share one preparation and execution owner.
 
-use super::native_specialization::{SelectedProgramOutput, prepare_selected_program_outputs};
 use super::*;
 
+/// One selected output in deterministic program and request order.
 #[derive(Clone)]
-pub(super) struct RootConditionBatches {
-    pub(super) evaluated: RootConditionBatch,
-    pub(super) search: RootConditionBatch,
+pub(super) struct SelectedProgramOutput {
+    pub(super) program: usize,
+    request_order: usize,
+    pub(super) output: usize,
+    pub(super) offset: usize,
 }
 
-impl RootConditionBatches {
-    pub(super) fn new(
-        source: &PreparedScalarProgramBlock,
-        plan: &RootConditionPlan,
-        backend: Option<&Rc<dyn SolveExecutionBackend>>,
-        primary: Option<&Self>,
-    ) -> Result<Self, EvalSolveError> {
-        let evaluated = RootConditionBatch::new(
-            source,
-            &plan.evaluated_rows,
-            backend,
-            primary.map(|batches| &batches.evaluated),
-        )?;
-        let search = if plan.evaluated_rows == plan.search_rows {
-            evaluated.clone()
-        } else {
-            RootConditionBatch::new(
-                source,
-                &plan.search_rows,
-                backend,
-                primary.map(|batches| &batches.search),
-            )?
-        };
-        Ok(Self { evaluated, search })
+pub(super) fn prepare_selected_program_outputs(
+    selected: &mut Vec<SelectedProgramOutput>,
+    block: &PreparedScalarProgramBlock,
+    output_indices: &[usize],
+) -> Result<(), RuntimeSolveError> {
+    selected.clear();
+    reserve_runtime_vec_capacity(selected, output_indices.len(), "selected program outputs")?;
+    for (request_order, &output) in output_indices.iter().enumerate() {
+        let (program, offset) = block.row_output_position(output).ok_or_else(|| {
+            RuntimeSolveError::solve_ir(format!(
+                "selected expression output {output} has no owning program"
+            ))
+        })?;
+        selected.push(SelectedProgramOutput {
+            program,
+            request_order,
+            output,
+            offset,
+        });
     }
+    selected.sort_unstable_by_key(|row| (row.program, row.request_order));
+    Ok(())
 }
 
 /// The source projection and optional native product contain no numerical history.
 #[derive(Clone)]
-pub(super) struct RootConditionBatch {
+pub(super) struct PreparedOutputSelection {
     block: PreparedScalarProgramBlock,
     compiled: Option<Rc<dyn CompiledSolveExpression>>,
     outputs: Box<[(usize, usize)]>,
     required_output_len: usize,
 }
 
-impl RootConditionBatch {
-    fn new(
+impl PreparedOutputSelection {
+    pub(super) fn is_empty(&self) -> bool {
+        self.outputs.is_empty()
+    }
+
+    pub(super) fn new(
         source: &PreparedScalarProgramBlock,
         selected: &[usize],
         backend: Option<&Rc<dyn SolveExecutionBackend>>,
         primary: Option<&Self>,
     ) -> Result<Self, EvalSolveError> {
-        let RootProjection {
+        let OutputProjection {
             block,
             outputs,
             required_output_len,
-        } = RootProjection::new(source, selected)?;
+        } = OutputProjection::new(source, selected)?;
         // A changed selection must never execute superseded programs through
         // an overlay. Only exact immutable program reuse is admitted here.
         let reuse = match BlockReuse::of(primary.map(|batch| &batch.block), &block) {
@@ -70,7 +73,7 @@ impl RootConditionBatch {
                 if block.is_empty() {
                     None
                 } else {
-                    compiled_expression(backend, "root selection", block)
+                    compiled_expression(backend, "fixed output selection", block)
                 }
             },
         );
@@ -91,7 +94,7 @@ impl RootConditionBatch {
     ) -> Result<(), RuntimeSolveError> {
         if out.len() < self.required_output_len {
             return Err(RuntimeSolveError::solve_ir(format!(
-                "root selection requires {} output entries, got {}",
+                "fixed output selection requires {} output entries, got {}",
                 self.required_output_len,
                 out.len()
             )));
@@ -128,13 +131,13 @@ impl RootConditionBatch {
 }
 
 /// Checked source/output ownership produced once for one fixed selection.
-struct RootProjection {
+struct OutputProjection {
     block: solve::ScalarProgramBlock,
     outputs: Box<[(usize, usize)]>,
     required_output_len: usize,
 }
 
-impl RootProjection {
+impl OutputProjection {
     fn new(
         source: &PreparedScalarProgramBlock,
         selected: &[usize],
@@ -158,32 +161,34 @@ impl RootProjection {
                     .block()
                     .programs()
                     .get(program)
-                    .ok_or_else(|| invalid(format!("root source program {program} is absent")))?
+                    .ok_or_else(|| invalid(format!("selected source program {program} is absent")))?
                     .clone(),
             );
             spans.push(source.block().program_span(program).ok_or_else(|| {
-                invalid(format!("root source program {program} has no provenance"))
+                invalid(format!(
+                    "selected source program {program} has no provenance"
+                ))
             })?);
             for row in group {
                 outputs.push((
                     row.output,
                     count
                         .checked_add(row.offset)
-                        .ok_or_else(|| invalid("root output offset overflow".into()))?,
+                        .ok_or_else(|| invalid("selected output offset overflow".into()))?,
                 ));
                 required_output_len = required_output_len.max(
                     row.output
                         .checked_add(1)
-                        .ok_or_else(|| invalid("root output index overflow".into()))?,
+                        .ok_or_else(|| invalid("selected output index overflow".into()))?,
                 );
             }
             count = count
                 .checked_add(source.row_output_count(program).ok_or_else(|| {
                     invalid(format!(
-                        "root source program {program} has no output extent"
+                        "selected source program {program} has no output extent"
                     ))
                 })?)
-                .ok_or_else(|| invalid("root output extent overflow".into()))?;
+                .ok_or_else(|| invalid("selected output extent overflow".into()))?;
         }
         let block =
             solve::ScalarProgramBlock::with_output_indices(programs, spans, (0..count).collect())
@@ -231,7 +236,7 @@ mod tests {
 
     #[test]
     fn grouped_sparse_selection_preserves_bits_and_skips_other_programs() {
-        let batch = RootConditionBatch::new(&source(), &[1, 3, 1], None, None).unwrap();
+        let batch = PreparedOutputSelection::new(&source(), &[1, 3, 1], None, None).unwrap();
         let runtime = SolveRuntime::new_fixture(&solve::SolveModel::default()).unwrap();
         let mut out = [99.0; 9];
         batch
@@ -256,8 +261,8 @@ mod tests {
 
     #[test]
     fn missing_owner_and_short_destination_reject_without_execution() {
-        assert!(RootConditionBatch::new(&source(), &[7], None, None).is_err());
-        let batch = RootConditionBatch::new(&source(), &[1, 3], None, None).unwrap();
+        assert!(PreparedOutputSelection::new(&source(), &[7], None, None).is_err());
+        let batch = PreparedOutputSelection::new(&source(), &[1, 3], None, None).unwrap();
         let runtime = SolveRuntime::new_fixture(&solve::SolveModel::default()).unwrap();
         let mut out = [99.0; 3];
         let error = batch
