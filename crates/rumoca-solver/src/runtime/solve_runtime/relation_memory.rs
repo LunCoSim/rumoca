@@ -1035,6 +1035,36 @@ impl SolveRuntime {
         Ok(())
     }
 
+    fn visible_program_outputs(
+        &self,
+        program: usize,
+        y: &[f64],
+        params: &[f64],
+        t: f64,
+    ) -> Result<Vec<f64>, RuntimeSolveError> {
+        let mut outputs = Vec::new();
+        if self.visible_value_rows.row_output_count(program) == Some(1) {
+            outputs.push(self.visible_value_rows.eval_row_with_context(
+                program,
+                y,
+                params,
+                t,
+                self.row_eval_context(),
+            )?);
+        } else {
+            self.visible_value_rows
+                .eval_row_outputs_unchecked_with_context(
+                    program,
+                    y,
+                    params,
+                    t,
+                    self.row_eval_context(),
+                    &mut outputs,
+                )?;
+        }
+        Ok(outputs)
+    }
+
     pub fn visible_values_for_names(
         &self,
         y: &[f64],
@@ -1058,27 +1088,7 @@ impl SolveRuntime {
                     ))
                 })?;
             if let std::collections::btree_map::Entry::Vacant(entry) = programs.entry(program) {
-                let mut outputs = Vec::new();
-                if self.visible_value_rows.row_output_count(program) == Some(1) {
-                    outputs.push(self.visible_value_rows.eval_row_with_context(
-                        program,
-                        y,
-                        params,
-                        t,
-                        self.row_eval_context(),
-                    )?);
-                } else {
-                    self.visible_value_rows
-                        .eval_row_outputs_unchecked_with_context(
-                            program,
-                            y,
-                            params,
-                            t,
-                            self.row_eval_context(),
-                            &mut outputs,
-                        )?;
-                }
-                entry.insert(outputs);
+                entry.insert(self.visible_program_outputs(program, y, params, t)?);
             }
             let outputs = &programs[&program];
             let value = outputs.get(offset).copied().ok_or_else(|| {

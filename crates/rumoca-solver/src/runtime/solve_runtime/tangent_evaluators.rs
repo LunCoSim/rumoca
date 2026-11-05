@@ -26,18 +26,16 @@ pub(super) fn torn_tangent_evaluators(
                 return Ok(None);
             };
             let mut compiled = None;
-            if directional.is_some() {
-                if !plan.directional() {
-                    compiled = compiled_tangent_lanes(&plan, jvp, backend)?;
-                }
-                if compiled.is_none() {
-                    let Ok(directions) = solve::TornTangentPlan::derive_directional(tearing, jvp)
-                    else {
-                        return Ok(None);
-                    };
-                    plan = directions;
-                    compiled = directional.cloned();
-                }
+            if directional.is_some() && !plan.directional() {
+                compiled = compiled_tangent_lanes(&plan, jvp, backend)?;
+            }
+            if directional.is_some() && compiled.is_none() {
+                let Ok(directions) = solve::TornTangentPlan::derive_directional(tearing, jvp)
+                else {
+                    return Ok(None);
+                };
+                plan = directions;
+                compiled = directional.cloned();
             }
             let evaluator = shared.prepare(plan)?;
             Ok(Some(PreparedTornTangent {
