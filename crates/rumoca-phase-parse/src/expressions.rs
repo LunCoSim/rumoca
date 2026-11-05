@@ -1193,6 +1193,27 @@ fn convert_global_function_call(
     })
 }
 
+fn convert_unsigned_number(
+    number: &modelica_grammar_trait::UnsignedNumber,
+) -> anyhow::Result<rumoca_ir_ast::Expression> {
+    match number {
+        modelica_grammar_trait::UnsignedNumber::UnsignedInteger(unsigned_int) => {
+            Ok(rumoca_ir_ast::Expression::Terminal {
+                terminal_type: rumoca_ir_ast::TerminalType::UnsignedInteger,
+                token: unsigned_int.unsigned_integer.clone(),
+                span: token_span(&unsigned_int.unsigned_integer)?,
+            })
+        }
+        modelica_grammar_trait::UnsignedNumber::UnsignedReal(unsigned_real) => {
+            Ok(rumoca_ir_ast::Expression::Terminal {
+                terminal_type: rumoca_ir_ast::TerminalType::UnsignedReal,
+                token: unsigned_real.unsigned_real.clone(),
+                span: token_span(&unsigned_real.unsigned_real)?,
+            })
+        }
+    }
+}
+
 impl TryFrom<&modelica_grammar_trait::Primary> for rumoca_ir_ast::Expression {
     type Error = anyhow::Error;
 
@@ -1229,22 +1250,7 @@ impl TryFrom<&modelica_grammar_trait::Primary> for rumoca_ir_ast::Expression {
                 }
             }
             modelica_grammar_trait::Primary::UnsignedNumber(unsigned_num) => {
-                match &unsigned_num.unsigned_number {
-                    modelica_grammar_trait::UnsignedNumber::UnsignedInteger(unsigned_int) => {
-                        Ok(rumoca_ir_ast::Expression::Terminal {
-                            terminal_type: rumoca_ir_ast::TerminalType::UnsignedInteger,
-                            token: unsigned_int.unsigned_integer.clone(),
-                            span: token_span(&unsigned_int.unsigned_integer)?,
-                        })
-                    }
-                    modelica_grammar_trait::UnsignedNumber::UnsignedReal(unsigned_real) => {
-                        Ok(rumoca_ir_ast::Expression::Terminal {
-                            terminal_type: rumoca_ir_ast::TerminalType::UnsignedReal,
-                            token: unsigned_real.unsigned_real.clone(),
-                            span: token_span(&unsigned_real.unsigned_real)?,
-                        })
-                    }
-                }
+                convert_unsigned_number(&unsigned_num.unsigned_number)
             }
             modelica_grammar_trait::Primary::String(string) => {
                 Ok(rumoca_ir_ast::Expression::Terminal {
