@@ -12,7 +12,7 @@
 //! reaches these arms.
 
 mod algebra;
-mod conditionals;
+pub(super) mod conditionals;
 mod formal;
 mod geometry;
 mod lifted_values;
@@ -264,7 +264,7 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
                 self.differentiate_array(elements, order, provenance)
             }
             dae::ExpressionOperation::Conditional(operands) => self
-                .materialize_parameter_conditional(operands, Some(order), provenance)
+                .materialize_parameter_conditional(source_id, operands, Some(order), provenance)
                 .map(Derivative::Expression),
             dae::ExpressionOperation::Builtin { builtin, arguments }
                 if is_linear_tensor_map(builtin) =>
@@ -587,7 +587,7 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
                 self.rebuild_call_value(source_id, &arguments, provenance)
             }
             dae::ExpressionOperation::Conditional(operands) => {
-                self.materialize_parameter_conditional(operands, None, provenance)
+                self.materialize_parameter_conditional(source_id, operands, None, provenance)
             }
             dae::ExpressionOperation::Field { base, field } => {
                 self.materialize_projected_field(source_id, base, field, provenance)
@@ -817,6 +817,7 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
             // Their operands are checked structural extents, not values in the
             // continuous system, so these constructors are time invariant.
             Builtin::Zeros | Builtin::Ones | Builtin::Identity => Ok(Derivative::Zero),
+            Builtin::Fill => self.differentiate_fill(arguments, order, provenance),
             Builtin::Cross | Builtin::OuterProduct => {
                 self.differentiate_bilinear_builtin(builtin, arguments, order, provenance)
             }
@@ -828,8 +829,35 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
             }
             Builtin::Atan2 => self.differentiate_atan2_builtin(arguments, order, provenance),
             Builtin::LinearSolve => self.differentiate_linear_solve(arguments, order, provenance),
+            Builtin::Smooth => self.differentiate_smooth(arguments, order, provenance),
             _ => unreachable!("differentiability preflight rejects this builtin"),
         }
+    }
+
+    /// `d^k/dt^k smooth(p, e) = smooth(p - k, d^k e)` (MLS §3.7.5): the
+    /// derivative keeps the differentiability the operand still certifies.
+    fn differentiate_smooth(
+        &mut self,
+        arguments: dae::ExpressionOperands<'source>,
+        order: u8,
+        provenance: dae::DaeProvenance,
+    ) -> Result<Derivative<'target>, dae::DaeConstructionError> {
+        let (smoothness, value) = super::smooth_order::smooth_operands(self.source, arguments)
+            .expect("differentiability preflight proved a literal smooth order");
+        let Derivative::Expression(derivative) =
+            self.differentiate_order(value, order, provenance)?
+        else {
+            return Ok(Derivative::Zero);
+        };
+        let remaining = super::smooth_order::remaining_order(smoothness, order);
+        let remaining = self
+            .target
+            .at(provenance)
+            .literal(dae::DaeLiteral::Integer(i64::from(remaining)))?;
+        self.target
+            .at(provenance)
+            .builtin(dae::PureBuiltin::Smooth, vec![remaining, derivative])
+            .map(Derivative::Expression)
     }
 
     fn differentiate_atan2_builtin(

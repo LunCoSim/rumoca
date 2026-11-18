@@ -11,11 +11,6 @@ use rumoca_ir_solve::{FunctionConditionalOwnerId, ProjectionJacobianApplication}
 #[cfg(test)]
 mod shared_module_tests;
 
-#[cfg(test)]
-thread_local! {
-    static RETAINED_OPERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 /// Lazily created JIT module shared by the projection applications of one
 /// compiled Jacobian source.
 #[derive(Default)]
@@ -73,17 +68,38 @@ impl ProjectionModule {
             state: RefCell::new(ProjectionModuleState {
                 scopes: Vec::new(),
                 applications: 0,
-                emitter: CraneliftEmitter::new(pure_calls.map(Rc::as_ref))?,
+                emitter: CraneliftEmitter::new(pure_calls.cloned())?,
             }),
         })
     }
 
-    fn compile(
+    /// Define every application in this module, then finalize the module once
+    /// for all of them: finalizing patches and protects every function the
+    /// module holds, so finalizing per application is quadratic in the module.
+    fn compile_all(
         &self,
-        application: &ProjectionJacobianApplication,
-    ) -> Result<JacobianRowFn, CompileError> {
+        applications: &[&ProjectionJacobianApplication],
+    ) -> Result<Vec<JacobianRowFn>, CompileError> {
         let mut state = self.state.borrow_mut();
         let state = &mut *state;
+        let ids = applications
+            .iter()
+            .map(|application| state.define(application))
+            .collect::<Result<Vec<_>, _>>()?;
+        let module = &mut state.emitter.module;
+        finalize_jit_module(module)?;
+        ids.into_iter()
+            .map(|id| finalized_jacobian_fn(module, id))
+            .collect()
+    }
+}
+
+impl ProjectionModuleState {
+    fn define(
+        &mut self,
+        application: &ProjectionJacobianApplication,
+    ) -> Result<FuncId, CompileError> {
+        let state = self;
         let scope = match state
             .scopes
             .iter()
@@ -107,17 +123,17 @@ impl ProjectionModule {
             state.applications
         );
         state.applications += 1;
-        let compiled = emit_projection_application(emitter, application, &name);
+        let defined = define_projection_application(emitter, application, &name);
         state.scopes[scope].functions = std::mem::take(&mut emitter.conditional_functions);
-        compiled
+        defined
     }
 }
 
-fn emit_projection_application(
+fn define_projection_application(
     emitter: &mut CraneliftEmitter,
     application: &ProjectionJacobianApplication,
     name: &str,
-) -> Result<JacobianRowFn, CompileError> {
+) -> Result<FuncId, CompileError> {
     for color in application.colors() {
         for program in color.outputs().programs() {
             let row = &application.source().programs()[program.program()];
@@ -125,28 +141,42 @@ fn emit_projection_application(
             emitter.ensure_conditional_programs(row, RowKind::JacobianV)?;
         }
     }
-    let id = emitter.compile_projection_application(application, name)?;
-    finalize_jit_module(&mut emitter.module)?;
-    finalized_jacobian_fn(&emitter.module, id)
+    emitter.compile_projection_application(application, name)
 }
 
 pub(super) struct ProjectionBatch {
     function: JacobianRowFn,
+    scratch: scratch::ScratchOwner,
     _module: Rc<ProjectionModule>,
 }
 
 impl ProjectionBatch {
+    #[cfg(test)]
     pub(super) fn compile(
         application: &ProjectionJacobianApplication,
         pure_calls: Option<&Rc<typed_program::CompiledPureCallTable>>,
         shared: &SharedProjectionModule,
     ) -> Result<Self, CompileError> {
+        let mut batches = Self::compile_all(&[application], pure_calls, shared)?;
+        Ok(batches.remove(0))
+    }
+
+    /// Compile every application into the shared module with one finalization.
+    pub(super) fn compile_all(
+        applications: &[&ProjectionJacobianApplication],
+        pure_calls: Option<&Rc<typed_program::CompiledPureCallTable>>,
+        shared: &SharedProjectionModule,
+    ) -> Result<Vec<Self>, CompileError> {
         let module = shared.module(pure_calls)?;
-        match module.compile(application) {
-            Ok(function) => Ok(Self {
-                function,
-                _module: module,
-            }),
+        match module.compile_all(applications) {
+            Ok(functions) => Ok(functions
+                .into_iter()
+                .map(|function| Self {
+                    function,
+                    scratch: Default::default(),
+                    _module: module.clone(),
+                })
+                .collect()),
             Err(error) => {
                 shared.discard();
                 Err(error)
@@ -165,15 +195,16 @@ impl ProjectionBatch {
         // SAFETY: the prepared application checks all input/output extents and
         // exclusively leases both scratch buffers. The seed pointer refers to
         // writable storage; this entry sets and clears its issued color seeds.
-        status::check(unsafe {
+        status::check(self.scratch.invoke(|arena| unsafe {
             (self.function)(
                 y.as_ptr(),
                 p.as_ptr(),
                 t,
                 seed.as_mut_ptr(),
                 output.as_mut_ptr(),
+                arena,
             )
-        })
+        }))
     }
 }
 
@@ -186,7 +217,7 @@ impl CraneliftEmitter {
         let pointer = self.module.target_config().pointer_type();
         let mut signature = self.module.make_signature();
         signature.returns.push(AbiParam::new(types::I8));
-        for kind in [pointer, pointer, types::F64, pointer, pointer] {
+        for kind in [pointer, pointer, types::F64, pointer, pointer, pointer] {
             signature.params.push(AbiParam::new(kind));
         }
         let id = self
@@ -202,25 +233,30 @@ impl CraneliftEmitter {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
         let params = builder.block_params(entry).to_vec();
+        scratch::enter(&mut builder);
         let mut loaded_y = HashMap::new();
         let mut loaded_p = HashMap::new();
-        let mut retained = HashMap::new();
+        // Retained results only for the programs this application issues: the
+        // shared source block holds every program of the compiled Jacobian, and
+        // sizing a slot table for all of them per application is quadratic in
+        // the block.
+        let mut retained: HashMap<usize, Vec<Option<RetainedResult>>> = HashMap::new();
         for color in application.colors() {
             set_seeds(&mut builder, params[3], color.seed_indices(), 1.0)?;
             for program in color.outputs().programs() {
                 let row = &application.source().programs()[program.program()];
-                let retained = retained
-                    .entry(program.program())
-                    .or_insert_with(|| program_retention(row.len()));
+                let placements = compact_placements(application, program.placements())?;
                 self.lower_projection_program(
                     &mut builder,
                     &params,
                     row,
-                    program.placements(),
+                    &placements,
                     (&mut loaded_y, &mut loaded_p),
                     ProgramReuse {
                         issued: application.invariant_operations(program.program()),
-                        retained,
+                        retained: retained
+                            .entry(program.program())
+                            .or_insert_with(|| vec![None; row.len()]),
                     },
                 )?;
             }
@@ -228,9 +264,7 @@ impl CraneliftEmitter {
         }
         status::succeed(&mut builder);
         builder.finalize();
-        self.module
-            .define_function(id, &mut context)
-            .map_err(to_backend_err)?;
+        self.module.queue_function(id, &mut context)?;
         self.module.clear_context(&mut context);
         Ok(id)
     }
@@ -273,6 +307,7 @@ impl CraneliftEmitter {
             fold_functions: &self.fold_functions,
             conditional_functions: &self.conditional_functions,
             pure_call_functions: &self.pure_call_functions,
+            source_operation: std::ptr::null(),
             pure_call_results: HashMap::new(),
             nested_fold_results: HashMap::new(),
             conditional_results: HashMap::new(),
@@ -333,12 +368,6 @@ struct ProgramReuse<'a> {
     retained: &'a mut [Option<RetainedResult>],
 }
 
-fn program_retention(operations: usize) -> Vec<Option<RetainedResult>> {
-    #[cfg(test)]
-    RETAINED_OPERATIONS.with(|count| count.set(count.get() + operations));
-    vec![None; operations]
-}
-
 #[derive(Clone)]
 struct RetainedResult {
     start: u32,
@@ -375,4 +404,26 @@ impl RetainedResult {
         }
         Ok(())
     }
+}
+
+/// Re-address column-major placements to the slots of the application's
+/// compact pattern layout, the storage the native entry writes.
+pub(super) fn compact_placements(
+    application: &ProjectionJacobianApplication,
+    placements: &[(usize, usize)],
+) -> Result<Vec<(usize, usize)>, CompileError> {
+    let layout = application.compact_layout();
+    placements
+        .iter()
+        .map(|&(offset, target)| {
+            layout
+                .dense_slot(target)
+                .map(|slot| (offset, slot))
+                .ok_or_else(|| {
+                    CompileError::Input(
+                        "projection placement lies outside its block pattern".into(),
+                    )
+                })
+        })
+        .collect()
 }

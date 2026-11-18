@@ -36,6 +36,8 @@ pub(crate) fn row_reads_y_index(program: &[LinearOp], target: usize) -> bool {
 /// dependency views can enumerate only producer coordinates intersecting the
 /// ranges without rebuilding one load operation per lane.
 pub(crate) fn row_y_input_ranges(program: &[LinearOp]) -> Vec<Range<usize>> {
+    #[cfg(test)]
+    crate::refresh_plan::record_input_range_walk();
     let mut ranges = Vec::new();
     collect_y_input_ranges(program, &mut ranges);
     ranges.sort_unstable_by_key(|range| (range.start, range.end));
@@ -72,7 +74,9 @@ fn collect_y_input_ranges(program: &[LinearOp], ranges: &mut Vec<Range<usize>>) 
             LinearOp::FunctionFold { program, .. }
             | LinearOp::GuardedFunctionFold { program, .. }
             | LinearOp::StoreOutputFunctionFold { program, .. } => {
-                collect_y_input_ranges(&program.update, ranges);
+                for region in program.regions() {
+                    collect_y_input_ranges(region, ranges);
+                }
             }
             LinearOp::FunctionConditional { program, .. } => {
                 for arm in &program.arms {
@@ -123,15 +127,22 @@ pub(super) fn failable_op_reads_any_y_index(prefix: &[LinearOp], y_indices: &[us
 }
 
 /// Whether evaluating `op` can return an error, rather than a non-finite
-/// value, depending on its operand values: a singular dense solve, a pure
+/// value, depending on its operand values: a checked runtime tensor read,
+/// a singular dense solve, a pure
 /// call whose body raises, an external-table query, a random-generator op
 /// on runtime state, or a function fold or conditional whose body holds one
 /// of these. Structural errors (register bounds, uninitialized registers)
 /// fail the same way on every input.
 pub(super) fn op_can_fail(op: &LinearOp) -> bool {
     match op {
+        LinearOp::LoadIndexedRegister { indices, .. }
+        | LinearOp::LoadIndexedFoldCarried { indices, .. }
+        | LinearOp::LoadIndexedFoldCapture { indices, .. } => indices
+            .iter()
+            .any(|index| matches!(index, rumoca_ir_solve::TensorIndex::Runtime(_))),
         LinearOp::LinearSolveComponent { .. }
         | LinearOp::PureCall { .. }
+        | LinearOp::PureCallObservation { .. }
         | LinearOp::PureCallDirectional { .. }
         | LinearOp::TableBounds { .. }
         | LinearOp::TableLookup { .. }
@@ -146,7 +157,7 @@ pub(super) fn op_can_fail(op: &LinearOp) -> bool {
         LinearOp::FunctionFold { program, .. }
         | LinearOp::GuardedFunctionFold { program, .. }
         | LinearOp::StoreOutputFunctionFold { program, .. } => {
-            program.update.iter().any(op_can_fail)
+            program.regions().flatten().any(op_can_fail)
         }
         LinearOp::FunctionConditional { program, .. } => program
             .arms
@@ -213,7 +224,9 @@ fn collect_parameter_indices(row: &[LinearOp], indices: &mut BTreeSet<usize>) {
             LinearOp::FunctionFold { program, .. }
             | LinearOp::GuardedFunctionFold { program, .. }
             | LinearOp::StoreOutputFunctionFold { program, .. } => {
-                collect_parameter_indices(&program.update, indices);
+                for region in program.regions() {
+                    collect_parameter_indices(region, indices);
+                }
             }
             LinearOp::FunctionConditional { program, .. } => {
                 for arm in &program.arms {
@@ -328,9 +341,11 @@ fn binary_gradient_dependency(
                 && (lhs.gradient_zero || rhs.value_parameter_only)
                 && (rhs.gradient_zero || lhs.value_parameter_only),
         },
+        // `a / b` carries the gradient of either operand: a divisor that reads
+        // solver Y contributes `-a / b^2` times its own.
         BinaryOp::Div => GradientDependency {
             value_parameter_only,
-            gradient_zero: lhs.gradient_zero,
+            gradient_zero: lhs.gradient_zero && rhs.gradient_zero,
             gradient_parameter_only: rhs.value_parameter_only && lhs.gradient_parameter_only,
         },
         BinaryOp::Pow
@@ -347,13 +362,19 @@ fn select_gradient_dependency(
     if_true: GradientDependency,
     if_false: GradientDependency,
 ) -> GradientDependency {
+    // Whichever branch the condition selects, a selection between two
+    // branches without a gradient has none: only a selection between
+    // gradients needs a parameter-only condition to keep its gradient
+    // parameter-static.
+    let gradient_zero = if_true.gradient_zero && if_false.gradient_zero;
     GradientDependency {
         value_parameter_only: condition.value_parameter_only
             && if_true.value_parameter_only
             && if_false.value_parameter_only,
-        gradient_zero: if_true.gradient_zero && if_false.gradient_zero,
-        gradient_parameter_only: condition.value_parameter_only
-            && if_true.gradient_parameter_only
-            && if_false.gradient_parameter_only,
+        gradient_zero,
+        gradient_parameter_only: gradient_zero
+            || (condition.value_parameter_only
+                && if_true.gradient_parameter_only
+                && if_false.gradient_parameter_only),
     }
 }

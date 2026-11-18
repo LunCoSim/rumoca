@@ -32,6 +32,7 @@
 
 mod constant_collection;
 mod enum_context;
+mod function_bindings;
 mod function_signatures;
 mod instanced;
 mod modifier_targets;
@@ -244,6 +245,9 @@ pub struct TypeChecker {
     type_roots: HashMap<TypeId, TypeId>,
     /// Source-declaration component metadata for standalone resolved-tree checks.
     current_declaration_semantics: HashMap<DefId, ComponentSemantics>,
+    /// Source dimension domains, retained before evaluation replaces them with extents.
+    component_index_domains: HashMap<DefId, Vec<TypeId>>,
+    component_member_ids: HashMap<(DefId, String), DefId>,
     /// Concrete component metadata keyed by `InstanceId`.
     current_instance_semantics: InstanceSemanticScope,
     /// Concrete class instance whose body is currently being checked.
@@ -251,9 +255,9 @@ pub struct TypeChecker {
     /// Concrete instance scope used for lexical lookup in instanced bodies and
     /// bindings.
     current_instance_scope: Option<ComponentPath>,
-    /// Lexically active `for` iterators. These are Integer locals, not
+    /// Lexically active `for` iterators retain their range element types, not
     /// component references, and may shadow a component with the same name.
-    current_integer_iterators: Vec<String>,
+    current_iterators: Vec<(Option<rumoca_core::IndexBinderProvenance>, String, TypeId)>,
     /// Array domain contributed by the current structured class instance.
     /// Declaration-body equations are scalar over this implicit outer domain.
     current_instance_domain_shape: Vec<usize>,
@@ -278,6 +282,7 @@ pub struct TypeChecker {
     /// inner map preserves the declaration slot from base type DefId to the
     /// effective instance type DefId.
     current_call_type_overrides: function_signatures::CallTypeOverrides,
+    reachable_function_bindings: Option<Vec<function_bindings::FunctionBindingContext>>,
     /// Type aliases whose targets could not be resolved during type-table
     /// construction (e.g. an MSL alias into a library that is not loaded).
     ///
@@ -301,15 +306,18 @@ impl TypeChecker {
             operator_record_zero_capabilities: HashMap::new(),
             type_roots: HashMap::new(),
             current_declaration_semantics: HashMap::new(),
+            component_index_domains: HashMap::new(),
+            component_member_ids: HashMap::new(),
             current_instance_semantics: InstanceSemanticScope::default(),
             current_class_instance_id: None,
             current_instance_scope: None,
-            current_integer_iterators: Vec::new(),
+            current_iterators: Vec::new(),
             current_instance_domain_shape: Vec::new(),
             component_modifier_targets: HashMap::new(),
             component_modifier_member_types: HashMap::new(),
             function_signatures: HashMap::new(),
             current_call_type_overrides: function_signatures::CallTypeOverrides::default(),
+            reachable_function_bindings: None,
             deferred_alias_errors: HashMap::new(),
         }
     }
@@ -374,6 +382,7 @@ impl TypeChecker {
         tree.type_table = type_table;
         self.type_ids_by_def_id = type_ids_by_def_id;
         self.rebuild_type_roots(tree, &tree.type_table);
+        self.collect_component_index_domains(tree, &tree.type_table);
         self.component_modifier_targets = modifier_targets::build_component_modifier_targets(tree);
         self.component_modifier_member_types =
             match modifier_targets::build_component_modifier_member_types(
@@ -1097,25 +1106,6 @@ impl TypeChecker {
             }
         }
         (None, None)
-    }
-
-    /// Multi-pass extraction of constants from ancestor classes (MLS §4.5, §7.1).
-    fn extract_enclosing_constants_multi_pass(
-        ancestors: &[&ClassDef],
-        ctx: &mut rumoca_eval_ast::eval::TypeCheckEvalContext,
-    ) {
-        const MAX_PASSES: usize = 5;
-        for _pass in 0..MAX_PASSES {
-            let prev = ctx.integers.len() + ctx.dimensions.len() + ctx.reals.len();
-            for ancestor in ancestors {
-                Self::extract_ancestor_extends_modification_constants(ancestor, ctx);
-                Self::extract_class_constants("", ancestor, ctx);
-            }
-            let new = ctx.integers.len() + ctx.dimensions.len() + ctx.reals.len();
-            if new == prev {
-                break;
-            }
-        }
     }
 
     /// Multi-pass dimension evaluation for all dimension types (MLS §10.1).

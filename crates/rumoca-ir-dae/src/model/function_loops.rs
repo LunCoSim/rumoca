@@ -113,13 +113,13 @@ impl<'dae> Functions<'_, 'dae> {
         let initial_values = targets
             .iter()
             .map(|target| {
-                build.current_values[target.ordinal() as usize].ok_or(
-                    DaeConstructionError::IncompleteDefinition {
+                build.current_values[target.ordinal() as usize]
+                    .definition()
+                    .ok_or(DaeConstructionError::IncompleteDefinition {
                         kind: "function loop initial value",
                         index: target.ordinal(),
                         span: provenance.span(),
-                    },
-                )
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let enclosing_fold = function_build_state(self.storage, &parent).active_fold;
@@ -136,6 +136,7 @@ impl<'dae> Functions<'_, 'dae> {
             },
         )?;
         let raw = function_fold_raw(self.storage, fold, provenance)?;
+        let scope = self.storage.function_folds[raw as usize].scope;
         let generated =
             DaeProvenance::generated(DaeGeneration::FunctionLoopLowering, provenance.span())?;
         let build = function_build_state_mut(self.storage, &parent);
@@ -149,11 +150,13 @@ impl<'dae> Functions<'_, 'dae> {
                 iteration_local_set,
             ),
             active_fold: build.active_fold.replace(fold.ordinal()),
+            active_scope: build.active_scope.replace(scope),
         };
         for target in &iteration_locals {
-            build.current_values[target.ordinal() as usize] = None;
+            build.current_values[target.ordinal() as usize] = FunctionValueState::Unassigned;
         }
         parent.domain = Some(domain);
+        parent.scope = Some(scope);
         // The entry parameters below are issued with this fold already open, so
         // they are recorded as its own region's definitions rather than the
         // enclosing scope's.
@@ -177,9 +180,58 @@ impl<'dae> Functions<'_, 'dae> {
                 .parameter_definitions
                 .push(definition.ordinal());
             function_build_state_mut(self.storage, &parent).current_values
-                [target.ordinal() as usize] = Some(definition.ordinal());
+                [target.ordinal() as usize] = FunctionValueState::Assigned(definition.ordinal());
         }
         Ok((fold, parent, state))
+    }
+
+    /// End the loop at the start of the first iteration whose `condition` is
+    /// false (MLS §11.2.3 `while`, or a run-time `for` bound). The loop domain
+    /// is the proven pass bound; `condition` is evaluated before each pass on
+    /// the carried state, the enclosing values and that pass's own binders, so
+    /// it is set before the body's first statement. The caller proves that the
+    /// passes it ends would leave the carried state unchanged.
+    pub fn continue_loop_while(
+        &mut self,
+        loop_body: &mut FunctionLoop<'dae>,
+        condition: ExprId<'dae>,
+        provenance: DaeProvenance,
+    ) -> Result<(), DaeConstructionError> {
+        check_provenance(self.source_map, provenance)?;
+        let raw = function_fold_raw(self.storage, loop_body.fold, provenance)?;
+        if self.storage.function_folds[raw as usize]
+            .continuation
+            .is_some()
+        {
+            return Err(duplicate("function loop continuation", raw, provenance));
+        }
+        if !function_build_state(self.storage, &loop_body.body)
+            .statements
+            .is_empty()
+        {
+            return Err(DaeConstructionError::IncompleteDefinition {
+                kind: "function loop continuation before the body",
+                index: loop_body.fold.ordinal(),
+                span: provenance.span(),
+            });
+        }
+        expect_function_body_expression(self.storage, &loop_body.body, condition, provenance)?;
+        validate_function_value_reads(self.storage, &loop_body.body, condition, provenance)?;
+        let found = self.storage.expr_type(condition, provenance)?;
+        if !found.is_scalar() {
+            return Err(DaeConstructionError::ExpectedScalar {
+                span: provenance.span(),
+            });
+        }
+        if found.scalar_type() != ScalarType::Boolean {
+            return Err(DaeConstructionError::TypeMismatch {
+                expected: ScalarType::Boolean,
+                found: found.scalar_type(),
+                span: provenance.span(),
+            });
+        }
+        self.storage.function_folds[raw as usize].continuation = Some(condition.index());
+        Ok(())
     }
 
     pub fn assign_loop(
@@ -189,22 +241,7 @@ impl<'dae> Functions<'_, 'dae> {
         value: ExprId<'dae>,
         provenance: DaeProvenance,
     ) -> Result<(), DaeConstructionError> {
-        check_provenance(self.source_map, provenance)?;
-        check_function_value_owner(loop_body.body.function, target, provenance)?;
-        let carries_target = function_build_state(self.storage, &loop_body.body)
-            .carried_targets
-            .contains(&target.ordinal());
-        let is_iteration_local = function_build_state(self.storage, &loop_body.body)
-            .iteration_local_targets
-            .contains(&target.ordinal());
-        if !carries_target && !is_iteration_local {
-            return Err(DaeConstructionError::IncompleteDefinition {
-                kind: "function loop target",
-                index: target.ordinal(),
-                span: provenance.span(),
-            });
-        }
-        self.assign_after_owner_checks(&mut loop_body.body, target, value, provenance)
+        self.assign(&mut loop_body.body, target, value, provenance)
     }
 
     /// Atomically commit a conditional transition to loop-carried values.
@@ -214,20 +251,6 @@ impl<'dae> Functions<'_, 'dae> {
         assignments: &[(FunctionValueId<'dae>, ExprId<'dae>)],
         provenance: DaeProvenance,
     ) -> Result<(), DaeConstructionError> {
-        check_provenance(self.source_map, provenance)?;
-        let build = function_build_state(self.storage, &loop_body.body);
-        for (target, _) in assignments {
-            check_function_value_owner(loop_body.body.function, *target, provenance)?;
-            if !build.carried_targets.contains(&target.ordinal())
-                && !build.iteration_local_targets.contains(&target.ordinal())
-            {
-                return Err(DaeConstructionError::IncompleteDefinition {
-                    kind: "function loop target",
-                    index: target.ordinal(),
-                    span: provenance.span(),
-                });
-            }
-        }
         self.assign_all(&mut loop_body.body, assignments, provenance)
     }
 
@@ -311,6 +334,8 @@ impl<'dae> Functions<'_, 'dae> {
         // Closing the region before those definitions are issued is what makes
         // the recorded scope state that fact rather than assert it.
         function_build_state_mut(self.storage, &loop_body.body).active_fold = state.active_fold;
+        function_build_state_mut(self.storage, &loop_body.body).active_scope = state.active_scope;
+        loop_body.body.scope = state.active_scope;
         function_build_state_mut(self.storage, &loop_body.body).current_values =
             state.current_values;
         for (carried, target) in targets.iter().enumerate() {
@@ -339,7 +364,7 @@ impl<'dae> Functions<'_, 'dae> {
                 .output_definitions
                 .push(definition.ordinal());
             function_build_state_mut(self.storage, &loop_body.body).current_values
-                [*target as usize] = Some(definition.ordinal());
+                [*target as usize] = FunctionValueState::Assigned(definition.ordinal());
         }
         let build = function_build_state_mut(self.storage, &loop_body.body);
         let loop_statements = std::mem::take(&mut build.statements);
@@ -367,7 +392,7 @@ impl<'dae> Functions<'_, 'dae> {
         let updates = targets
             .iter()
             .map(|target| {
-                build.current_values[*target as usize].ok_or(
+                build.current_values[*target as usize].definition().ok_or(
                     DaeConstructionError::IncompleteDefinition {
                         kind: "function loop update",
                         index: *target,

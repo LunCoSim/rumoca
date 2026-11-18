@@ -19,6 +19,38 @@ pub(crate) fn component_type_is_record(
         .is_some_and(|class_def| class_def.class_type == rumoca_core::ClassType::Record)
 }
 
+/// Whether `comp` may hold an enumeration value (MLS 3.7 §4.8.5): its
+/// declared type is an enumeration class, directly or through a short type
+/// definition, or is not resolved here (a type reached through a replaceable
+/// package, which only a binding that evaluates to a literal settles). A
+/// predefined or any other resolved class never holds one.
+pub(crate) fn component_type_may_be_enumeration(
+    comp: &ast::Component,
+    class_index: &ast::ClassDefIndex<'_>,
+) -> bool {
+    let Some(mut class) = comp
+        .type_def_id
+        .and_then(|type_def_id| class_index.get(type_def_id))
+    else {
+        return comp.type_def_id.is_none();
+    };
+    // A short type definition `type T = E` extends exactly one class; the
+    // chain is acyclic after Resolve, and the class count bounds it.
+    for _ in 0..=class_index.def_ids().count() {
+        if !class.enum_literals.is_empty() {
+            return true;
+        }
+        let [extend] = class.extends.as_slice() else {
+            return false;
+        };
+        let Some(base) = extend.base_def_id.and_then(|base| class_index.get(base)) else {
+            return false;
+        };
+        class = base;
+    }
+    false
+}
+
 pub(crate) fn try_extract_record_array_constructor_constant(
     expr: &ast::Expression,
     ctx: &mut Context,
@@ -146,4 +178,56 @@ fn first_modification_span(comp: &ast::Component) -> Option<rumoca_core::Span> {
         .next()
         .map(ast::Expression::span)
         .filter(|span| !span.is_dummy())
+}
+
+/// Field paths materialized by evaluated record-array constructors.
+/// Scalar records keep their existing scoped field lookup; arrays enumerate
+/// their own elements so unrelated model constants are never scanned.
+pub(crate) fn record_array_field_suffixes(value: &rumoca_core::Expression) -> Option<Vec<String>> {
+    if !matches!(value, rumoca_core::Expression::Array { .. }) {
+        return None;
+    }
+
+    let mut fields = Vec::new();
+    collect_record_field_suffixes(value, "", &mut fields);
+    Some(fields)
+}
+
+fn collect_record_field_suffixes(
+    value: &rumoca_core::Expression,
+    prefix: &str,
+    fields: &mut Vec<String>,
+) {
+    use rumoca_core::Expression;
+    match value {
+        Expression::Array { elements, .. } => {
+            for (index, element) in elements.iter().enumerate() {
+                collect_record_field_suffixes(element, &format!("{prefix}[{}]", index + 1), fields);
+            }
+        }
+        Expression::FunctionCall {
+            args,
+            is_constructor: true,
+            ..
+        } => {
+            for arg in args {
+                let Expression::FunctionCall { name, args, .. } = arg else {
+                    continue;
+                };
+                let Some(field) = name
+                    .as_str()
+                    .strip_prefix(rumoca_core::NAMED_FUNCTION_ARG_PREFIX)
+                else {
+                    continue;
+                };
+                let [value] = args.as_slice() else {
+                    continue;
+                };
+                let suffix = format!("{prefix}.{field}");
+                collect_record_field_suffixes(value, &suffix, fields);
+                fields.push(suffix);
+            }
+        }
+        _ => {}
+    }
 }

@@ -13,12 +13,13 @@
 //! multi-second MSL parse across every model a worker handles, which is the
 //! same win the rumoca warm worker provides.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::super::common::apply_omc_thread_env;
+use super::simulation_result::FreshResultFile;
 
 /// Poll interval while waiting for the OMC ZeroMQ port file to appear.
 const PORT_FILE_POLL: Duration = Duration::from_millis(20);
@@ -52,6 +53,8 @@ pub(super) struct OmcSimSettings {
 #[derive(Debug, Clone)]
 pub(super) struct OmcSimOutcome {
     pub(super) result_file: Option<String>,
+    pub(super) fresh_result: Option<FreshResultFile>,
+    pub(super) raw_reply: String,
     pub(super) messages: String,
     pub(super) error: String,
     pub(super) timing: OmcPhaseSeconds,
@@ -84,14 +87,17 @@ pub(super) struct OmcSession {
     // The context must outlive the socket; keep it owned by the session.
     _ctx: zmq::Context,
     port_file: PathBuf,
+    work_dir: PathBuf,
 }
 
 impl OmcSession {
     /// Spawn an `omc --interactive=zmq` process, connect to it, and load the MSL
-    /// once. `msl_load_exprs` are evaluated in order (e.g. `loadFile("...")`).
+    /// once. `msl_load_exprs` are evaluated in order (e.g. `loadFile("...")`);
+    /// the session is refused unless its `ModelicaServices` is `services_package`.
     pub(super) fn spawn(
         work_dir: &Path,
         msl_load_exprs: &[String],
+        services_package: &Path,
         omc_threads: usize,
         startup_timeout: Duration,
         load_timeout: Duration,
@@ -150,6 +156,7 @@ impl OmcSession {
             socket,
             _ctx: ctx,
             port_file,
+            work_dir: work_dir.to_path_buf(),
         };
 
         for expr in msl_load_exprs {
@@ -158,6 +165,12 @@ impl OmcSession {
                 anyhow!("failed to load MSL into omc session ({expr}): {error}")
             })?;
         }
+        let source = session
+            .eval("getSourceFile(ModelicaServices)", load_timeout)
+            .map_err(|error| {
+                anyhow!("failed to query the omc session ModelicaServices: {error}")
+            })?;
+        require_services_source(&source, services_package)?;
         // Drain any accumulated load-time diagnostics so they do not leak into
         // the first model's error string.
         let _ = session.eval("getErrorString()", load_timeout);
@@ -197,13 +210,20 @@ impl OmcSession {
                 "simulate({model}, stopTime={stop_time}, outputFormat=\"csv\", fileNamePrefix=\"{model}\")"
             )
         };
+        let expected_result = self.work_dir.join(format!("{model}_res.csv"));
+        let prior_result = FreshResultFile::snapshot(&expected_result);
         let record = self.eval(&expr, sim_timeout)?;
         let error = match self.eval("getErrorString()", Duration::from_secs(10)) {
             Ok(text) => unquote_omc_string(text.trim()),
             Err(OmcEvalError::Timeout) => return Err(OmcEvalError::Timeout),
             Err(other) => return Err(other),
         };
-        Ok(parse_sim_record(&record, error))
+        Ok(FreshResultFile::from_request(
+            &expected_result,
+            prior_result,
+            &record,
+            error,
+        ))
     }
 
     /// Kill the underlying process. Used before respawning after a hang.
@@ -299,6 +319,27 @@ fn find_port_file(work_dir: &Path, needle: &str) -> Option<PathBuf> {
 
 /// Strip the surrounding quotes OMC puts around string replies and unescape the
 /// common `\n`/`\"` sequences.
+/// Refuse a session whose `ModelicaServices` (the `getSourceFile` reply) is not
+/// the pinned OpenModelica package: other services resolve resources
+/// differently, so its references would not be OMC's.
+fn require_services_source(reply: &str, services_package: &Path) -> Result<()> {
+    let source = unquote_omc_string(reply);
+    let expected = std::fs::canonicalize(services_package).with_context(|| {
+        format!(
+            "pinned ModelicaServices '{}' is not readable",
+            services_package.display()
+        )
+    })?;
+    // OMC reports the file it parsed, normalized its own way; compare files.
+    if std::fs::canonicalize(&source).ok().as_deref() != Some(expected.as_path()) {
+        bail!(
+            "omc session loaded ModelicaServices from '{source}', not the pinned '{}'",
+            expected.display()
+        );
+    }
+    Ok(())
+}
+
 fn unquote_omc_string(text: &str) -> String {
     let trimmed = text.trim();
     let inner = trimmed
@@ -308,8 +349,10 @@ fn unquote_omc_string(text: &str) -> String {
     inner.replace("\\n", "\n").replace("\\\"", "\"")
 }
 
-fn parse_sim_record(record: &str, error: String) -> OmcSimOutcome {
+pub(super) fn parse_sim_record(record: &str, error: String) -> OmcSimOutcome {
     OmcSimOutcome {
+        fresh_result: None,
+        raw_reply: record.to_string(),
         result_file: extract_record_string(record, "resultFile").filter(|value| !value.is_empty()),
         messages: extract_record_string(record, "messages").unwrap_or_default(),
         error,
@@ -395,6 +438,33 @@ fn extract_record_f64(record: &str, field: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_requires_the_pinned_services_package() {
+        let root = tempfile::tempdir().unwrap();
+        let package = |dir: &str| {
+            let path = root.path().join(dir).join("package.mo");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+            path
+        };
+        let pinned = package("services/ModelicaServices");
+        let generic = package("ModelicaServices 4.1.0");
+        // The pinned file named through a `..` detour is the same file.
+        let detour = root
+            .path()
+            .join("ModelicaServices 4.1.0/../services/ModelicaServices/package.mo");
+        require_services_source(&format!("\"{}\"\n", detour.display()), &pinned)
+            .expect("the pinned package");
+        let refused = require_services_source(&format!("\"{}\"", generic.display()), &pinned)
+            .expect_err("the generic MSL services are refused");
+        assert!(
+            refused.to_string().contains("ModelicaServices 4.1.0"),
+            "{refused}"
+        );
+        let missing = require_services_source("\"\"", &pinned).expect_err("no services loaded");
+        assert!(missing.to_string().contains("not the pinned"), "{missing}");
+    }
 
     #[test]
     fn empty_port_file_is_not_a_ready_session() {
@@ -531,10 +601,11 @@ end SimulationResult;"#;
 
     #[test]
     fn reference_outcome_accepts_result_with_nonfatal_warning() {
-        let outcome = parse_sim_record(
+        let mut outcome = parse_sim_record(
             r#"record SimulationResult
     resultFile = "result.csv",
-    messages = "LOG_ASSERT | warning | [<interactive>:1:68-1:125:writable]
+    messages = "LOG_SUCCESS | info | The initialization finished successfully without homotopy method.
+LOG_ASSERT | warning | [<interactive>:1:68-1:125:writable]
 | | | The following assertion has been violated during initialization at time 0.000000
 | | | ((x < -1.0)) --> \"expected warning\"
 LOG_SUCCESS | info | The simulation finished successfully.
@@ -542,10 +613,17 @@ LOG_SUCCESS | info | The simulation finished successfully.
 end SimulationResult;"#,
             "Warning: harmless diagnostic".into(),
         );
+        let directory = tempfile::tempdir().expect("result directory");
+        let path = directory.path().join("result.csv");
+        std::fs::write(&path, "time,y\n0,1\n").expect("fresh result");
+        let reply = outcome
+            .raw_reply
+            .replace("result.csv", &path.display().to_string());
+        outcome = FreshResultFile::from_request(&path, Ok(None), &reply, outcome.error);
         let result = super::super::build_session_model_result(&outcome, 1.0);
 
         assert_eq!(result.status, "success");
-        assert_eq!(result.result_file.as_deref(), Some("result.csv"));
+        assert_eq!(result.result_file, outcome.result_file);
         assert_eq!(result.error, None);
     }
 

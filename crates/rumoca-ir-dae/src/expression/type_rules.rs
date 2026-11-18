@@ -10,6 +10,19 @@ pub(super) fn validate_static_quotient(
         unreachable!("builtin result validation proves quotient arity")
     };
     let operator = quotient_name(builtin);
+    if discrete_integer_quotient(storage, [*lhs, *rhs], at)? {
+        // MLS §3.8.5: Integer expressions with discrete operands are already
+        // discrete-time. Their exact arithmetic needs no continuous root and
+        // must not be domain-proved through the Real static-value helper.
+        return if storage.static_integer(*rhs) == Some(0) {
+            Err(DaeConstructionError::UndefinedBuiltinDomain {
+                operator,
+                span: at.span(),
+            })
+        } else {
+            Ok(())
+        };
+    }
     let (Some(lhs), Some(rhs)) = (
         static_numeric_value(storage, lhs.index()),
         static_numeric_value(storage, rhs.index()),
@@ -31,6 +44,23 @@ pub(super) fn validate_static_quotient(
             span: at.span(),
         })
     }
+}
+
+fn discrete_integer_quotient(
+    storage: &Storage,
+    arguments: [ExprId<'_>; 2],
+    at: DaeProvenance,
+) -> Result<bool, DaeConstructionError> {
+    for argument in arguments {
+        let value_type = storage.expr_type(argument, at)?;
+        if !value_type.is_scalar()
+            || value_type.scalar_type() != ScalarType::Integer
+            || storage.expr_variability(argument, at)? == ExpressionVariability::Continuous
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Where a runtime quotient is evaluated.
@@ -96,11 +126,10 @@ pub(super) fn validate_runtime_quotient(
 }
 
 /// MLS §3.7.2: `div`, `mod`, and `rem` trigger events where their result
-/// changes discontinuously during continuous integration. Operands of constant
-/// variability, such as the binders of a structured domain, never change, so
-/// the quotient needs no event owner. A statically proven zero divisor is still
-/// an undefined domain. Parameter-variability operands keep their checked
-/// runtime owner, which proves the divisor for the parameter values in use.
+/// changes discontinuously during continuous integration. Constant and parameter
+/// operands, including structured-domain binders, never change during integration,
+/// so their quotient needs no event owner. A statically proven zero divisor is
+/// still undefined; other invalid divisors retain the ordinary evaluation fault.
 fn validate_time_invariant_quotient(
     storage: &Storage,
     operator: &'static str,
@@ -110,9 +139,7 @@ fn validate_time_invariant_quotient(
     for operand in [lhs, rhs] {
         if matches!(
             storage.expr_variability(operand, at)?,
-            ExpressionVariability::Parameter
-                | ExpressionVariability::Discrete
-                | ExpressionVariability::Continuous
+            ExpressionVariability::Discrete | ExpressionVariability::Continuous
         ) {
             return Err(DaeConstructionError::NonStaticDiscontinuity {
                 operator,
@@ -333,14 +360,14 @@ fn power_result(
         return Err(DaeConstructionError::ShapeMismatch { span: at.span() });
     }
     Ok(ValueType::array(
-        promoted_numeric_scalar(lhs.scalar_type(), rhs.scalar_type(), false),
+        promoted_numeric_scalar(lhs.scalar_type(), rhs.scalar_type(), lhs.is_scalar()),
         lhs.dimensions().to_vec(),
     ))
 }
 
 /// The value type of an MLS 3.6 §10.6 element-wise operator (`.+`, `.-`, `.*`,
 /// `./`, `.^`). Each admits `size(a) = size(b)` or a scalar operand that is
-/// expanded to the other's shape; only `./` forces a Real result.
+/// expanded to the other's shape; `./` and `.^` force a Real result.
 fn elementwise_result(
     operator: BinaryOperator,
     lhs: &ValueType,
@@ -360,7 +387,10 @@ fn elementwise_result(
         promoted_numeric_scalar(
             lhs.scalar_type(),
             rhs.scalar_type(),
-            matches!(operator, BinaryOperator::ElementwiseDivide),
+            matches!(
+                operator,
+                BinaryOperator::ElementwiseDivide | BinaryOperator::ElementwisePower
+            ),
         ),
         dimensions.to_vec(),
     ))
@@ -436,9 +466,15 @@ pub(super) fn builtin_result<'dae>(
     }
     expect_numeric(first.scalar_type(), at)?;
     match builtin {
-        PureBuiltin::Abs | PureBuiltin::Sign => {
+        PureBuiltin::Abs => {
             expect_arity(arguments, 1, at)?;
             Ok(first)
+        }
+        // MLS 3.7 §3.7.1: `sign(v)` "expands into noEvent(if v > 0 then 1 else
+        // if v < 0 then -1 else 0)", an Integer expression for either operand type.
+        PureBuiltin::Sign => {
+            expect_arity(arguments, 1, at)?;
+            Ok(ValueType::array(ScalarType::Integer, first.dimensions()))
         }
         PureBuiltin::Sqrt
         | PureBuiltin::Floor
@@ -601,14 +637,10 @@ fn shaped_builtin_result(
     at: DaeProvenance,
 ) -> Result<ValueType, DaeConstructionError> {
     let (scalar, extents) = match builtin {
-        PureBuiltin::Zeros | PureBuiltin::Ones => (ScalarType::Real, arguments),
-        PureBuiltin::Fill if arguments.len() >= 2 && first.is_scalar() => {
-            (first.scalar_type(), &arguments[1..])
-        }
-        PureBuiltin::Fill if arguments.len() < 2 => {
-            return Err(invalid_arity(2, arguments.len(), at));
-        }
-        PureBuiltin::Fill => return Err(DaeConstructionError::ShapeMismatch { span: at.span() }),
+        // MLS 3.7 §10.3.3: `zeros` and `ones` are Integer arrays; a Real
+        // context converts them like any Integer expression.
+        PureBuiltin::Zeros | PureBuiltin::Ones => (ScalarType::Integer, arguments),
+        PureBuiltin::Fill => return fill_result(storage, arguments, first, at),
         PureBuiltin::Linspace => {
             expect_arity(arguments, 3, at)?;
             let endpoints = common_value_type(first, storage.expr_type(arguments[1], at)?, at)?;
@@ -651,6 +683,30 @@ fn shaped_builtin_result(
         .map(|expression| literal_array_extent(storage, expression, at))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ValueType::array(scalar, dimensions))
+}
+
+/// MLS 3.7 §10.3.3: `fill(s, n1, n2, ...)` has `s`'s element type at every
+/// position, so a record element keeps its record name and fields. Only an
+/// element value (a scalar or a record) is accepted; an array `s` stays
+/// refused.
+fn fill_result(
+    storage: &Storage,
+    arguments: &[ExprId<'_>],
+    first: &ValueType,
+    at: DaeProvenance,
+) -> Result<ValueType, DaeConstructionError> {
+    if arguments.len() < 2 {
+        return Err(invalid_arity(2, arguments.len(), at));
+    }
+    if !first.dimensions().is_empty() {
+        return Err(DaeConstructionError::ShapeMismatch { span: at.span() });
+    }
+    let dimensions = arguments[1..]
+        .iter()
+        .copied()
+        .map(|expression| literal_array_extent(storage, expression, at))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(first.with_dimensions(dimensions))
 }
 
 /// Construct the exact rank-one type MLS §10.3.2 gives `vector(A)`.

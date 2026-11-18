@@ -148,13 +148,24 @@ pub(super) fn rebuild_roots<'target>(
         let root = source
             .structured_root(id)
             .expect("finalized structured-root identity resolves");
-        target.conditions(|target| {
-            target.structured_root(
-                domains[root.domain().index() as usize].id,
-                expressions[root.expression().index() as usize],
-                root.provenance(),
-            )
-        })?;
+        let rebuilt = if let Some(owner) = quotients.structured_root_owner(index) {
+            quotients.replay_structured_root(owner, domains, target)?
+        } else {
+            target.conditions(|target| {
+                target.structured_root(
+                    domains[root.domain().index() as usize].id,
+                    expressions[root.expression().index() as usize],
+                    root.provenance(),
+                )
+            })?
+        };
+        if rebuilt.index() as usize != index {
+            return Err(dae::DaeConstructionError::IncompleteDefinition {
+                kind: "rebuilt structured root stream",
+                index: index as u32,
+                span: root.provenance().span(),
+            });
+        }
     }
     Ok(())
 }
@@ -218,6 +229,12 @@ fn rebuild_event_action<'target>(
             action.provenance(),
         ),
         dae::EventActionOperation::Terminate { message } => events.terminate(
+            trigger,
+            guard,
+            expressions[message.index() as usize],
+            action.provenance(),
+        ),
+        dae::EventActionOperation::Print { message } => events.print(
             trigger,
             guard,
             expressions[message.index() as usize],

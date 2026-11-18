@@ -8,12 +8,12 @@ use crate::{CompilationResult, TemplateIr, error::CompilerError};
 use anyhow::{Context, Result, bail};
 #[cfg(feature = "scheduled-sim")]
 use rumoca_compile::codegen::targets::TargetFile;
-#[cfg(test)]
-use rumoca_compile::codegen::targets::validate_solve_tensor_inventory;
+#[cfg(feature = "fmi")]
+use rumoca_compile::codegen::targets::validate_solve_target_capabilities;
 use rumoca_compile::codegen::targets::{
     RenderedTargetFile, TargetBundle, TargetCapabilities, TargetManifest, TargetTemplateIr,
     TargetTemplateSource, ensure_target_has_rendered_files, validate_dae_target_capabilities,
-    validate_solve_target_capabilities,
+    validate_flat_target_capabilities, validate_solve_target_capabilities_with_calls,
 };
 #[cfg(any(feature = "scheduled-sim", feature = "fmu-packaging"))]
 use rumoca_compile::codegen::targets::{TargetArchiveFormat, TargetArchiveRoot, safe_target_join};
@@ -88,6 +88,11 @@ pub(crate) fn invalidate_target_output(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_target_output_dir(&manifest, &identity.artifact_stem));
     if let Some(package) = &manifest.package {
+        if !package.inputs.is_empty() {
+            // Exact build provenance is not available before semantic compilation;
+            // the completed publisher owns replacement for compiled-input products.
+            return Ok(());
+        }
         let root = render_builtin_output_path(&package.root, &identity.artifact_stem)?;
         let root = safe_target_join(&out_dir, root.trim())?;
         let archive = package
@@ -154,6 +159,124 @@ pub fn compile_packaged_target(
     target: &str,
     output: PathBuf,
 ) -> Result<()> {
+    let (bundle, manifest, identity, renderer) = resolve_packaged_context(result, model, target)?;
+    compile_manifest_package(
+        result,
+        &renderer,
+        &bundle,
+        &manifest,
+        &output,
+        &identity.artifact_stem,
+    )
+}
+
+/// Prepare immutable rendered metadata/build inputs for a target with separately
+/// compiled assets. The returned object retains the exact artifact session and
+/// publishes only after the caller supplies all declared asset roles.
+#[cfg(feature = "fmu-packaging")]
+pub fn prepare_packaged_target(
+    result: &CompilationResult,
+    model: &str,
+    target: &str,
+) -> Result<crate::packaging::PreparedTargetPackage> {
+    let (bundle, manifest, identity, renderer) = resolve_packaged_context(result, model, target)?;
+    prepare_manifest_package(
+        result,
+        &bundle,
+        &manifest,
+        &identity.artifact_stem,
+        &renderer,
+    )
+}
+
+#[cfg(feature = "fmu-packaging")]
+fn prepare_manifest_package(
+    result: &CompilationResult,
+    bundle: &TargetBundle,
+    manifest: &TargetManifest,
+    model_identifier: &str,
+    renderer: &ManifestRenderer,
+) -> Result<crate::packaging::PreparedTargetPackage> {
+    validate_manifest_package_policy(manifest)?;
+    let artifact = match renderer {
+        #[cfg(feature = "fmi")]
+        ManifestRenderer::Fmi { artifact, .. } => artifact.clone(),
+        ManifestRenderer::AlgorithmCode { artifact, .. } => artifact.clone(),
+        _ => crate::packaging::ArtifactSession::new(&manifest.files)?,
+    };
+    let render = |template: &str, context: &crate::packaging::ArtifactRenderContext<'_>| {
+        let source = bundle
+            .template_source(template)
+            .unwrap_or(std::borrow::Cow::Borrowed(template));
+        renderer.render_with_artifact(result, source.as_ref(), model_identifier, context)
+    };
+    let rendered = crate::packaging::render_web_with_session(&manifest.files, render, &artifact)?;
+    let checksums = std::collections::BTreeMap::new();
+    let context = crate::packaging::ArtifactRenderContext {
+        session: &artifact,
+        checksums: &checksums,
+    };
+    let assets = manifest
+        .assets
+        .iter()
+        .map(|asset| Ok((render(&asset.dest, &context)?, bundle.asset_files(asset)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let product = crate::packaging::PreparedTargetPackage::construct(
+        rendered,
+        assets,
+        manifest.package.as_ref().expect("resolved package"),
+        |path| render(path, &context),
+        artifact.clone(),
+    )?;
+    Ok(product)
+}
+
+/// Publish the exact sealed adapter result after checking its prepared inventory
+/// and declared slot. Generic archive assembly remains structural only.
+///
+/// Coverage exemption: a `CompiledWasmComponent` is issued only by a
+/// wasm32-wasip2 toolchain build, which no workspace test can run (the Template
+/// Runtime wasm CI job exercises it); the checked
+/// behaviour lives in `sealed_slot` and `PreparedTargetPackage::publish`, which
+/// the tests cover.
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(feature = "fmu-packaging")]
+pub fn publish_wasm_component(
+    prepared: crate::packaging::PreparedTargetPackage,
+    component: rumoca_exec_wasm::CompiledWasmComponent<crate::packaging::ArtifactSession>,
+    output: &Path,
+) -> Result<()> {
+    let slot = sealed_slot(&prepared, component.binding())?;
+    prepared.publish(
+        std::collections::BTreeMap::from([(slot, component.into_bytes())]),
+        output,
+    )
+}
+
+/// The declared slot a sealed build result is bound to, only when it was issued
+/// from this very prepared inventory.
+#[cfg(feature = "fmu-packaging")]
+fn sealed_slot(
+    prepared: &crate::packaging::PreparedTargetPackage,
+    binding: &rumoca_core::artifact_build::ArtifactBuildBinding<crate::packaging::ArtifactSession>,
+) -> Result<String> {
+    if !prepared.accepts_build(binding) {
+        bail!("compiled component belongs to a foreign prepared inventory or slot");
+    }
+    Ok(binding.slot().to_owned())
+}
+
+#[cfg(feature = "fmu-packaging")]
+fn resolve_packaged_context<'model>(
+    result: &CompilationResult,
+    model: &'model str,
+    target: &str,
+) -> Result<(
+    TargetBundle,
+    TargetManifest,
+    TargetModelIdentity<'model>,
+    ManifestRenderer,
+)> {
     if raw_template_target(target) {
         bail!("raw template targets do not declare packages");
     }
@@ -173,14 +296,7 @@ pub fn compile_packaged_target(
         EmissionPolicy::reviewable(),
         validated,
     )?;
-    compile_manifest_package(
-        result,
-        &renderer,
-        &bundle,
-        &manifest,
-        &output,
-        &identity.artifact_stem,
-    )
+    Ok((bundle, manifest, identity, renderer))
 }
 
 /// Apply the `--phase`/`-ir`/unknown-target guards and load a built-in or
@@ -264,16 +380,15 @@ pub fn render_target_files(
     // `packaging::render_web_files` — the same
     // topological render + hash-inject the CLI writes, minus the on-disk
     // packaging — so CI exercises the exact web the container writer will.
-    if manifest.ir == TargetTemplateIr::AlgorithmCode {
-        let package = lower_algorithm_code(
+    if matches!(
+        manifest.ir,
+        TargetTemplateIr::AlgorithmCode | TargetTemplateIr::AlgorithmBlock
+    ) {
+        let renderer = algorithm_code_renderer(
             result,
             identity.semantic_name,
-            manifest.name.as_deref(),
+            &manifest,
             EmissionPolicy::reviewable(),
-        )?;
-        let renderer = rumoca_phase_codegen::AlgorithmCodeTemplateRenderer::new(
-            &package,
-            result.dae.source_map(),
         )?;
         let render = algorithm_code_web_render(&renderer, &bundle, &identity.artifact_stem);
         return crate::packaging::render_web_files(&manifest.files, render);
@@ -350,6 +465,39 @@ fn lower_algorithm_code(
         },
     )
     .map_err(|diagnostics| galec_projection_error(result, diagnostics, target.unwrap_or("custom")))
+}
+
+/// The renderer of an Algorithm Code target. An `algorithm-block` target
+/// prints its C from the package's Solve refinement (#483: DAE → GALEC →
+/// Solve IR → C), refined under the target's binary32 profile and declared
+/// Integer domain before anything renders, so a refusal ends the command
+/// before any output exists.
+fn algorithm_code_renderer(
+    result: &CompilationResult,
+    model: &str,
+    manifest: &TargetManifest,
+    emission_policy: EmissionPolicy,
+) -> Result<rumoca_phase_codegen::AlgorithmCodeTemplateRenderer> {
+    let package = lower_algorithm_code(result, model, manifest.name.as_deref(), emission_policy)?;
+    if manifest.ir != TargetTemplateIr::AlgorithmBlock {
+        return Ok(rumoca_phase_codegen::AlgorithmCodeTemplateRenderer::new(
+            &package,
+            result.dae.source_map(),
+        )?);
+    }
+    let target = manifest.name.as_deref().unwrap_or("custom");
+    let profile = manifest.algorithm_block_profile()?;
+    let block =
+        rumoca_sim::algorithm_block::lower_algorithm_block(&package, profile).map_err(|error| {
+            anyhow::anyhow!("Solve refinement refused target '{target}' before any output: {error}")
+        })?;
+    Ok(
+        rumoca_phase_codegen::AlgorithmCodeTemplateRenderer::with_solve_block(
+            &package,
+            &block,
+            result.dae.source_map(),
+        )?,
+    )
 }
 
 fn galec_projection_error(
@@ -493,7 +641,7 @@ fn template_ir_to_cli(value: TargetTemplateIr) -> TemplateIr {
         }
         TargetTemplateIr::Flat => TemplateIr::Flat,
         TargetTemplateIr::Ast => TemplateIr::Ast,
-        TargetTemplateIr::AlgorithmCode => {
+        TargetTemplateIr::AlgorithmCode | TargetTemplateIr::AlgorithmBlock => {
             unreachable!("Algorithm Code targets use their checked phase-owned renderer")
         }
     }
@@ -567,18 +715,21 @@ fn compile_manifest_package(
     out_dir: &Path,
     model_identifier: &str,
 ) -> Result<()> {
+    validate_manifest_package_policy(manifest)?;
     let declared = manifest
         .package
         .as_ref()
         .context("internal: packaged target has no [package] declaration")?;
-    for file in &manifest.files {
-        if file.mode.is_some() {
-            bail!(
-                "[package] targets do not support per-file `mode` (file '{}'): \
-                 the package writer owns the on-disk layout",
-                file.path
-            );
-        }
+    if !declared.inputs.is_empty() {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "component-build"))]
+        return crate::component_delivery::deliver(
+            prepare_manifest_package(result, bundle, manifest, model_identifier, renderer)?,
+            out_dir,
+        );
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "component-build")))]
+        bail!(
+            "target requires component-build, or explicit prepare_packaged_target and sealed publication"
+        );
     }
     let package_root = renderer
         .render(result, &declared.root, model_identifier)
@@ -588,10 +739,6 @@ fn compile_manifest_package(
         .archive
         .as_ref()
         .map(|archive| {
-            if archive.format != TargetArchiveFormat::Zip || archive.root != TargetArchiveRoot::Flat
-            {
-                bail!("Only flat zip archives are currently supported");
-            }
             let rendered = renderer
                 .render(result, &archive.path, model_identifier)
                 .context("Render [package.archive] path")?;
@@ -617,6 +764,29 @@ fn compile_manifest_package(
         &package,
         &package_root,
     )?;
+    Ok(())
+}
+
+#[cfg(feature = "fmu-packaging")]
+fn validate_manifest_package_policy(manifest: &TargetManifest) -> Result<()> {
+    let declared = manifest
+        .package
+        .as_ref()
+        .context("target has no package declaration")?;
+    for file in &manifest.files {
+        if file.mode.is_some() {
+            bail!(
+                "[package] targets do not support per-file `mode` (file '{}'): \
+                 the package writer owns the on-disk layout",
+                file.path
+            );
+        }
+    }
+    if declared.archive.as_ref().is_some_and(|archive| {
+        archive.format != TargetArchiveFormat::Zip || archive.root != TargetArchiveRoot::Flat
+    }) {
+        bail!("Only flat zip archives are currently supported");
+    }
     Ok(())
 }
 
@@ -654,9 +824,13 @@ fn validate_target_requirements(
     result: &CompilationResult,
     manifest: &TargetManifest,
 ) -> Result<ValidatedTarget> {
-    let mut validated = ValidatedTarget::default();
+    let validated = ValidatedTarget::default();
+    #[cfg(feature = "fmi")]
+    let mut validated = validated;
     match manifest.ir {
-        TargetTemplateIr::Dae | TargetTemplateIr::AlgorithmCode => {
+        TargetTemplateIr::Dae
+        | TargetTemplateIr::AlgorithmCode
+        | TargetTemplateIr::AlgorithmBlock => {
             let capabilities = declared_capabilities(manifest)?;
             validate_dae_target_capabilities(&result.dae, manifest, capabilities)?;
         }
@@ -668,22 +842,41 @@ fn validate_target_requirements(
             validate_dae_target_capabilities(&result.dae, manifest, capabilities)?;
             #[cfg(feature = "fmi")]
             if manifest.ir == TargetTemplateIr::Fmi {
-                let component = rumoca_sim::lower_fmi_component(&result.dae)
+                let component = rumoca_sim::lower_fmi_c_export_component(&result.dae)
                     .context("Construct checked FMI component")?;
                 validate_solve_target_capabilities(component.problem(), manifest, capabilities)?;
                 validated.fmi_component = Some(component);
                 return Ok(validated);
             }
-            let solve = rumoca_sim::lower_solve_problem(&result.dae)
+            // The renderer inlines pure calls from the owners lowered with
+            // the problem (`build_solve_template_renderer`), so the gate reads
+            // the same pair.
+            let solve = rumoca_sim::lower_solve_package(&result.dae)
                 .context("Lower Solve IR for target capability validation")?;
-            validate_solve_target_capabilities(&solve, manifest, capabilities)?;
+            validate_solve_target_capabilities_with_calls(
+                &solve.problem,
+                Some(&solve.pure_calls),
+                manifest,
+                capabilities,
+            )?;
+            if manifest.ir == TargetTemplateIr::Solve && capabilities.scalar_fallback == Some(true)
+            {
+                result.require_scalar_target_projection()?;
+            }
         }
-        // Flat and AST templates carry no capability obligation. The Flat
-        // render context proves its own contract before any byte is produced
-        // (`rumoca::codegen::EC007`, the non-materialized structured-family
-        // refusal), and the AST is source structure with no lowering claim a
-        // capability column could describe.
-        TargetTemplateIr::Flat | TargetTemplateIr::Ast => {}
+        // A Flat template that declares a `[capabilities]` table is held to
+        // it: `events` / `algorithms` declared unsupported refuse a model whose
+        // `when` chains or algorithm sections the template would otherwise
+        // drop silently. Undeclared Flat templates keep no obligation; the
+        // render context still proves its own structured-family contract
+        // (`rumoca::codegen::EC007`). The AST is source structure with no
+        // lowering claim a capability column could describe.
+        TargetTemplateIr::Flat => {
+            if let Some(capabilities) = manifest.capabilities.as_ref() {
+                validate_flat_target_capabilities(&result.flat, manifest, capabilities)?;
+            }
+        }
+        TargetTemplateIr::Ast => {}
     }
     Ok(validated)
 }
@@ -795,16 +988,15 @@ fn resolve_manifest_renderer(
     if manifest.ir == TargetTemplateIr::Solve && manifest.name.as_deref() == Some("wgsl-ode") {
         return Ok(ManifestRenderer::WgslSolve);
     }
-    if manifest.ir == TargetTemplateIr::AlgorithmCode {
-        let package = lower_algorithm_code(
+    if matches!(
+        manifest.ir,
+        TargetTemplateIr::AlgorithmCode | TargetTemplateIr::AlgorithmBlock
+    ) {
+        let renderer = algorithm_code_renderer(
             result,
             identity.semantic_name,
-            manifest.name.as_deref(),
+            manifest,
             admitted_emission_policy(manifest, emission_policy)?,
-        )?;
-        let renderer = rumoca_phase_codegen::AlgorithmCodeTemplateRenderer::new(
-            &package,
-            result.dae.source_map(),
         )?;
         let artifact = crate::packaging::ArtifactSession::new(&manifest.files)?;
         return Ok(ManifestRenderer::AlgorithmCode { renderer, artifact });
@@ -817,10 +1009,13 @@ fn resolve_manifest_renderer(
             let Some(component) = validated.fmi_component else {
                 bail!("FMI target renderer requires the component its capability gate checked");
             };
-            // Admission preserves the correlated kernel and proves the complete
-            // event profile before any FMI template receives its inventory.
-            let c_profile = component
+            // Deployment coverage and C execution admission retain the same
+            // correlated kernel before any template receives its inventory.
+            let deployment = component
                 .into_codegen_view()
+                .try_deployment(manifest.fmi_deployment.clone().unwrap_or_default())
+                .context("Admit checked FMI deployment capabilities")?;
+            let c_profile = deployment
                 .try_c()
                 .context("Project checked FMI component for a storage-backed target")?;
             let renderer =
@@ -955,8 +1150,39 @@ fn print_target_completion_message(
     Ok(())
 }
 
+#[cfg(all(test, feature = "fmu-packaging"))]
+mod prepared_package_tests;
+
+#[cfg(all(test, feature = "fmu-packaging"))]
+mod deployment_admission_tests {
+    use super::*;
+
+    #[test]
+    fn fmi_deployment_refuses_published_string_before_creating_a_product() {
+        let source = r#"model UnmappedString parameter String label = "sensor"; output Real y; equation y = 1; end UnmappedString;"#;
+        let result = crate::Compiler::new()
+            .model("UnmappedString")
+            .compile_str(source, "UnmappedString.mo")
+            .unwrap();
+        render_target_files(&result, "UnmappedString", "fmi3", None)
+            .expect("the shared C kernel supports literal String metadata/access");
+        let output = tempfile::tempdir().unwrap();
+        let error = compile_packaged_target(
+            &result,
+            "UnmappedString",
+            "fmi-ls-wasm",
+            output.path().to_path_buf(),
+        )
+        .expect_err("the WIT deployment has no String accessor");
+        assert!(format!("{error:#}").contains("unsupported-feature:fmi-variable-access-string"));
+        assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+    }
+}
+
 #[cfg(all(test, feature = "scheduled-sim"))]
 mod tests {
+    use rumoca_compile::codegen::targets::validate_solve_tensor_inventory;
+
     use super::*;
     use crate::Compiler;
 
@@ -1087,16 +1313,22 @@ end FmiSwitchedDecay;
     #[cfg(feature = "fmu-packaging")]
     fn compile_time_event_target_demo() -> CompilationResult {
         let source = r#"
-model FmiTimeEventDecay
-  Real x(start = 1.0);
+model FmiDynamicTimeEvent
+  Real deadline(start = 1.0, fixed = true);
+  Integer n(start = 0, fixed = true);
 equation
-  der(x) = if time > 0.5 then -1.0 else 1.0;
-end FmiTimeEventDecay;
+  when time > 0.3 then
+    deadline = time + 1.0;
+  end when;
+  when time >= pre(deadline) then
+    n = pre(n) + 1;
+  end when;
+end FmiDynamicTimeEvent;
 "#;
 
         Compiler::new()
-            .model("FmiTimeEventDecay")
-            .compile_str(source, "FmiTimeEventDecay.mo")
+            .model("FmiDynamicTimeEvent")
+            .compile_str(source, "FmiDynamicTimeEvent.mo")
             .expect("time-event target demo should compile")
     }
 
@@ -1173,6 +1405,39 @@ end FmiUndelayedDecay;
     /// The same rejection on the packaging entry point, with nothing written.
     #[cfg(feature = "fmu-packaging")]
     #[test]
+    fn native_and_prepared_packages_refuse_per_file_modes_before_writes() {
+        let result = compile_undelayed_target_demo();
+        for target in ["fmi3", "fmi-ls-wasm"] {
+            let (bundle, mut manifest, identity, renderer) =
+                resolve_packaged_context(&result, "FmiUndelayedDecay", target).unwrap();
+            manifest.files[0].mode = Some("644".into());
+            let error = prepare_manifest_package(
+                &result,
+                &bundle,
+                &manifest,
+                &identity.artifact_stem,
+                &renderer,
+            )
+            .err()
+            .expect("prepared package must reject per-file modes");
+            assert!(error.to_string().contains("do not support per-file `mode`"));
+            let work = tempfile::tempdir().unwrap();
+            let error = compile_manifest_package(
+                &result,
+                &renderer,
+                &bundle,
+                &manifest,
+                work.path(),
+                &identity.artifact_stem,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("do not support per-file `mode`"));
+            assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(feature = "fmu-packaging")]
+    #[test]
     fn fmi_packaging_rejects_a_delayed_model_before_writing_any_output() {
         let result = compile_delayed_target_demo();
 
@@ -1208,7 +1473,7 @@ end FmiUndelayedDecay;
             let out_dir = tempfile::tempdir().expect("temp output dir");
             let error = compile_packaged_target(
                 &result,
-                "FmiTimeEventDecay",
+                "FmiDynamicTimeEvent",
                 target,
                 out_dir.path().to_path_buf(),
             )
@@ -1217,6 +1482,11 @@ end FmiUndelayedDecay;
                 error
                     .downcast_ref::<rumoca_ir_solve::fmi::FmiCCodegenError>()
                     .is_some(),
+                "{target}: {error:#}"
+            );
+            assert!(
+                format!("{error:#}")
+                    .contains("the C profile cannot execute dynamic or scheduled-root time events"),
                 "{target}: {error:#}"
             );
             assert_eq!(
@@ -1279,9 +1549,12 @@ end FmiUndelayedDecay;
                 .fmi_component
                 .as_ref()
                 .expect("an FMI gate carries the component it validated");
+            // Compare canonical source data, independently of derived cache warmth.
             assert_eq!(
-                format!("{:?}", component.problem()),
-                format!("{independent:?}"),
+                serde_json::to_value(component.problem())
+                    .expect("the validated Solve problem serializes"),
+                serde_json::to_value(&independent)
+                    .expect("the independent Solve problem serializes"),
                 "{target}: the validated problem must be the DAE's Solve lowering"
             );
             resolve_manifest_renderer(

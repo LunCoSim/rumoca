@@ -1,3 +1,4 @@
+use super::registers::RegisterSet;
 use super::*;
 
 fn wide_matrix_program() -> Vec<LinearOp> {
@@ -36,7 +37,7 @@ fn shared_wide_value_proof_benchmark() {
     let programs = programs(&rows);
     let start = std::time::Instant::now();
     for _ in 0..8 {
-        let shared = SharedValueSegments::derive(std::hint::black_box(&programs)).unwrap();
+        let shared = SharedValueSegments::derive(std::hint::black_box(&programs));
         shared.check(&programs).unwrap();
         assert_eq!(shared.segments.len(), 1);
         assert_eq!(count(shared.segments[0].ops(), "MatrixMultiply"), 1);
@@ -52,7 +53,7 @@ fn shared_wide_value_proof_benchmark() {
 fn shared_wide_value_proof_rejects_changed_operands_and_output_projection() {
     let rows = [(wide_matrix_program(), (512..768).collect())];
     let programs = programs(&rows);
-    let mut changed = SharedValueSegments::derive(&programs).unwrap();
+    let mut changed = SharedValueSegments::derive(&programs);
     for op in &mut changed.segments[0].ops {
         if let LinearOp::MatrixMultiply {
             lhs_start,
@@ -67,7 +68,7 @@ fn shared_wide_value_proof_rejects_changed_operands_and_output_projection() {
         changed.check(&programs),
         Err(SharedValueError::Output { index: 0 })
     );
-    let mut changed = SharedValueSegments::derive(&programs).unwrap();
+    let mut changed = SharedValueSegments::derive(&programs);
     let output = changed.segments[0]
         .ops
         .iter_mut()
@@ -234,7 +235,7 @@ fn shared_value_proof_preserves_constant_bits_and_normalizes_destinations() {
             )
         });
         let programs = programs(&rows);
-        let mut shared = SharedValueSegments::derive(&programs).unwrap();
+        let mut shared = SharedValueSegments::derive(&programs);
         shared.check(&programs).unwrap();
         assert_eq!(count(shared.segments[0].ops(), "Const"), 1);
         for op in &mut shared.segments[0].ops {
@@ -257,7 +258,7 @@ fn shared_scalar_value_proof_benchmark() {
     let programs = programs(&rows);
     let start = std::time::Instant::now();
     for _ in 0..8 {
-        let shared = SharedValueSegments::derive(std::hint::black_box(&programs)).unwrap();
+        let shared = SharedValueSegments::derive(std::hint::black_box(&programs));
         shared.check(&programs).unwrap();
         assert!(shared.shared > 256);
         std::hint::black_box(shared);
@@ -285,7 +286,7 @@ fn a_repeated_value_is_computed_once_and_the_segment_checks() {
         (product_plus(0, 1, 2.0), vec![11]),
     ];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs).unwrap();
+    let shared = SharedValueSegments::derive(&programs);
     shared.check(&programs).unwrap();
     let [segment] = shared.segments() else {
         panic!("both programs fuse into one segment");
@@ -304,7 +305,7 @@ fn a_slot_an_earlier_program_stored_is_read_from_its_register() {
         (product_plus(5, 2, 3.0), vec![6]),
     ];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs).unwrap();
+    let shared = SharedValueSegments::derive(&programs);
     shared.check(&programs).unwrap();
     let [segment] = shared.segments() else {
         panic!("one segment");
@@ -341,7 +342,7 @@ fn a_program_with_an_effect_or_a_rewritten_register_is_its_own_segment() {
         (rewritten.clone(), vec![8]),
     ];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs).unwrap();
+    let shared = SharedValueSegments::derive(&programs);
     shared.check(&programs).unwrap();
     let segments = shared.segments();
     assert_eq!(segments.len(), 4);
@@ -385,7 +386,7 @@ fn a_tensor_value_keeps_its_layout_and_is_shared_whole() {
         (product(3), vec![12]),
     ];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs).unwrap();
+    let shared = SharedValueSegments::derive(&programs);
     shared.check(&programs).unwrap();
     let [segment] = shared.segments() else {
         panic!("one segment");
@@ -413,7 +414,7 @@ fn a_segment_closes_at_the_register_cap_and_records_what_is_recomputed() {
     };
     let rows = [identity(0), identity(1)];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs).unwrap();
+    let shared = SharedValueSegments::derive(&programs);
     shared.check(&programs).unwrap();
     assert_eq!(shared.segments().len(), 2);
     assert_eq!(
@@ -432,7 +433,7 @@ fn the_checker_rejects_a_segment_that_computes_another_value() {
         (product_plus(0, 1, 2.0), vec![11]),
     ];
     let programs = programs(&rows);
-    let mut shared = SharedValueSegments::derive(&programs).unwrap();
+    let mut shared = SharedValueSegments::derive(&programs);
     for op in &mut shared.segments[0].ops {
         if let LinearOp::Const { value, .. } = op
             && *value == 2.0
@@ -477,7 +478,7 @@ fn copied_fill(a: usize) -> Vec<LinearOp> {
 fn a_copy_names_the_value_it_copies_and_a_gathered_range_checks() {
     let rows = [(copied_fill(0), vec![10]), (copied_fill(1), vec![11])];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs).unwrap();
+    let shared = SharedValueSegments::derive(&programs);
     shared.check(&programs).unwrap();
     let [segment] = shared.segments() else {
         panic!("one segment");
@@ -526,7 +527,7 @@ fn parameter_and_continuous_values_are_computed_once_per_call() {
             (sine_of(load.clone(), 2.0), vec![11]),
         ];
         let programs = programs(&rows);
-        let shared = SharedValueSegments::derive(&programs).unwrap();
+        let shared = SharedValueSegments::derive(&programs);
         shared.check(&programs).unwrap();
         let [segment] = shared.segments() else {
             panic!("one segment");
@@ -564,7 +565,7 @@ fn a_discrete_memory_value_is_read_from_its_slot_at_every_call() {
         (sine_of(pre, 2.0), vec![22]),
     ];
     let programs = programs(&rows);
-    let shared = SharedValueSegments::derive(&programs).unwrap();
+    let shared = SharedValueSegments::derive(&programs);
     shared.check(&programs).unwrap();
     let [segment] = shared.segments() else {
         panic!("one segment");
@@ -603,4 +604,308 @@ fn a_sharing_that_fails_its_proof_is_counted_and_admits_nothing() {
     .unwrap();
     let admitted = admit_proven(Ok(right), &program, &targets).expect("a proven sharing");
     assert_eq!(count(&admitted.ops, "StoreOutput"), 1);
+}
+
+/// `y[target + i] = y[a + i] * y[b + i]` over `width` lanes as one tensor
+/// operation (the load, the product and the range store).
+fn wide_product(width: usize, a: usize, b: usize) -> Vec<LinearOp> {
+    let load = |dst_start: Reg, input_start: usize| LinearOp::TensorLoad {
+        dst_start,
+        input: TensorInputKind::Y,
+        input_start,
+        count: width,
+        seed_start: None,
+        lanes: 1,
+    };
+    vec![
+        load(0, a),
+        load(width as Reg, b),
+        LinearOp::TensorBinary {
+            dst_start: 2 * width as Reg,
+            op: BinaryOp::Mul,
+            lhs_start: 0,
+            rhs_start: width as Reg,
+            count: width,
+            lhs_stride: 1,
+            rhs_stride: 1,
+            lanes: 1,
+        },
+        LinearOp::StoreOutputRange {
+            start: 2 * width as Reg,
+            count: width,
+            stride: 1,
+        },
+    ]
+}
+
+/// A wide tensor operation costs its width, not its width squared: the
+/// operands of an operation are interned once, and each of its outputs is a
+/// term over that one id.
+#[test]
+fn a_wide_tensor_operation_is_derived_and_checked_in_linear_time() {
+    let width = 20_000;
+    let rows = [(
+        wide_product(width, 0, width),
+        (10_000..10_000 + width).collect::<Vec<_>>(),
+    )];
+    let programs = programs(&rows);
+    let started = std::time::Instant::now();
+    let shared = SharedValueSegments::derive(&programs);
+    shared.check(&programs).unwrap();
+    // Quadratic hashing of the operand list per output takes minutes here.
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(count(shared.segments()[0].ops(), "TensorBinary"), 1);
+}
+
+/// The read set of a wide range operation is collected in one validation,
+/// not rediscovered one register at a time.
+#[test]
+fn the_read_set_of_a_wide_range_is_collected_linearly() {
+    let count = 200_000;
+    let op = LinearOp::StoreOutputRange {
+        start: 0,
+        count,
+        stride: 1,
+    };
+    let started = std::time::Instant::now();
+    let reads = registers::read_registers(&op).expect("a validatable operation");
+    assert_eq!(reads.len(), count);
+    assert!(reads.iter().copied().eq(0..count as Reg));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// A scalar operation's key names its operands by field, so compaction keeps
+/// only the registers it reads; a range operation's key records the offset
+/// between its operands, so it keeps the span between them.
+#[test]
+fn compaction_keeps_operand_spans_only_where_the_key_records_them() {
+    let far = 100_000;
+    let scalar = registers::compact_registers(vec![
+        LinearOp::Const { dst: 0, value: 1.0 },
+        LinearOp::Const {
+            dst: far,
+            value: 2.0,
+        },
+        LinearOp::Binary {
+            dst: far + 1,
+            op: BinaryOp::Add,
+            lhs: 0,
+            rhs: far,
+        },
+        LinearOp::StoreOutput { src: far + 1 },
+    ]);
+    assert_eq!(
+        scalar[2],
+        LinearOp::Binary {
+            dst: 2,
+            op: BinaryOp::Add,
+            lhs: 0,
+            rhs: 1,
+        }
+    );
+    let ranged = registers::compact_registers(vec![
+        LinearOp::Const { dst: 0, value: 1.0 },
+        LinearOp::Const {
+            dst: far,
+            value: 2.0,
+        },
+        LinearOp::TensorBinary {
+            dst_start: far + 1,
+            op: BinaryOp::Add,
+            lhs_start: 0,
+            rhs_start: far,
+            count: 1,
+            lhs_stride: 1,
+            rhs_stride: 1,
+            lanes: 1,
+        },
+        LinearOp::StoreOutput { src: far + 1 },
+    ]);
+    assert!(matches!(
+        ranged[2],
+        LinearOp::TensorBinary { lhs_start: 0, rhs_start, .. } if rhs_start == far
+    ));
+}
+
+/// Every output of a wide operation is a term in one consecutive block that no
+/// slot or other value shares, and the same operation over the same operands
+/// is the same block, so a wide operation costs no table entry per lane.
+#[test]
+fn a_wide_operations_outputs_are_one_private_block_of_terms() {
+    let mut terms = Terms::default();
+    let slot = terms.slot(7);
+    assert_eq!(terms.slot(7), slot, "a slot is one term");
+    let wide = terms.key("wide", vec![(0, slot)], 1_000);
+    let again = terms.key("wide", vec![(0, slot)], 1_000);
+    assert_eq!(wide, again, "one operation over one operand is one value");
+    let other = terms.key("wide", vec![(0, slot + 1)], 1_000);
+    let wide_terms = (0..1_000).map(|lane| Terms::value(&wide, lane).unwrap());
+    let other_terms = (0..1_000).map(|lane| Terms::value(&other, lane).unwrap());
+    let mut all = wide_terms
+        .chain(other_terms)
+        .chain(std::iter::once(slot))
+        .collect::<Vec<_>>();
+    let count = all.len();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), count, "no two outputs share a term");
+    let later_slot = terms.slot(8);
+    assert!(
+        !all.contains(&later_slot),
+        "a slot seen after a wide operation is not one of its outputs"
+    );
+}
+
+#[test]
+fn register_state_is_dense_and_counts_the_registers_it_holds() {
+    let mut table = RegisterTable::<usize>::default();
+    assert_eq!(table.get(5), None);
+    table.insert(5, 50);
+    table.insert(5, 51);
+    table.insert(2, 20);
+    assert_eq!(
+        (table.get(5), table.get(2), table.len()),
+        (Some(51), Some(20), 2)
+    );
+    table.remove(5);
+    assert_eq!((table.get(5), table.len()), (None, 1));
+    let mut set = RegisterSet::default();
+    assert!(set.insert(9) && !set.insert(9));
+    set.remove(9);
+    assert!(!set.contains(9) && set.insert(9));
+}
+
+/// A term past the width a key was issued with belongs to the next value, so
+/// it is refused.
+#[test]
+fn a_value_term_past_the_key_width_is_refused() {
+    let mut terms = Terms::default();
+    let slot = terms.slot(0);
+    let key = terms.key("pair", vec![(0, slot)], 2);
+    assert!(Terms::value(&key, 1).is_some());
+    assert_eq!(Terms::value(&key, 2), None);
+    let wider = terms.key("pair", vec![(0, slot)], 3);
+    assert_eq!(
+        wider, key,
+        "the operation keeps the width it was issued with"
+    );
+    assert_eq!(Terms::value(&wider, 2), None);
+}
+
+/// Run `step` over a program builder whose register map holds nothing, as a
+/// violated classification would leave it, and report whether the builder
+/// declined.
+fn declines_over_empty_map(step: &Step<'_>, targets: &[usize]) -> bool {
+    let mut builder = Builder::default();
+    let mut program = ProgramBuilder {
+        builder: &mut builder,
+        base: 0,
+        map: RegisterTable::default(),
+        output: 0,
+        targets,
+    };
+    program.step(step);
+    builder.violated
+}
+
+#[test]
+fn an_inconsistent_register_map_declines_the_whole_sharing() {
+    let add = LinearOp::Binary {
+        dst: 2,
+        op: BinaryOp::Add,
+        lhs: 0,
+        rhs: 1,
+    };
+    let shape = value_shape(&add).unwrap();
+    assert!(declines_over_empty_map(&Step::Store(vec![3]), &[10]));
+    assert!(declines_over_empty_map(&Step::Copy { dst: 1, src: 0 }, &[]));
+    assert!(declines_over_empty_map(
+        &Step::Value {
+            op: &add,
+            shape,
+            dst: 2,
+            count: 1
+        },
+        &[]
+    ));
+    // A store with no target left is the same violation.
+    let mut builder = Builder::default();
+    let mut program = ProgramBuilder {
+        builder: &mut builder,
+        base: 0,
+        map: RegisterTable::default(),
+        output: 0,
+        targets: &[],
+    };
+    program.map.insert(0, 0);
+    program.step(&Step::Store(vec![0]));
+    assert!(builder.violated);
+}
+
+/// The decline target of a violated construction invariant shares nothing,
+/// keeps every program and its targets, and proves itself.
+#[test]
+fn the_unshared_sequence_keeps_every_program_and_checks() {
+    let rows = [
+        (product_plus(0, 1, 1.0), vec![10]),
+        (product_plus(0, 1, 2.0), vec![11]),
+    ];
+    let programs = programs(&rows);
+    let unshared = SharedValueSegments::unshared(&programs);
+    unshared.check(&programs).unwrap();
+    assert_eq!(unshared.shared_operations(), 0);
+    assert!(unshared.capped().is_empty());
+    let [first, second] = unshared.segments() else {
+        panic!("one segment per program");
+    };
+    assert_eq!((first.ops(), first.targets()), (&rows[0].0[..], &[10][..]));
+    assert_eq!(
+        (second.ops(), second.targets(), second.first_program()),
+        (&rows[1].0[..], &[11][..], 1)
+    );
+}
+
+#[test]
+fn conditional_value_proofs_do_not_merge_distinct_execution_owners() {
+    let conditional = |identity| {
+        let owner = FunctionConditionalOwnerId::checked(identity).unwrap();
+        let region = |value| {
+            vec![
+                LinearOp::Const { dst: 0, value },
+                LinearOp::StoreOutput { src: 0 },
+            ]
+        };
+        let program = FunctionConditionalProgram::checked_owned(
+            owner,
+            0,
+            vec![1],
+            [(region(1.0), region(7.0))],
+            region(8.0),
+        )
+        .unwrap();
+        vec![
+            LinearOp::FunctionConditional {
+                dst_start: 0,
+                capture_start: 0,
+                program: std::sync::Arc::new(program),
+            },
+            LinearOp::StoreOutput { src: 0 },
+        ]
+    };
+    let rows = [(conditional(1), vec![10]), (conditional(2), vec![11])];
+    let programs = programs(&rows);
+    let shared = SharedValueSegments::derive(&programs);
+    shared
+        .check(&programs)
+        .expect("execution-owner identity remains in normal segment proofs");
+    let calls = shared
+        .segments()
+        .iter()
+        .flat_map(|segment| segment.ops())
+        .filter(|op| matches!(op, LinearOp::FunctionConditional { .. }))
+        .count();
+    assert_eq!(
+        calls, 2,
+        "equal values do not erase distinct execution owners"
+    );
 }

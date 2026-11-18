@@ -1,0 +1,127 @@
+//! Portable status-returning native assignments with checked typed call linkage.
+use crate::{TypedCallFault, WasmCompileError};
+use rumoca_ir_solve::{NativeRefreshAssignmentSchedule, SolvePureCallTable, VarLayout};
+
+/// A checked address failure in a model scalar program, without a function owner.
+/// Kernel/program ordinals refer to the emitted construction-issued value schedule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeGatherFault {
+    pub status: u32,
+    pub kind: crate::TypedCallFaultKind,
+    pub kernel: usize,
+    pub program: usize,
+    pub operation: usize,
+    /// Enclosing operation and ordered condition/result/fallback region ordinal.
+    pub region_path: Vec<(usize, usize)>,
+    pub provenance: rumoca_core::Span,
+}
+
+/// One failure of an original dense component, issued with its source program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeLinearSolveFault {
+    pub status: u32,
+    pub size: usize,
+    pub component: usize,
+    pub kernel: usize,
+    pub program: usize,
+    pub operation: usize,
+    pub region_path: Vec<(usize, usize)>,
+    pub provenance: rumoca_core::Span,
+}
+
+#[derive(Debug)]
+pub struct CompiledNativeCallProgramWasm {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) capacity_policy: crate::CheckedNativeWasmCapacityPolicy,
+    pub(crate) scratch_bytes: u32,
+    pub(crate) scratch_report: crate::ScratchReport,
+    pub(crate) faults: Vec<TypedCallFault>,
+    pub(crate) gather_faults: Vec<NativeGatherFault>,
+    pub(crate) linear_solve_faults: Vec<NativeLinearSolveFault>,
+    pub(crate) math_imports: Vec<&'static str>,
+    pub(crate) carried: rumoca_ir_solve::NativeCarriedState,
+}
+
+impl CompiledNativeCallProgramWasm {
+    pub fn capacity_policy(&self) -> crate::CheckedNativeWasmCapacityPolicy {
+        self.capacity_policy
+    }
+
+    /// The state this module publishes into P instead of the host Y (SOLVE-C101).
+    pub fn carried_state(&self) -> &rumoca_ir_solve::NativeCarriedState {
+        &self.carried
+    }
+
+    pub fn module_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn scratch_bytes(&self) -> u32 {
+        self.scratch_bytes
+    }
+    /// Per-owner frame, region and call-site scratch high-water marks.
+    pub fn scratch_report(&self) -> &crate::ScratchReport {
+        &self.scratch_report
+    }
+    /// Status 1 denotes invalid whole-program buffers; 2 invalid scalar-to-typed input.
+    /// Higher statuses retain exact call-owner or model-program provenance.
+    /// Model address faults are exposed by `gather_faults`.
+    pub fn faults(&self) -> &[TypedCallFault] {
+        &self.faults
+    }
+    pub fn gather_faults(&self) -> &[NativeGatherFault] {
+        &self.gather_faults
+    }
+    pub(crate) fn status_error(&self, status: u32) -> WasmCompileError {
+        self.entry_status_error(status, &self.gather_faults, &self.linear_solve_faults)
+    }
+
+    /// Shared helper faults plus the faults of one entry of a shared module.
+    pub(crate) fn entry_status_error(
+        &self,
+        status: u32,
+        gather_faults: &[NativeGatherFault],
+        linear_solve_faults: &[NativeLinearSolveFault],
+    ) -> WasmCompileError {
+        if let Some(fault) = self.faults().iter().find(|fault| fault.status == status) {
+            return WasmCompileError::TypedSource(fault.clone());
+        }
+        if let Some(fault) = gather_faults.iter().find(|fault| fault.status == status) {
+            return WasmCompileError::GatherSource(fault.clone());
+        }
+        if let Some(fault) = linear_solve_faults
+            .iter()
+            .find(|fault| fault.status == status)
+        {
+            return WasmCompileError::LinearSolveSource(fault.clone());
+        }
+        WasmCompileError::Backend(format!("native entry failure status {status}"))
+    }
+
+    pub fn math_imports(&self) -> &[&'static str] {
+        &self.math_imports
+    }
+}
+
+/// Execute the construction-issued schedule, linking the model's exact call table.
+/// ABI: eval_assignments(yPtr,pPtr,time,scratchPtr,reservedZero)->status.
+/// Aligned Y/P/scratch spans must be disjoint and fully in unshared env.memory.
+/// The complete Y tuple is published only on status zero; P is never changed.
+pub fn compile_native_assignment_schedule_with_calls_wasm(
+    schedule: &NativeRefreshAssignmentSchedule,
+    layout: &VarLayout,
+    calls: &SolvePureCallTable,
+) -> Result<CompiledNativeCallProgramWasm, WasmCompileError> {
+    crate::emit::emit_native_call_assignment_module(schedule, layout, calls)
+        .map_err(WasmCompileError::Backend)
+}
+
+/// Compile the same checked schedule with explicit deployment bounds.
+pub fn compile_native_assignment_schedule_with_calls_wasm_and_policy(
+    schedule: &NativeRefreshAssignmentSchedule,
+    layout: &VarLayout,
+    calls: &SolvePureCallTable,
+    policy: crate::CheckedNativeWasmCapacityPolicy,
+) -> Result<CompiledNativeCallProgramWasm, WasmCompileError> {
+    crate::emit::emit_native_call_assignment_module_with_policy(schedule, layout, calls, policy)
+        .map_err(WasmCompileError::Backend)
+}

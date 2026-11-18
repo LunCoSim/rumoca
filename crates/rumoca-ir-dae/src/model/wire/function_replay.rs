@@ -1,4 +1,6 @@
 use super::*;
+mod scoped_branches;
+use scoped_branches::{BranchReplayFrame, ConditionalReplayFrame};
 use serde::Serialize;
 use serde::ser::SerializeSeq;
 
@@ -57,6 +59,8 @@ fn function_output<'storage>(
         ),
     };
     FunctionEntryWire {
+        construction_start: function.construction_start,
+        construction_end: function.construction_end,
         name: &function.name,
         parameters: function
             .parameter_values
@@ -191,6 +195,15 @@ fn project_statements(
     statements
         .iter()
         .map(|statement| match statement {
+            FunctionStatementWire::RequireAssigned {
+                target, definition, ..
+            } => FunctionStatementInput::RequireAssigned {
+                target: *target,
+                provenance: function.definitions[*definition as usize].provenance,
+            },
+            FunctionStatementWire::ScopedConditional { owner } => {
+                project_scoped_conditional(function, folds, *owner)
+            }
             FunctionStatementWire::Assignment { definition } => {
                 let definition = &function.definitions[*definition as usize];
                 FunctionStatementInput::Assignment {
@@ -199,29 +212,21 @@ fn project_statements(
                     provenance: definition.provenance,
                 }
             }
-            FunctionStatementWire::AssignmentGroup {
-                definitions,
-                conditional,
-            } => FunctionStatementInput::AssignmentGroup {
-                assignments: definitions
-                    .iter()
-                    .map(|definition| {
-                        let definition = &function.definitions[*definition as usize];
-                        FunctionAssignmentInput {
-                            target: definition.target,
-                            rhs: definition.rhs,
-                            provenance: definition.provenance,
-                        }
-                    })
-                    .collect(),
-                conditional: conditional
-                    .as_ref()
-                    .map(|conditional| FunctionConditionalInput {
-                        conditions: conditional.conditions.clone(),
-                        branches: conditional.branches.clone(),
-                        fallback: conditional.fallback.clone(),
-                    }),
-            },
+            FunctionStatementWire::AssignmentGroup { definitions } => {
+                FunctionStatementInput::AssignmentGroup {
+                    assignments: definitions
+                        .iter()
+                        .map(|definition| {
+                            let definition = &function.definitions[*definition as usize];
+                            FunctionAssignmentInput {
+                                target: definition.target,
+                                rhs: definition.rhs,
+                                provenance: definition.provenance,
+                            }
+                        })
+                        .collect(),
+                }
+            }
             FunctionStatementWire::Assertion {
                 condition,
                 message,
@@ -243,6 +248,7 @@ fn project_statements(
                     domain: fold.domain,
                     targets: fold.targets.clone(),
                     iteration_locals: fold.iteration_locals.clone(),
+                    continuation: fold.continuation,
                     statements: project_statements(function, folds, statements),
                     begin_provenance: fold.provenance,
                     finish_provenance: *provenance,
@@ -252,6 +258,27 @@ fn project_statements(
         .collect()
 }
 
+fn project_scoped_conditional(
+    function: &FunctionEntry,
+    folds: &[FunctionFoldEntry],
+    owner: u32,
+) -> FunctionStatementInput {
+    let conditional = &function.conditionals[owner as usize];
+    let project = |ordinal: u32| {
+        let branch = &function.branches[ordinal as usize];
+        FunctionBranchInput {
+            statements: project_statements(function, folds, &branch.statements),
+            provenance: branch.declaration,
+        }
+    };
+    FunctionStatementInput::Conditional {
+        conditions: conditional.conditions.clone(),
+        branches: conditional.branches.iter().copied().map(project).collect(),
+        fallback: project(conditional.fallback),
+        provenance: conditional.declaration,
+    }
+}
+
 pub(super) fn reconstruct<'dae>(
     wire: &StorageWire,
     dae: &mut DaeConstruction<'dae>,
@@ -259,6 +286,14 @@ pub(super) fn reconstruct<'dae>(
 ) -> Result<(), DaeConstructionError> {
     let mut links = vec![Vec::new(); wire.functions.len()];
     for component in function_graph::function_components(wire)? {
+        while ids.expressions.len() < component.construction_start {
+            if !super::reconstruct_next_expression(wire, dae, ids)? {
+                return Err(malformed("function construction prefix"));
+            }
+        }
+        if ids.expressions.len() != component.construction_start {
+            return Err(malformed("function construction boundary"));
+        }
         if component.recursive {
             reconstruct_recursive_component(
                 wire,
@@ -290,7 +325,8 @@ pub(super) fn reconstruct<'dae>(
         match expression.node {
             ExprNodeWire::FunctionValue { .. }
             | ExprNodeWire::FunctionFoldParameter { .. }
-            | ExprNodeWire::FunctionFoldOutput { .. } => {
+            | ExprNodeWire::FunctionFoldOutput { .. }
+            | ExprNodeWire::FunctionConditionalOutput { .. } => {
                 return Err(malformed("expressions.nodes.function_scope"));
             }
             _ => {
@@ -392,6 +428,17 @@ fn replay_component<'group, 'dae>(
 ) -> Result<(), DaeConstructionError> {
     let mut functions = begin_functions(wire, dae, reservations)?;
     while ids.expressions.len() < expression_end {
+        if wire
+            .expressions
+            .model_contexts
+            .get(ids.next_wire_expression)
+            != Some(&None)
+            || ids
+                .model_conditional_closes
+                .contains_key(&(ids.expressions.len() as u32))
+        {
+            return Err(malformed("function global construction scope"));
+        }
         let expression = wire_expression(wire, ids.next_wire_expression)?;
         match expression.node {
             ExprNodeWire::FunctionValue {
@@ -410,6 +457,16 @@ fn replay_component<'group, 'dae>(
             }
             ExprNodeWire::FunctionFoldOutput { function } => {
                 replay_loop_exit(wire, dae, ids, &mut functions, *function)?;
+            }
+            ExprNodeWire::FunctionConditionalOutput { function } => {
+                replay_conditional_output(
+                    wire,
+                    dae,
+                    ids,
+                    &mut functions,
+                    *function,
+                    expression.provenance,
+                )?;
             }
             ExprNodeWire::RuntimeQuotientOwner {
                 kind: QuotientOwnerKindWire::Function { function },
@@ -440,6 +497,8 @@ struct FunctionReplay<'wire, 'group, 'dae> {
     operations: Vec<ReplayOp<'wire>>,
     next_operation: usize,
     capability: Option<ReplayCapability<'group, 'dae>>,
+    branches: Vec<BranchReplayFrame<'dae>>,
+    conditionals: Vec<ConditionalReplayFrame<'wire, 'dae>>,
 }
 
 enum ReplayCapability<'group, 'dae> {
@@ -452,17 +511,29 @@ enum ReplayCapability<'group, 'dae> {
 
 #[derive(Clone, Copy)]
 enum ReplayOp<'wire> {
+    RequireAssigned {
+        target: u32,
+        provenance: DaeProvenance,
+    },
+    BeginConditional {
+        conditions: &'wire [u32],
+        branch_count: usize,
+        provenance: DaeProvenance,
+    },
+    BeginBranch(DaeProvenance),
+    EndBranch,
+    EndConditional,
     Assign(AssignmentInput),
     AssignGroup(AssignmentGroupInput<'wire>),
     Assert(AssertionInput),
     BeginFold(FoldInput<'wire>),
+    Continue(ContinuationInput),
     EndFold(FoldEnd),
 }
 
 #[derive(Clone, Copy)]
 struct AssignmentGroupInput<'wire> {
     assignments: &'wire [FunctionAssignmentInput],
-    conditional: Option<&'wire FunctionConditionalInput>,
 }
 
 #[derive(Clone, Copy)]
@@ -485,6 +556,13 @@ struct FoldInput<'wire> {
     domain: u32,
     targets: &'wire [u32],
     iteration_locals: &'wire [u32],
+    continuation: Option<u32>,
+    provenance: DaeProvenance,
+}
+
+#[derive(Clone, Copy)]
+struct ContinuationInput {
+    condition: u32,
     provenance: DaeProvenance,
 }
 
@@ -517,6 +595,8 @@ fn begin_functions<'wire, 'group, 'dae>(
                     operations: Vec::new(),
                     next_operation: 0,
                     capability: Some(ReplayCapability::External(reservation)),
+                    branches: Vec::new(),
+                    conditionals: Vec::new(),
                 });
             }
             let body =
@@ -526,6 +606,8 @@ fn begin_functions<'wire, 'group, 'dae>(
                 operations: flatten_operations(&function.statements)?,
                 next_operation: 0,
                 capability: Some(ReplayCapability::Body(body)),
+                branches: Vec::new(),
+                conditionals: Vec::new(),
             })
         })
         .collect()
@@ -534,45 +616,86 @@ fn begin_functions<'wire, 'group, 'dae>(
 fn flatten_operations(
     statements: &[FunctionStatementInput],
 ) -> Result<Vec<ReplayOp<'_>>, DaeConstructionError> {
-    let mut operations = Vec::with_capacity(statements.len());
+    let mut operations = Vec::new();
+    push_statement_operations(&mut operations, statements)?;
+    Ok(operations)
+}
+
+fn push_statement_operations<'wire>(
+    operations: &mut Vec<ReplayOp<'wire>>,
+    statements: &'wire [FunctionStatementInput],
+) -> Result<(), DaeConstructionError> {
     for statement in statements {
-        match statement {
-            FunctionStatementInput::Assignment { .. } => {
-                operations.push(ReplayOp::Assign(assignment(statement)?));
-            }
-            FunctionStatementInput::AssignmentGroup {
-                assignments,
-                conditional,
-            } => {
-                operations.push(ReplayOp::AssignGroup(AssignmentGroupInput {
-                    assignments,
-                    conditional: conditional.as_ref(),
-                }));
-            }
-            FunctionStatementInput::Assertion { .. } => {
-                operations.push(ReplayOp::Assert(assertion(statement)?));
-            }
-            FunctionStatementInput::For {
-                domain,
-                targets,
-                iteration_locals,
-                statements,
-                begin_provenance,
-                finish_provenance,
-            } => push_fold_operations(
-                &mut operations,
+        push_statement_operation(operations, statement)?;
+    }
+    Ok(())
+}
+
+fn push_statement_operation<'wire>(
+    operations: &mut Vec<ReplayOp<'wire>>,
+    statement: &'wire FunctionStatementInput,
+) -> Result<(), DaeConstructionError> {
+    match statement {
+        FunctionStatementInput::RequireAssigned { target, provenance } => {
+            operations.push(ReplayOp::RequireAssigned {
+                target: *target,
+                provenance: *provenance,
+            })
+        }
+        FunctionStatementInput::Assignment { .. } => {
+            operations.push(ReplayOp::Assign(assignment(statement)?))
+        }
+        FunctionStatementInput::AssignmentGroup { assignments } => {
+            operations.push(ReplayOp::AssignGroup(AssignmentGroupInput { assignments }))
+        }
+        FunctionStatementInput::Assertion { .. } => {
+            operations.push(ReplayOp::Assert(assertion(statement)?))
+        }
+        FunctionStatementInput::For {
+            domain,
+            targets,
+            iteration_locals,
+            continuation,
+            statements,
+            begin_provenance,
+            finish_provenance,
+        } => {
+            push_fold_operations(
+                operations,
                 FoldInput {
                     domain: *domain,
                     targets,
                     iteration_locals,
+                    continuation: *continuation,
                     provenance: *begin_provenance,
                 },
                 statements,
                 *finish_provenance,
-            )?,
+            )?;
+        }
+        FunctionStatementInput::Conditional {
+            conditions,
+            branches,
+            fallback,
+            provenance,
+        } => {
+            if conditions.len() != branches.len() {
+                return Err(malformed("functions.statements.conditional"));
+            }
+            operations.push(ReplayOp::BeginConditional {
+                conditions,
+                branch_count: branches.len() + 1,
+                provenance: *provenance,
+            });
+            for branch in branches.iter().chain(std::iter::once(fallback)) {
+                operations.push(ReplayOp::BeginBranch(branch.provenance));
+                push_statement_operations(operations, &branch.statements)?;
+                operations.push(ReplayOp::EndBranch);
+            }
+            operations.push(ReplayOp::EndConditional);
         }
     }
-    Ok(operations)
+    Ok(())
 }
 
 fn push_fold_operations<'wire>(
@@ -582,43 +705,13 @@ fn push_fold_operations<'wire>(
     finish: DaeProvenance,
 ) -> Result<(), DaeConstructionError> {
     operations.push(ReplayOp::BeginFold(begin));
-    for statement in statements {
-        match statement {
-            FunctionStatementInput::Assignment { .. } => {
-                operations.push(ReplayOp::Assign(assignment(statement)?));
-            }
-            FunctionStatementInput::AssignmentGroup {
-                assignments,
-                conditional,
-            } => {
-                operations.push(ReplayOp::AssignGroup(AssignmentGroupInput {
-                    assignments,
-                    conditional: conditional.as_ref(),
-                }));
-            }
-            FunctionStatementInput::Assertion { .. } => {
-                operations.push(ReplayOp::Assert(assertion(statement)?));
-            }
-            FunctionStatementInput::For {
-                domain,
-                targets,
-                iteration_locals,
-                statements,
-                begin_provenance,
-                finish_provenance,
-            } => push_fold_operations(
-                operations,
-                FoldInput {
-                    domain: *domain,
-                    targets,
-                    iteration_locals,
-                    provenance: *begin_provenance,
-                },
-                statements,
-                *finish_provenance,
-            )?,
-        }
+    if let Some(condition) = begin.continuation {
+        operations.push(ReplayOp::Continue(ContinuationInput {
+            condition,
+            provenance: begin.provenance,
+        }));
     }
+    push_statement_operations(operations, statements)?;
     operations.push(ReplayOp::EndFold(FoldEnd {
         target_count: begin.targets.len(),
         provenance: finish,
@@ -638,10 +731,13 @@ fn assignment(statement: &FunctionStatementInput) -> Result<AssignmentInput, Dae
             provenance: *provenance,
         }),
         FunctionStatementInput::AssignmentGroup { .. }
+        | FunctionStatementInput::RequireAssigned { .. }
         | FunctionStatementInput::Assertion { .. } => {
             Err(malformed("functions.statements.assignment"))
         }
-        FunctionStatementInput::For { .. } => Err(malformed("functions.statements.nesting")),
+        FunctionStatementInput::For { .. } | FunctionStatementInput::Conditional { .. } => {
+            Err(malformed("functions.statements.nesting"))
+        }
     }
 }
 
@@ -660,7 +756,11 @@ fn assertion(statement: &FunctionStatementInput) -> Result<AssertionInput, DaeCo
         }),
         FunctionStatementInput::Assignment { .. }
         | FunctionStatementInput::AssignmentGroup { .. }
-        | FunctionStatementInput::For { .. } => Err(malformed("functions.statements.assertion")),
+        | FunctionStatementInput::RequireAssigned { .. }
+        | FunctionStatementInput::For { .. }
+        | FunctionStatementInput::Conditional { .. } => {
+            Err(malformed("functions.statements.assertion"))
+        }
     }
 }
 
@@ -681,8 +781,12 @@ fn replay_function_quotient<'dae>(
     let lhs = mapped(&ids.expressions, lhs, "expression", provenance)?;
     let rhs = mapped(&ids.expressions, rhs, "expression", provenance)?;
     let state = function_state_mut(functions, function_raw, provenance)?;
-    let Some(ReplayCapability::Body(body)) = state.capability.as_ref() else {
-        return Err(malformed("expressions.nodes.function_quotient_owner"));
+    let body = match state.capability.as_ref() {
+        Some(ReplayCapability::Body(body)) => body,
+        Some(ReplayCapability::Fold(loop_body)) => loop_body.body(),
+        Some(ReplayCapability::External(_)) | None => {
+            return Err(malformed("expressions.nodes.function_quotient_owner"));
+        }
     };
     let quotient = dae.function_runtime_quotient(body, builtin, [lhs, rhs], provenance)?;
     if quotient.index() as usize != ids.expressions.len() {
@@ -694,6 +798,30 @@ fn replay_function_quotient<'dae>(
     // The function owner occupies its global owner ordinal so later model
     // markers keep naming the construction-issued sequence.
     ids.quotient_replays.push(PendingOwnerSlot::Function);
+    Ok(())
+}
+
+fn replay_conditional_output<'dae>(
+    wire: &StorageWire,
+    dae: &mut DaeConstruction<'dae>,
+    ids: &mut WireIds<'dae>,
+    functions: &mut [FunctionReplay<'_, '_, 'dae>],
+    function: u32,
+    provenance: DaeProvenance,
+) -> Result<(), DaeConstructionError> {
+    let state = function_state_mut(functions, function, provenance)?;
+    apply_ready_operations(wire, dae, ids, state)?;
+    match state.operations.get(state.next_operation).copied() {
+        Some(ReplayOp::EndConditional) => scoped_branches::end_conditional(wire, dae, ids, state)?,
+        Some(ReplayOp::RequireAssigned {
+            target,
+            provenance: action_at,
+        }) if action_at == provenance => {
+            scoped_branches::require_assigned(wire, dae, ids, state, target, action_at)?;
+        }
+        _ => return Err(malformed("expressions.nodes.function_conditional_output")),
+    }
+    state.next_operation += 1;
     Ok(())
 }
 
@@ -792,6 +920,28 @@ fn apply_next_ready_operation<'dae>(
         return Ok(false);
     };
     match operation {
+        ReplayOp::RequireAssigned { .. } => return Ok(false),
+        ReplayOp::BeginConditional {
+            conditions,
+            branch_count,
+            provenance,
+        } => {
+            if conditions
+                .iter()
+                .any(|condition| *condition as usize >= ids.expressions.len())
+            {
+                return Ok(false);
+            }
+            scoped_branches::begin_conditional(state, conditions, branch_count, provenance);
+        }
+        ReplayOp::BeginBranch(provenance) => scoped_branches::begin_branch(dae, state, provenance)?,
+        ReplayOp::EndBranch => scoped_branches::end_branch(dae, state)?,
+        ReplayOp::EndConditional => {
+            if scoped_branches::projection_count(dae, state)? != 0 {
+                return Ok(false);
+            }
+            scoped_branches::end_conditional(wire, dae, ids, state)?;
+        }
         ReplayOp::Assign(assignment) => {
             if assignment.rhs as usize >= ids.expressions.len() {
                 return Ok(false);
@@ -803,14 +953,6 @@ fn apply_next_ready_operation<'dae>(
                 .assignments
                 .iter()
                 .any(|assignment| assignment.rhs as usize >= ids.expressions.len())
-                || group.conditional.is_some_and(|conditional| {
-                    conditional
-                        .conditions
-                        .iter()
-                        .chain(conditional.branches.iter().flatten())
-                        .chain(&conditional.fallback)
-                        .any(|expression| *expression as usize >= ids.expressions.len())
-                })
             {
                 return Ok(false);
             }
@@ -832,6 +974,12 @@ fn apply_next_ready_operation<'dae>(
             let function = checked_u32(state.function_index, "function", input.provenance)?;
             enter_loop(wire, dae, ids, state, function, input)?;
         }
+        ReplayOp::Continue(input) => {
+            if input.condition as usize >= ids.expressions.len() {
+                return Ok(false);
+            }
+            apply_continuation(dae, ids, state, input)?;
+        }
         ReplayOp::EndFold(input) => {
             if input.target_count != 0 {
                 return Ok(false);
@@ -852,6 +1000,21 @@ fn apply_ready_operations<'dae>(
 ) -> Result<(), DaeConstructionError> {
     while apply_next_ready_operation(wire, dae, ids, state)? {}
     Ok(())
+}
+
+fn apply_continuation<'dae>(
+    dae: &mut DaeConstruction<'dae>,
+    ids: &WireIds<'dae>,
+    state: &mut FunctionReplay<'_, '_, 'dae>,
+    input: ContinuationInput,
+) -> Result<(), DaeConstructionError> {
+    let condition = mapped_expression(ids, input.condition, input.provenance)?;
+    match state.capability.as_mut() {
+        Some(ReplayCapability::Fold(loop_body)) => dae.functions(|functions| {
+            functions.continue_loop_while(loop_body, condition, input.provenance)
+        }),
+        _ => Err(malformed("functions.statements.continuation")),
+    }
 }
 
 fn apply_assertion<'dae>(
@@ -945,64 +1108,10 @@ fn apply_assignment_group<'dae>(
         .capability
         .as_mut()
         .ok_or_else(|| incomplete("function capability", state.function_index, provenance))?;
-    dae.functions(|functions| match (capability, group.conditional) {
-        (ReplayCapability::Body(body), Some(conditional)) => functions.replay_conditional_all(
-            body,
-            &assignments,
-            &conditional
-                .conditions
-                .iter()
-                .map(|value| mapped_expression(ids, *value, provenance))
-                .collect::<Result<Vec<_>, _>>()?,
-            &conditional
-                .branches
-                .iter()
-                .map(|branch| {
-                    branch
-                        .iter()
-                        .map(|value| mapped_expression(ids, *value, provenance))
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            &conditional
-                .fallback
-                .iter()
-                .map(|value| mapped_expression(ids, *value, provenance))
-                .collect::<Result<Vec<_>, _>>()?,
-            provenance,
-        ),
-        (ReplayCapability::Fold(body), Some(conditional)) => functions.replay_conditional_all_loop(
-            body,
-            &assignments,
-            &conditional
-                .conditions
-                .iter()
-                .map(|value| mapped_expression(ids, *value, provenance))
-                .collect::<Result<Vec<_>, _>>()?,
-            &conditional
-                .branches
-                .iter()
-                .map(|branch| {
-                    branch
-                        .iter()
-                        .map(|value| mapped_expression(ids, *value, provenance))
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            &conditional
-                .fallback
-                .iter()
-                .map(|value| mapped_expression(ids, *value, provenance))
-                .collect::<Result<Vec<_>, _>>()?,
-            provenance,
-        ),
-        (ReplayCapability::Body(body), None) => {
-            functions.assign_all(body, &assignments, provenance)
-        }
-        (ReplayCapability::Fold(body), None) => {
-            functions.assign_all_loop(body, &assignments, provenance)
-        }
-        (ReplayCapability::External(_), _) => Err(malformed("functions.external")),
+    dae.functions(|functions| match capability {
+        ReplayCapability::Body(body) => functions.assign_all(body, &assignments, provenance),
+        ReplayCapability::Fold(body) => functions.assign_all_loop(body, &assignments, provenance),
+        ReplayCapability::External(_) => Err(malformed("functions.external")),
     })
 }
 
@@ -1286,6 +1395,7 @@ fn replay_external_body<'group, 'dae>(
 enum GeneratedGroup {
     Parameter,
     Output,
+    Conditional,
 }
 
 struct GeneratedGroupReplay {
@@ -1351,6 +1461,12 @@ fn expect_generated_node(
                 function: found_function,
             },
             GeneratedGroup::Output,
+        )
+        | (
+            ExprNodeWire::FunctionConditionalOutput {
+                function: found_function,
+            },
+            GeneratedGroup::Conditional,
         ) => *found_function == function,
         _ => false,
     };

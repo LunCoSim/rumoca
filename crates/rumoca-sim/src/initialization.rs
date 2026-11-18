@@ -18,7 +18,7 @@ pub fn initialize_fmi_component(
     options: &SimOptions,
     requested_outputs: &[String],
 ) -> Result<Vec<f64>, SimulationDiagnosticError> {
-    let backend = crate::fmi_execution_backend(component, options);
+    let backend = crate::fmi_execution_backend(component, options)?;
     let host =
         crate::me_backend::initialized_host(component.into(), options, backend, "initialization")
             .map_err(|error| SimulationDiagnosticError::Solver(error.to_string()))?;

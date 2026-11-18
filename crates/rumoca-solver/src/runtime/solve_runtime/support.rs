@@ -5,9 +5,39 @@ use rustc_hash::FxHashMap;
 use std::hash::Hash;
 use std::rc::Rc;
 
-use super::{CompiledSolveExpression, CompiledSolveJacobianExpression, SolveExecutionBackend};
+#[cfg(test)]
+use super::selected_programs::CompleteExpression;
+use super::selected_programs::CompleteJacobian;
 
-pub(super) fn optional_compiled<T>(label: &str, result: Result<T, String>) -> Option<T> {
+use super::{EvalSolveError, SolveExecutionBackend};
+
+/// A refusal names the refused program's span only when that span belongs to
+/// this block; otherwise the block's span is used when all programs share one.
+pub(super) fn required_compiled<T, E: Into<super::CompileRefusal>>(
+    label: &str,
+    source_spans: &[rumoca_core::Span],
+    result: Result<T, E>,
+) -> Result<T, EvalSolveError> {
+    result.map_err(|refusal| {
+        let refusal = refusal.into();
+        let span = refusal
+            .span()
+            .filter(|span| source_spans.contains(span))
+            .or_else(|| unique_span(source_spans));
+        EvalSolveError::CompiledExecution {
+            message: format!(
+                "required compiled program `{label}` could not be lowered: {}",
+                refusal.message()
+            ),
+            span,
+        }
+    })
+}
+
+pub(super) fn optional_compiled<T, E: std::fmt::Display>(
+    label: &str,
+    result: Result<T, E>,
+) -> Option<T> {
     match result {
         Ok(compiled) => Some(compiled),
         Err(error) => {
@@ -23,12 +53,22 @@ pub(super) fn optional_compiled<T>(label: &str, result: Result<T, String>) -> Op
 }
 
 /// `block` compiled by `backend` as a whole-block expression, if it compiles.
+#[cfg(test)]
 pub(super) fn compiled_expression(
     backend: Option<&Rc<dyn SolveExecutionBackend>>,
     label: &str,
     block: &solve::ScalarProgramBlock,
-) -> Option<Rc<dyn CompiledSolveExpression>> {
-    backend.and_then(|backend| optional_compiled(label, backend.compile_expression(block)))
+) -> Result<Option<Rc<CompleteExpression>>, EvalSolveError> {
+    backend
+        .map(|backend| {
+            let whole = required_compiled(
+                label,
+                block.program_spans(),
+                backend.compile_expression(block),
+            )?;
+            super::selected_programs::expression_from_whole(backend.as_ref(), label, block, whole)
+        })
+        .transpose()
 }
 
 /// `block` compiled by `backend` as a forward-mode Jacobian, if it compiles.
@@ -36,8 +76,10 @@ pub(super) fn compiled_jacobian(
     backend: Option<&Rc<dyn SolveExecutionBackend>>,
     label: &str,
     block: &solve::ScalarProgramBlock,
-) -> Option<Rc<dyn CompiledSolveJacobianExpression>> {
-    backend.and_then(|backend| optional_compiled(label, backend.compile_jacobian_expression(block)))
+) -> Result<Option<Rc<CompleteJacobian>>, EvalSolveError> {
+    backend
+        .map(|backend| super::selected_programs::jacobian(backend.as_ref(), label, block))
+        .transpose()
 }
 
 pub(super) fn zero_runtime_values(
@@ -111,10 +153,10 @@ where
 
 pub(super) fn build_visible_name_index(model: &solve::SolveModel) -> FxHashMap<String, usize> {
     model
-        .visible_names
-        .iter()
+        .visible_names()
+        .into_iter()
         .enumerate()
-        .map(|(idx, name)| (name.clone(), idx))
+        .map(|(idx, name)| (name, idx))
         .collect()
 }
 
@@ -164,4 +206,75 @@ pub(super) fn visible_value_index_error(
     RuntimeSolveError::solve_ir(format!(
         "{context} for visible name `{name}` reference index {index}, but only {len} values are available"
     ))
+}
+
+pub(super) fn admitted_compiled_error(
+    context: &'static str,
+    source_spans: &[rumoca_core::Span],
+    error: RuntimeSolveError,
+) -> RuntimeSolveError {
+    match error {
+        RuntimeSolveError::CompiledExecution {
+            message,
+            source_spans: issued,
+            ..
+        } => RuntimeSolveError::CompiledExecution {
+            context,
+            message,
+            source_spans: if issued.is_empty() {
+                source_spans.into()
+            } else {
+                issued
+            },
+        },
+        RuntimeSolveError::SolveIr { message, span } => RuntimeSolveError::SolveIr {
+            message,
+            span: span.or_else(|| unique_span(source_spans)),
+        },
+        RuntimeSolveError::SourceFault { message, span } => RuntimeSolveError::SourceFault {
+            message,
+            span: span.or_else(|| unique_span(source_spans)),
+        },
+        error => error,
+    }
+}
+
+fn unique_span(spans: &[rumoca_core::Span]) -> Option<rumoca_core::Span> {
+    let first = spans.first().copied()?;
+    spans.iter().all(|span| *span == first).then_some(first)
+}
+
+#[cfg(test)]
+#[test]
+fn required_spans_keep_members_reject_foreign_and_fall_back_to_a_unique_span() {
+    use rumoca_core::{SourceId, Span};
+    let a = Span::from_offsets(SourceId::from_source_name("block.mo"), 10, 20);
+    let b = Span::from_offsets(SourceId::from_source_name("block.mo"), 30, 40);
+    let foreign = Span::from_offsets(SourceId::from_source_name("foreign.mo"), 30, 40);
+    for (spans, offered, expected) in [
+        (vec![a, b], Some(b), Some(b)),
+        (vec![a, b], Some(foreign), None),
+        (vec![a, b], None, None),
+        (vec![a, a], None, Some(a)),
+        (vec![a, a], Some(foreign), Some(a)),
+        (vec![], Some(a), None),
+    ] {
+        let refusal = super::CompileRefusal::new("refusal", offered);
+        let error = required_compiled("block", &spans, Result::<(), _>::Err(refusal)).unwrap_err();
+        assert!(
+            matches!(error, EvalSolveError::CompiledExecution { span, .. } if span == expected)
+        );
+    }
+}
+
+pub(super) fn admitted_output_call(
+    scratch: &std::cell::RefCell<Vec<f64>>,
+    out: &mut [f64],
+    call: impl FnOnce(&mut [f64]) -> Result<(), RuntimeSolveError>,
+) -> Result<(), RuntimeSolveError> {
+    let mut scratch = scratch.borrow_mut();
+    resize_runtime_values(&mut scratch, out.len(), 0.0, "compiled output transaction")?;
+    call(&mut scratch)?;
+    out.copy_from_slice(&scratch);
+    Ok(())
 }

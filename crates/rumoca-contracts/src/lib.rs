@@ -5,7 +5,7 @@
 //!
 //! # Overview
 //!
-//! The MLS defines 438 contracts across 18 categories. This framework:
+//! SPEC_0022 defines 471 contracts across 18 categories. This framework:
 //! - Registers all contracts with metadata
 //! - Provides test infrastructure and macros
 //! - Tracks compliance status
@@ -38,7 +38,7 @@ pub use registry::{Contract, ContractCategory, ContractId, ContractRegistry, Con
 pub use report::ComplianceReport;
 pub use runner::{ContractResult, TestRunner};
 
-/// Contract IDs currently backed by explicit tests in `crates/rumoca-contracts/tests`.
+/// Contract IDs currently backed by explicit workspace tests.
 ///
 /// This list is intentionally strict and is validated by
 /// `tests/contract_coverage.rs` so registry status and test coverage stay aligned.
@@ -60,6 +60,8 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "ALG-016",
     "ALG-017",
     "ALG-018",
+    "ALG-019",
+    "ALG-020",
     "ANN-001",
     "ANN-003",
     "ANN-008",
@@ -109,6 +111,8 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "ARR-042",
     "ARR-043",
     "ARR-044",
+    "ARR-045",
+    "ARR-046",
     "CLK-001",
     "CLK-002",
     "CLK-003",
@@ -232,6 +236,7 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "EQN-038",
     "EQN-039",
     "EQN-040",
+    "EQN-041",
     "EXPR-001",
     "EXPR-002",
     "EXPR-003",
@@ -271,6 +276,7 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "EXPR-038",
     "EXPR-039",
     "EXPR-041",
+    "EXPR-042",
     "FUNC-001",
     "FUNC-002",
     "FUNC-003",
@@ -303,6 +309,10 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "FUNC-037",
     "FUNC-039",
     "FUNC-040",
+    "FUNC-041",
+    "FUNC-042",
+    "FUNC-043",
+    "FUNC-045",
     "INST-001",
     "INST-002",
     "INST-003",
@@ -354,6 +364,7 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "INST-056",
     "INST-057",
     "INST-058",
+    "INST-059",
     "LEX-001",
     "LEX-002",
     "LEX-003",
@@ -379,6 +390,7 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "OPREC-009",
     "OPREC-010",
     "OPREC-011",
+    "OPREC-012",
     "PKG-001",
     "PKG-002",
     "PKG-003",
@@ -391,6 +403,7 @@ pub const IMPLEMENTED_CONTRACT_IDS: &[&str] = &[
     "PKG-010",
     "PKG-011",
     "PKG-012",
+    "PKG-013",
     "SIM-001",
     "SIM-002",
     "SIM-003",
@@ -492,11 +505,11 @@ mod tests {
     #[test]
     fn test_registry_has_all_contracts() {
         let registry = create_registry();
-        // SPEC_0022 defines 458 contracts
+        // SPEC_0022 defines 472 contracts
         assert_eq!(
             registry.len(),
-            458,
-            "Expected 458 contracts, got {}",
+            472,
+            "Expected 472 contracts, got {}",
             registry.len()
         );
     }
@@ -515,30 +528,30 @@ mod tests {
             registry
                 .by_category(ContractCategory::Instantiation)
                 .count(),
-            58
+            59
         );
         assert_eq!(
             registry.by_category(ContractCategory::Expression).count(),
-            41
+            42
         );
-        assert_eq!(registry.by_category(ContractCategory::Equation).count(), 40);
+        assert_eq!(registry.by_category(ContractCategory::Equation).count(), 41);
         assert_eq!(
             registry.by_category(ContractCategory::Algorithm).count(),
-            18
+            20
         );
         assert_eq!(
             registry.by_category(ContractCategory::Connection).count(),
             30
         );
-        assert_eq!(registry.by_category(ContractCategory::Function).count(), 40);
+        assert_eq!(registry.by_category(ContractCategory::Function).count(), 45);
         assert_eq!(registry.by_category(ContractCategory::Type).count(), 36);
-        assert_eq!(registry.by_category(ContractCategory::Array).count(), 44);
-        assert_eq!(registry.by_category(ContractCategory::Package).count(), 12);
+        assert_eq!(registry.by_category(ContractCategory::Array).count(), 46);
+        assert_eq!(registry.by_category(ContractCategory::Package).count(), 13);
         assert_eq!(
             registry
                 .by_category(ContractCategory::OperatorRecord)
                 .count(),
-            11
+            12
         );
         assert_eq!(
             registry.by_category(ContractCategory::Simulation).count(),

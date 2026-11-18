@@ -2,7 +2,7 @@ use rumoca_ir_solve as solve;
 
 use super::solve_ops::EventPreMode;
 use crate::timeline::{
-    ScheduledTimeEvents, next_periodic_event_after, periodic_schedule_matches_time,
+    ScheduledTimeEvents, next_periodic_event_time, periodic_schedule_matches_time,
     sample_time_match_with_tol, schedule_tick_time, scheduled_time_in_horizon,
 };
 
@@ -27,8 +27,7 @@ struct StopEvent {
 }
 
 impl SolveStopSchedule {
-    pub fn new(problem: &solve::SolveProblem, t_start: f64, t_end: impl Into<Option<f64>>) -> Self {
-        let t_end = t_end.into();
+    pub fn new(problem: &solve::SolveProblem, t_start: f64, t_end: f64) -> Self {
         let mut schedule = Self {
             events: collect_static_ode_events(problem, t_start, t_end),
             periodic_schedules: problem.clocks.periodic_event_schedules.clone(),
@@ -46,25 +45,14 @@ impl SolveStopSchedule {
     /// explicitly; keeping this query read-only prevents output-grid points
     /// near a future stop from silently consuming that stop.
     pub fn next_stop(&self, t_current: f64, t_target: f64) -> (f64, Option<RuntimeEventStop>) {
-        self.next_event(t_current, Some(t_target))
-            .map_or((t_target, None), |(time, event)| (time, Some(event)))
-    }
-
-    pub fn next_event(
-        &self,
-        t_current: f64,
-        t_target: Option<f64>,
-    ) -> Option<(f64, RuntimeEventStop)> {
         let mut next = None;
         if let Some(event) = self.events.get(self.next_idx)
             && !sample_time_match_with_tol(event.time, t_current)
-            && t_target.is_none_or(|target| {
-                event.time < target || sample_time_match_with_tol(event.time, target)
-            })
+            && (event.time < t_target || sample_time_match_with_tol(event.time, t_target))
         {
             merge_next_stop(&mut next, *event);
         }
-        if let Some(time) = next_periodic_event_after(&self.periodic_schedules, t_current, t_target)
+        if let Some(time) = next_periodic_event_time(&self.periodic_schedules, t_current, t_target)
         {
             merge_next_stop(
                 &mut next,
@@ -76,16 +64,16 @@ impl SolveStopSchedule {
             );
         }
         if let Some(event) = next {
-            return Some((
+            return (
                 event.time,
-                RuntimeEventStop {
+                Some(RuntimeEventStop {
                     pre_mode: event.pre_mode,
                     observe_right_limit: event.pre_mode == EventPreMode::FollowCurrent,
                     terminal: event.terminal,
-                },
-            ));
+                }),
+            );
         }
-        None
+        (t_target, None)
     }
 
     pub fn advance_past(&mut self, t_current: f64) {
@@ -268,10 +256,7 @@ pub fn initial_static_event_pre_mode(
     problem: &solve::SolveProblem,
     t_start: f64,
 ) -> Option<EventPreMode> {
-    let mut mode = problem
-        .solve_layout
-        .initial_event_parameter_index
-        .map(|_| EventPreMode::FollowCurrent);
+    let mut mode = None;
     for event_t in &problem.events.scheduled_time_events {
         if sample_time_match_with_tol(*event_t, t_start) {
             merge_initial_event_mode(&mut mode, EventPreMode::FollowCurrent);
@@ -376,32 +361,21 @@ fn periodic_tick_time_at(schedule: &solve::PeriodicEventSchedule, t: f64) -> Opt
 fn collect_static_ode_events(
     problem: &solve::SolveProblem,
     t_start: f64,
-    t_end: Option<f64>,
+    t_end: f64,
 ) -> Vec<StopEvent> {
     let mut events: Vec<StopEvent> = problem
         .events
         .scheduled_time_events
         .iter()
         .copied()
-        .filter(|event_t| {
-            t_end.map_or_else(
-                || {
-                    event_t.is_finite()
-                        && (*event_t > t_start || sample_time_match_with_tol(*event_t, t_start))
-                },
-                |end| scheduled_time_in_horizon(*event_t, t_start, end),
-            )
-        })
+        .filter(|event_t| scheduled_time_in_horizon(*event_t, t_start, t_end))
         .map(|time| StopEvent {
             time,
             pre_mode: EventPreMode::FollowCurrent,
             terminal: false,
         })
         .collect();
-    if let Some(t_end) = t_end
-        && problem.events.has_terminal_event
-        && scheduled_time_in_horizon(t_end, t_start, t_end)
-    {
+    if problem.events.has_terminal_event && scheduled_time_in_horizon(t_end, t_start, t_end) {
         events.push(StopEvent {
             time: t_end,
             pre_mode: EventPreMode::EventEntry,
@@ -476,14 +450,11 @@ mod tests {
     }
 
     #[test]
-    fn checked_initial_flag_schedules_the_initial_event() {
+    fn initialization_mode_does_not_issue_a_time_event() {
         let mut problem = solve::SolveProblem::default();
         problem.solve_layout.initial_event_parameter_index = Some(0);
 
-        assert_eq!(
-            initial_static_event_pre_mode(&problem, 0.0),
-            Some(EventPreMode::FollowCurrent)
-        );
+        assert_eq!(initial_static_event_pre_mode(&problem, 0.0), None);
     }
 
     #[test]

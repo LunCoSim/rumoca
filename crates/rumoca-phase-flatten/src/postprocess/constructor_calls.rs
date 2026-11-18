@@ -120,6 +120,7 @@ impl ConstructorMarker<'_> {
         for equation in equations {
             match equation {
                 flat::WhenEquation::Assign { value, .. }
+                | flat::WhenEquation::AssignElement { value, .. }
                 | flat::WhenEquation::Reinit { value, .. } => self.mark_expr(value),
                 flat::WhenEquation::Assert {
                     condition,
@@ -279,7 +280,7 @@ mod tests {
                 body: vec![constructor_field()],
                 scalar_view: rumoca_core::ComprehensionScalarView::BinderSubstitution,
             }),
-            interiors_materialized: false,
+            interiors: flat::FamilyInteriors::ContinuousAlgebraic,
         }
     }
 

@@ -9,16 +9,36 @@
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    sync::Mutex,
 };
 
-use cranelift_codegen::{CodegenError, Context, incremental_cache::CacheKvStore};
-use cranelift_jit::JITModule;
-use cranelift_module::{FuncId, Module, ModuleError, ModuleReloc};
+use cranelift_codegen::{Context, incremental_cache::CacheKvStore, isa::TargetIsa};
+#[cfg(test)]
+use cranelift_module::{Module, ModuleReloc};
 
 #[cfg(test)]
 pub(crate) mod tests;
 
 type Store = Rc<RefCell<dyn CacheKvStore>>;
+
+static JIT_PERF_MAP_REGISTRATION: Mutex<()> = Mutex::new(());
+
+// Cranelift appends each perf-map row through multiple writes. Serialize its
+// function registration only while that diagnostic map is enabled.
+pub(crate) fn with_perf_map_registration<T>(enabled: bool, register: impl FnOnce() -> T) -> T {
+    if enabled {
+        let _guard = JIT_PERF_MAP_REGISTRATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        register()
+    } else {
+        register()
+    }
+}
+
+pub(crate) fn perf_map_recording_enabled() -> bool {
+    cfg!(unix) && std::env::var_os("PERF_BUILDID_DIR").is_some()
+}
 
 /// Completed native compiler work in one explicit preparation scope.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -86,19 +106,27 @@ impl CacheKvStore for Lookup<'_> {
     }
 }
 
-pub(crate) fn define_function(
-    module: &mut JITModule,
-    id: FuncId,
+/// Whether preparation on this thread has admitted an artifact store.
+pub(crate) fn cache_active() -> bool {
+    ACTIVE.with(|active| active.borrow().is_some())
+}
+
+/// Compile with the same target as ordinary queued compilation.
+pub(crate) fn compile_function(
     context: &mut Context,
-) -> Result<(), Box<ModuleError>> {
-    let Some(scope) = ACTIVE.with(|active| active.borrow().clone()) else {
-        return module.define_function(id, context).map_err(Box::new);
+    target: &dyn TargetIsa,
+) -> Result<(), String> {
+    let scope = ACTIVE.with(|active| active.borrow().clone());
+    let Some(scope) = scope else {
+        return context
+            .compile(target, &mut Default::default())
+            .map(|_| ())
+            .map_err(|error| format!("{:?}", error.inner));
     };
-    let mut store = scope.store.try_borrow_mut().map_err(|_| {
-        ModuleError::Compilation(CodegenError::Unsupported(
-            "native compilation cache is already in use".into(),
-        ))
-    })?;
+    let mut store = scope
+        .store
+        .try_borrow_mut()
+        .map_err(|_| "native compilation cache is already in use".to_owned())?;
     let mut usage = scope.usage.get();
     usage.attempts += 1;
     scope.usage.set(usage);
@@ -106,19 +134,24 @@ pub(crate) fn define_function(
         store: &mut *store,
         matched: Cell::new(false),
     };
-    let hit = context
-        .compile_with_cache(module.isa(), &mut lookup, &mut Default::default())
-        .map_err(ModuleError::from)?
-        .1;
+    let (_, hit) = context
+        .compile_with_cache(target, &mut lookup, &mut Default::default())
+        .map_err(|error| format!("{error:?}"))?;
     usage.hits += u64::from(hit);
     usage.compilations += u64::from(!hit);
     usage.rejected_entries += u64::from(lookup.matched.get() && !hit);
     scope.usage.set(usage);
-    let code = context.compiled_code().ok_or_else(|| {
-        ModuleError::Compilation(CodegenError::Unsupported(
-            "native compilation produced no code".into(),
-        ))
-    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn define_function(
+    module: &mut cranelift_jit::JITModule,
+    id: cranelift_module::FuncId,
+    context: &mut Context,
+) -> Result<(), String> {
+    compile_function(context, module.isa())?;
+    let code = context.compiled_code().ok_or("compiled code is missing")?;
     let relocations: Vec<_> = code
         .buffer
         .relocs()
@@ -128,9 +161,9 @@ pub(crate) fn define_function(
     module
         .define_function_bytes(
             id,
-            code.buffer.alignment as u64,
+            code.buffer.alignment.into(),
             code.code_buffer(),
             &relocations,
         )
-        .map_err(Box::new)
+        .map_err(|error| error.to_string())
 }

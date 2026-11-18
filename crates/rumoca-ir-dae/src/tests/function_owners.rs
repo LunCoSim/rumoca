@@ -750,7 +750,8 @@ fn zeros_is_a_provenance_bearing_checked_array_operation() {
 
     let assert_zeros = |view: DaeView<'_>| {
         let expression = view.expression(view.expression_id(1).unwrap()).unwrap();
-        assert_eq!(expression.value_type().scalar_type(), ScalarType::Real);
+        // MLS 3.7 §10.3.3: `zeros` is an Integer array.
+        assert_eq!(expression.value_type().scalar_type(), ScalarType::Integer);
         assert_eq!(expression.value_type().dimensions(), &[2]);
         assert_eq!(view.source_text(expression.provenance()), Some("zeros(2)"));
         assert!(matches!(
@@ -949,6 +950,7 @@ fn function_for_loop_is_a_compact_checked_transition() {
                     domains.structured(
                         StructuredIndexDomain {
                             binders: vec![StructuredIndexBinder {
+                                provenance: rumoca_core::IndexBinderProvenance::Generated,
                                 id: 0,
                                 display_name: "k".to_string(),
                                 lower: 1,
@@ -1109,6 +1111,7 @@ fn nested_loop_domains<'dae>(
         domains.structured(
             StructuredIndexDomain {
                 binders: vec![StructuredIndexBinder {
+                    provenance: rumoca_core::IndexBinderProvenance::Generated,
                     id: 0,
                     display_name: "i".to_string(),
                     lower: 1,
@@ -1124,6 +1127,7 @@ fn nested_loop_domains<'dae>(
             outer_domain,
             StructuredIndexDomain {
                 binders: vec![StructuredIndexBinder {
+                    provenance: rumoca_core::IndexBinderProvenance::Generated,
                     id: 0,
                     display_name: "j".to_string(),
                     lower: 1,
@@ -1246,6 +1250,7 @@ fn function_loop_rejects_duplicate_carried_targets() {
                     domains.structured(
                         StructuredIndexDomain {
                             binders: vec![StructuredIndexBinder {
+                                provenance: rumoca_core::IndexBinderProvenance::Generated,
                                 id: 0,
                                 display_name: "k".to_string(),
                                 lower: 1,

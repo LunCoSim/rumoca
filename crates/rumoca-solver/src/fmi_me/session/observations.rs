@@ -9,7 +9,13 @@ impl MeSimulationSession<'_, '_> {
     /// Batched `fmi3GetFloat64` over every output at the current coordinate.
     pub fn output_values(&self) -> Result<Vec<f64>, MeSessionError> {
         self.require_live()?;
-        Ok(self.host.observe_current()?)
+        match (&self.deferred, self.snapped_yield) {
+            (Some(deferred), _) => self
+                .host
+                .observe_off_point(deferred.observed_time, &deferred.observed_states),
+            (None, Some(snapped)) => self.host.observe_off_point(snapped, &self.host.states),
+            (None, None) => Ok(self.host.observe_current()?),
+        }
     }
 
     /// Visit one complete checked observation in declared output order, then
@@ -22,7 +28,8 @@ impl MeSimulationSession<'_, '_> {
         mut visit: impl FnMut(&VarName, f64),
     ) -> Result<(), MeSessionError> {
         let mut values = self.output_values()?;
-        let names = &self.host.output_labels;
+        let kernel = self.host.kernel.borrow()?;
+        let names = kernel.visible_labels();
         if names.len() != values.len() {
             return Err(MeSessionError::Contract {
                 reason: format!(
@@ -57,8 +64,7 @@ impl MeSimulationSession<'_, '_> {
 
     /// Current visible values keyed by name, including host-applied inputs.
     pub fn visible_values(&self) -> Result<IndexMap<String, f64>, MeSessionError> {
-        let count = self.host.output_labels.len();
-        let mut visible = IndexMap::with_capacity(count);
+        let mut visible = IndexMap::new();
         self.visit_visible_values(|name, value| {
             visible.insert(name.to_string(), value);
         })?;

@@ -36,29 +36,17 @@ use std::path::PathBuf;
 
 // IR vocabulary and foundation primitives (DefId, Span, Expression, ...).
 // Previously lived in `rumoca-ir-core`; merged here per SPEC_0029 §3a.
+pub mod artifact_build;
 mod clock_lattice;
-include!(concat!(env!("OUT_DIR"), "/build_identity.rs"));
-
-/// The identity of the source state this crate was built from.
-///
-/// `None` when the build could not determine it. Callers comparing two
-/// artifacts MUST treat `None` as "cannot verify" and skip the comparison; two
-/// `None`s are not evidence that the builds agree.
-///
-/// Pairs with the package version: the version says which release, this says
-/// which build of it. Two artifacts reporting the same version and different
-/// identities were built from different source states.
-#[must_use]
-pub fn build_identity() -> Option<&'static str> {
-    BUILD_IDENTITY
-}
-
 pub mod dependency_graph;
 mod effective_type;
+mod enumeration_declaration;
 mod expression_rewriter;
 mod expression_visitor;
+mod generated_function_locals;
 mod ir_primitives;
 mod modelica_builtins;
+pub mod native_body;
 mod source_map;
 mod statement_rewriter;
 mod structured_domain;
@@ -71,16 +59,23 @@ pub use clock_lattice::{
 };
 pub use dependency_graph::{DependencyGraphError, DependencyScc, dependency_first_sccs};
 pub use effective_type::{EffectiveType, EffectiveTypeError};
+pub use enumeration_declaration::EnumerationDeclaration;
 pub use expression_rewriter::{ExpressionRewriter, FallibleExpressionRewriter};
 pub use expression_visitor::{ExpressionScope, ExpressionVisitor, FallibleExpressionVisitor};
+pub use generated_function_locals::{
+    GeneratedBooleanLocal, GeneratedFunctionLocalCatalog, GeneratedFunctionLocalKey,
+    GeneratedFunctionLocals, GeneratedLocalError,
+};
 pub use ir_primitives::*;
 pub use modelica_builtins::*;
 pub use source_map::{SourceMap, placeholder_source_name, source_id_for_name};
 pub use statement_rewriter::{FallibleStatementRewriter, StatementRewriter};
 pub use structured_domain::{
-    AffineForm, ArrayAccess, ComprehensionScalarView, ComprehensionTemplate, RegularForFamily,
+    AffineForm, ArrayAccess, ComprehensionScalarView, ComprehensionTemplate, IndexAxis, IndexBox,
+    IndexUnion, IntegerInterval, Progression, RealInterval, RegularForFamily, SetAnswer,
     StructuredIndexBinder, StructuredIndexDomain, StructuredIndexDomainError, checked_product,
-    flatten_coordinates, row_major_coordinates, row_major_strides,
+    flatten_coordinates, image, row_major_coordinates, row_major_strides,
+    scalar_component_display_name, scalar_component_name, solve_point,
 };
 pub use subscript::Subscript;
 
@@ -161,7 +156,10 @@ pub use eval_lookup::EvalLookup;
 pub mod enum_compare;
 pub use enum_compare::enum_values_equal;
 pub mod integer_binary;
-pub use integer_binary::{IntegerBinaryOperator, eval_ast_integer_binary, eval_integer_binary};
+pub use integer_binary::{
+    IntegerBinaryOperator, eval_ast_integer_binary, eval_integer_binary,
+    integer_within_binary64_exact_range,
+};
 pub mod integer_division;
 pub use integer_division::{
     eval_integer_div_builtin, eval_integer_mod_builtin, eval_integer_rem_builtin,
@@ -191,7 +189,7 @@ pub fn msl_cache_dir_from_manifest(manifest_dir: &str) -> PathBuf {
 /// a surface that still offered one would be advertising a method the tree
 /// cannot deliver, and the caller would have no way to tell the difference
 /// until the run silently used another one.
-pub const SOLVER_NAMES: [&str; 3] = ["auto", "bdf", "rk-like"];
+pub const SOLVER_NAMES: [&str; 4] = ["auto", "bdf", "rk-like", "velimplicit"];
 
 /// A solver name that is not one this tree can run.
 ///
@@ -252,6 +250,8 @@ mod solver_name_tests {
             ("rk-like", "rk-like"),
             ("RK_Like", "rk-like"),
             ("rk like", "rk-like"),
+            ("velimplicit", "velimplicit"),
+            ("Vel_Implicit", "velimplicit"),
         ] {
             assert_eq!(canonical_solver_name(raw), Ok(canonical));
         }

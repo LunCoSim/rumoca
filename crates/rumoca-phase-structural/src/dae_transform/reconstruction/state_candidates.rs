@@ -2,10 +2,11 @@
 
 use super::super::formal_derivatives::SelectedCoordinate;
 use super::super::variables::TargetVariable;
+use super::super::{PreparedStateCoordinate, PreparedStateCoordinates};
 use super::*;
 use rumoca_core::VarName;
 
-type RebuiltCandidate = (dae::Dae, Vec<u32>, Option<u32>);
+type RebuiltCandidate = (dae::Dae, Vec<u32>, Option<PreparedStateCoordinates>);
 
 pub(in crate::dae_transform) fn rebuild_state_candidate(
     model: &dae::Dae,
@@ -16,7 +17,7 @@ pub(in crate::dae_transform) fn rebuild_state_candidate(
     let rebuilt = model
         .inspect(|source| {
             let facts = DifferentiationFacts::collect(source);
-            dae::Dae::construct(model.source_map().clone(), |target| {
+            construct_replay(model, |target| {
                 prepare_rebuild(
                     source,
                     target,
@@ -60,7 +61,18 @@ pub(in crate::dae_transform) fn rebuild_state_candidate(
             })
         })
         .map_err(construction_failure)?;
-    Ok((rebuilt, coordinates, state))
+    let map = state.map(|state| PreparedStateCoordinates {
+        state,
+        coordinates: selected
+            .iter()
+            .map(|coordinate| PreparedStateCoordinate {
+                variable: coordinates[coordinate.origin as usize],
+                order: coordinate.order,
+                scalar: coordinate.scalar,
+            })
+            .collect(),
+    });
+    Ok((rebuilt, coordinates, map))
 }
 
 fn append_projection<'target>(

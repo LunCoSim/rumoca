@@ -151,7 +151,7 @@ impl EquationScan<'_> {
 
     fn scan_equation(&mut self, eq: &Equation, ctx: EqContext) {
         match eq {
-            Equation::Connect { lhs, rhs } => {
+            Equation::Connect { lhs, rhs, .. } => {
                 self.check_connect_context(lhs, ctx);
                 self.check_connect_subscripts(lhs);
                 self.check_connect_subscripts(rhs);

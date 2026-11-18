@@ -1,4 +1,5 @@
 import { setupCommandPalette } from './modules/command_palette.js';
+import { compiledDaeJson } from './modules/compiled_dae_output.js';
 import * as shared from '../vendor/visualization_shared.js';
 import { createSourceBreadcrumbs } from './modules/breadcrumbs.js';
 import { createPackageArchiveController } from './modules/package_archive_controller.js';
@@ -13,6 +14,8 @@ import {
 } from './modules/result_file_editor.js';
 import { setupMonacoWorkspace } from './modules/monaco_setup.js';
 import { createScenarioInterface } from './modules/scenario_interface.js';
+import { createAssistant } from './modules/assistant/index.js';
+import { createAssistantHost } from './modules/assistant/host.js';
 import { buildScenarioVisualizationViewStorage } from './modules/visualization_view_storage.js';
 import {
     createWorkspaceFilesystem,
@@ -369,15 +372,49 @@ function currentCodegenModel() {
     return trimMaybeString(window.selectedModel || currentSimulationModel());
 }
 
-async function resolveCodegenTemplateSelection(modelName = currentCodegenModel()) {
-    const settings = await codegenSettingsForModel(modelName);
+// A scenario's own [codegen] table wins over the per-model settings lookup,
+// which returns the first codegen scenario of a model regardless of which
+// scenario file is being run. Paths in the table are scenario-relative.
+function codegenSettingsFromScenarioContext(context) {
+    const codegen = context?.config?.codegen;
+    const target = trimMaybeString(codegen?.target);
+    if (!target) return null;
+    const outputDir = trimMaybeString(codegen.output_dir ?? codegen.outputDir);
+    const settings = codegenSettingsFromScenarioConfig({
+        target,
+        outputDir: outputDir ? resolveWorkspaceRelativePath(context.path, outputDir) : '',
+    });
+    if (settings.mode === 'custom-target') {
+        const relative = resolveWorkspaceRelativePath(context.path, target);
+        if (relative.endsWith('.jinja')) {
+            throw new Error(
+                `Single-template target '${target}' is not supported in the browser; `
+                + 'use a target directory with a target.toml, or the rumoca CLI.',
+            );
+        }
+        if (typeof workspaceFs.getFileContent(`${relative}/target.toml`) !== 'string') {
+            const available = builtInCodegenTemplates.map((template) => template.id).join(', ');
+            throw new Error(
+                `Target '${target}' cannot be rendered in the browser (available here: ${available}, `
+                + 'or a workspace target directory with a dae/algorithm-code target.toml). '
+                + `Use the rumoca CLI: rumoca compile <model.mo> --target ${target}`,
+            );
+        }
+        settings.customTargetPath = relative;
+    }
+    return settings;
+}
+
+async function resolveCodegenTemplateSelection(modelName = currentCodegenModel(), scenarioContext = null) {
+    const settings = codegenSettingsFromScenarioContext(scenarioContext)
+        || await codegenSettingsForModel(modelName);
     if (settings.mode === 'custom-target') {
         const targetPath = trimMaybeString(settings.customTargetPath);
         if (!targetPath) {
             throw new Error('Choose a custom target directory in Rumoca settings.');
         }
         return {
-            kind: 'target',
+            kind: 'custom-target',
             target: targetPath,
             label: targetPath,
             language: 'plaintext',
@@ -435,15 +472,16 @@ async function renderGalecCodegenSelection(modelName, workspaceSources, target) 
     return rendered.files;
 }
 
-async function renderCodegenSelection(modelName, daeJson, templateSelection) {
+async function renderCodegenSelection(modelName, source, workspaceSources, templateSelection) {
     let manifest = '';
     let templates = {};
     if (templateSelection.kind === 'custom-target') {
         ({ manifest, templates } = collectCustomCodegenTarget(templateSelection.target));
     }
-    const rendered = await sendWorkspaceCommand('rumoca.workspace.renderTarget', {
-        daeJson,
+    const rendered = await sendWorkspaceCommand('rumoca.workspace.renderTargetWithWorkspaceSources', {
+        source,
         modelName,
+        workspaceSources,
         target: templateSelection.target,
         manifest,
         templates: JSON.stringify(templates),
@@ -3639,7 +3677,7 @@ window.runScenarioForPane = async function(paneId) {
             throw new Error('Scenario has no model name.');
         }
         if (context.task === 'codegen') {
-            return await createCodegenRunForModel(context.modelName);
+            return await createCodegenRunForModel(context.modelName, context);
         }
         if (scenarioUsesInputRuntime(context.config)) {
             return await openInteractiveRunForContext(context, pane.id);
@@ -3668,32 +3706,26 @@ function displayDaeOutput(modelName) {
     if (result.error) { setDaeOutput(String(result.error || 'compile error')); return; }
     if (!result.dae) { setDaeOutput(`No DAE available for ${modelName}`); return; }
 
-    if (window.daeFormat === 'pretty') {
-        const prettyOutput = result.pretty || '';
-        setDaeOutput(prettyOutput || JSON.stringify(result.dae, null, 2));
-    } else {
-        if (result.dae_native) {
-            setDaeOutput(JSON.stringify(result.dae_native, null, 2), 'json');
-        } else {
-            setDaeOutput('DAE JSON not available');
-        }
-    }
+    const output = compiledDaeJson(result);
+    if (!output) { setDaeOutput('DAE JSON not available'); return; }
+    setDaeOutput(output, window.daeFormat === 'pretty' ? undefined : 'json');
 }
 
-async function createCodegenRunForModel(modelName) {
+async function createCodegenRunForModel(modelName, context = null) {
     const nextModel = trimMaybeString(modelName);
     if (!nextModel) {
         showTemplateError('No model selected for code generation output.');
         throw new Error('No model selected for code generation output.');
     }
-    const result = window.compiledModels[nextModel];
-    if (!result || result.error || !result.dae_native) {
-        showTemplateError('Compile a model before rendering code generation output.');
-        throw new Error('Compile a model before rendering code generation output.');
-    }
+    // The renderer compiles the model itself, so codegen does not depend on
+    // the live-check compile cache (cleared while a scenario file is open).
+    const modelPath = context?.modelPath || workspaceFs.getActiveDocumentPath();
+    const source = typeof context?.source === 'string'
+        ? context.source
+        : (window.editor ? window.editor.getValue() : '');
     try {
         await ensureBuiltInCodegenTemplatesLoaded();
-        const templateSelection = await resolveCodegenTemplateSelection(nextModel);
+        const templateSelection = await resolveCodegenTemplateSelection(nextModel, context);
         let renderedFiles;
         if (GALEC_CODEGEN_TARGETS.has(templateSelection.target)) {
             // Project GALEC from the FULL workspace sources (the addon owns its
@@ -3708,8 +3740,12 @@ async function createCodegenRunForModel(modelName) {
                 templateSelection.target,
             );
         } else {
-            const daeJson = JSON.stringify(result.dae_native);
-            renderedFiles = await renderCodegenSelection(nextModel, daeJson, templateSelection);
+            renderedFiles = await renderCodegenSelection(
+                nextModel,
+                source,
+                collectWorkspaceModelicaSourcesJson(modelPath),
+                templateSelection,
+            );
         }
         const configuredOutputRoot = normalizePath(templateSelection.outputRoot || '');
         const outputRoot = configuredOutputRoot || defaultCodegenOutputRoot(nextModel, templateSelection);
@@ -4123,9 +4159,10 @@ function augmentLanguagePayload(command, payload = {}) {
     if (!languageCommandNeedsWorkspaceSources(command)) {
         return payload;
     }
-    const activePath = workspaceFs?.getActiveDocumentPath?.() || '';
+    const { focusPath, ...rest } = payload;
+    const activePath = focusPath ?? (workspaceFs?.getActiveDocumentPath?.() || '');
     return {
-        ...payload,
+        ...rest,
         workspaceSources: collectWorkspaceModelicaSourcesJson(activePath),
     };
 }
@@ -4884,6 +4921,46 @@ setupCommandPalette({
     getQuickOpenItems: buildQuickOpenItems,
     getSymbolItems: buildDocumentSymbolItems,
 });
+
+async function assistantRunScenario(path) {
+    const context = await scenarioContextForPath(path);
+    if (!context) throw new Error(`${path} is not a scenario file`);
+    if (context.task === 'codegen') throw new Error('Codegen scenarios do not simulate.');
+    if (scenarioUsesInputRuntime(context.config)) {
+        throw new Error('Interactive scenarios run in the interactive viewer, not through the assistant.');
+    }
+    return await runSimulationWithContext({
+        modelName: context.modelName,
+        source: context.source,
+        focusPath: context.path,
+        excludePath: context.modelPath || context.path,
+    });
+}
+
+const assistant = createAssistant({
+    getMonaco: () => monacoApi,
+    host: createAssistantHost({
+        workspaceFs,
+        isScenarioPath: (path) => shared.isRumocaScenarioPath(path),
+        flushEditors: persistActivePaneDocument,
+        sendLanguageCommand,
+        sendScenarioCommand: async (command, payload) => JSON.parse(
+            await sendRequest('scenarioCommand', { command, payload }),
+        ),
+        normalizeDiagnostics: normalizeDiagnosticsPayload,
+        diagnosticCode: diagnosticCodeString,
+        runScenario: assistantRunScenario,
+        runModel: (modelName) => runSimulationWithContext({ modelName }),
+        normalizeRun: (document) => shared.normalizePersistedSimulationRun(document),
+        openDocument: (path) => openWorkspaceDocument(path, { focusEditor: false, forceReload: true }),
+        didChangeFiles() {
+            renderExplorerPane();
+            scheduleWorkspacePersistence();
+        },
+    }),
+});
+window.toggleAssistant = () => assistant.toggle();
+void assistant.start();
 
 // Monaco Editor
 require.config({ paths: { 'vs': './vendor/monaco/vs' }});

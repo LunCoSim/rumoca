@@ -12,7 +12,8 @@ type Statement = ast::Statement;
 /// Traversal is centralized here while semantic actions stay in callbacks.
 pub(crate) trait ResolveTraversalCallbacks {
     fn create_loop_scope(&mut self, enclosing: ScopeId) -> ScopeId;
-    fn bind_loop_index_name(&mut self, loop_scope: ScopeId, index_name: &str);
+    fn bind_loop_index_name(&mut self, loop_scope: ScopeId, index_name: &str)
+    -> rumoca_core::DefId;
     fn on_component_reference(&mut self, comp: &mut ComponentReference, scope: ScopeId);
     fn on_function_reference(&mut self, comp: &mut ComponentReference, scope: ScopeId);
     /// Prove the projected member identity of `base.field` (MLS §3.7.3).
@@ -48,15 +49,18 @@ pub(crate) fn walk_equation<C: ResolveTraversalCallbacks>(
             walk_expression(callbacks, lhs, scope);
             walk_expression(callbacks, rhs, scope);
         }
-        Equation::Connect { lhs, rhs } => {
+        Equation::Connect { lhs, rhs, .. } => {
             callbacks.on_component_reference(lhs, scope);
             callbacks.on_component_reference(rhs, scope);
         }
         Equation::For { indices, equations } => {
-            let loop_scope = callbacks.create_loop_scope(scope);
+            let mut loop_scope = scope;
             for index in indices {
-                callbacks.bind_loop_index_name(loop_scope, index.ident.text.as_ref());
                 walk_expression(callbacks, &mut index.range, loop_scope);
+                loop_scope = callbacks.create_loop_scope(loop_scope);
+                index.binder = Some(rumoca_core::IndexBinderProvenance::Source(
+                    callbacks.bind_loop_index_name(loop_scope, index.ident.text.as_ref()),
+                ));
             }
             walk_equations(callbacks, equations, loop_scope);
         }
@@ -139,10 +143,13 @@ pub(crate) fn walk_statement<C: ResolveTraversalCallbacks>(
             }
         }
         Statement::For { indices, equations } => {
-            let loop_scope = callbacks.create_loop_scope(scope);
+            let mut loop_scope = scope;
             for index in indices {
-                callbacks.bind_loop_index_name(loop_scope, index.ident.text.as_ref());
                 walk_expression(callbacks, &mut index.range, loop_scope);
+                loop_scope = callbacks.create_loop_scope(loop_scope);
+                index.binder = Some(rumoca_core::IndexBinderProvenance::Source(
+                    callbacks.bind_loop_index_name(loop_scope, index.ident.text.as_ref()),
+                ));
             }
             walk_statements(callbacks, equations, loop_scope);
         }
@@ -248,10 +255,13 @@ pub(crate) fn walk_expression<C: ResolveTraversalCallbacks>(
             filter,
             ..
         } => {
-            let loop_scope = callbacks.create_loop_scope(scope);
-            for index in indices {
-                callbacks.bind_loop_index_name(loop_scope, index.ident.text.as_ref());
+            let mut loop_scope = scope;
+            for index in indices.iter_mut().rev() {
                 walk_expression(callbacks, &mut index.range, loop_scope);
+                loop_scope = callbacks.create_loop_scope(loop_scope);
+                index.binder = Some(rumoca_core::IndexBinderProvenance::Source(
+                    callbacks.bind_loop_index_name(loop_scope, index.ident.text.as_ref()),
+                ));
             }
             walk_expression(callbacks, Arc::make_mut(expr), loop_scope);
             if let Some(filter_expr) = filter {
@@ -274,6 +284,53 @@ pub(crate) fn walk_expression<C: ResolveTraversalCallbacks>(
             callbacks.on_field_access(base, field, field_def_id, scope);
         }
         Expression::Terminal { .. } | Expression::Empty { .. } => {}
+    }
+}
+
+/// Walk the values of a class modification `x(...)` in `scope`, the scope its
+/// values are written in (MLS §7.2), as a plain modifier value is. Nested
+/// targets name members of the modified element's type, which Resolve does
+/// not own, so they are not walked.
+pub(crate) fn walk_class_modification_values<C: ResolveTraversalCallbacks>(
+    callbacks: &mut C,
+    expr: &mut Expression,
+    scope: ScopeId,
+) {
+    let Expression::ClassModification { modifications, .. } = expr else {
+        return;
+    };
+    for modification in modifications.iter_mut() {
+        match modification {
+            Expression::Modification { value, .. } | Expression::NamedArgument { value, .. } => {
+                walk_modifier_value(callbacks, Arc::make_mut(value), scope);
+            }
+            Expression::Binary {
+                op: rumoca_core::OpBinary::Assign,
+                lhs,
+                rhs,
+                ..
+            } => {
+                walk_class_modification_values(callbacks, Arc::make_mut(lhs), scope);
+                walk_expression(callbacks, Arc::make_mut(rhs), scope);
+            }
+            nested @ Expression::ClassModification { .. } => {
+                walk_class_modification_values(callbacks, nested, scope);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One nested modifier value: a further class modification, or a value.
+fn walk_modifier_value<C: ResolveTraversalCallbacks>(
+    callbacks: &mut C,
+    value: &mut Expression,
+    scope: ScopeId,
+) {
+    if matches!(value, Expression::ClassModification { .. }) {
+        walk_class_modification_values(callbacks, value, scope);
+    } else {
+        walk_expression(callbacks, value, scope);
     }
 }
 

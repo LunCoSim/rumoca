@@ -35,16 +35,16 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             ));
         }
         let base_start = self.pack_expression(base)?;
-        let mut compact = Vec::with_capacity(dimensions.len());
-        let mut value_count = 1usize;
-        for (axis, &extent) in dimensions.iter().enumerate() {
-            let (subscript, selected_count) =
-                self.pack_update_subscript(subscripts.get(axis), extent, span)?;
-            value_count = value_count.checked_mul(selected_count).ok_or_else(|| {
+        let compact = self.pack_update_subscripts(&dimensions, subscripts, span)?;
+        let value_count = dimensions
+            .iter()
+            .zip(&compact)
+            .try_fold(1usize, |count, (&extent, subscript)| {
+                count.checked_mul(subscript.value_extent(extent)?)
+            })
+            .ok_or_else(|| {
                 LowerError::contract("tensor update selected value extent overflow", span)
             })?;
-            compact.push(subscript);
-        }
         if value_count != scalar_count(self.view, value) {
             return Err(LowerError::contract(
                 "tensor update value shape does not match its projection",
@@ -57,20 +57,55 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             .try_fold(1usize, |count, extent| count.checked_mul(*extent as usize));
         let count =
             count.ok_or_else(|| LowerError::contract("tensor update extent overflow", span))?;
-        let dst_start = self.next_register;
-        for _ in 0..count {
-            self.register(span)?;
-        }
-        self.ops.push(solve::LinearOp::TensorUpdate {
+        let dst_start = self.register_range(count, span)?;
+        self.emit(solve::LinearOp::TensorUpdate {
             dst_start,
             base_start,
             value_start,
             dimensions: dimensions.into_boxed_slice(),
             subscripts: compact.into_boxed_slice(),
             lanes: 1,
-        });
+        })?;
         self.tensor_update_cache.insert(key, (dst_start, count));
         Ok(dst_start)
+    }
+
+    /// One scalar of an array update whose slice bounds are run-time values:
+    /// the update is issued once per call frame by [`Self::pack_array_update`]
+    /// and this reads its `scalar` register.
+    pub(super) fn windowed_update_scalar(
+        &mut self,
+        expression: dae::ExprId<'dae>,
+        base: dae::ExprId<'dae>,
+        value: dae::ExprId<'dae>,
+        subscripts: dae::SubscriptsView<'dae>,
+        scalar: usize,
+    ) -> Result<solve::Reg, LowerError> {
+        let span = self.node(expression).provenance().span();
+        let start = self.pack_array_update(expression, base, value, subscripts, span)?;
+        u32::try_from(scalar)
+            .ok()
+            .and_then(|offset| start.checked_add(offset))
+            .ok_or_else(|| LowerError::contract("windowed update scalar register overflows", span))
+    }
+
+    /// Every axis of one tensor update of `dimensions`, as the compact
+    /// subscripts shared by an ordinary `TensorUpdate` and a fold patch: an
+    /// omitted or whole axis is `Whole`, a scalar subscript an `Index` (constant
+    /// when it folds), a slice the packed register range of its one-based
+    /// coordinates, whose run-time start and constant extent the DAE shape
+    /// proof established.
+    pub(super) fn pack_update_subscripts(
+        &mut self,
+        dimensions: &[u32],
+        subscripts: dae::SubscriptsView<'dae>,
+        span: Span,
+    ) -> Result<Vec<solve::TensorUpdateSubscript>, LowerError> {
+        dimensions
+            .iter()
+            .enumerate()
+            .map(|(axis, &extent)| self.pack_update_subscript(subscripts.get(axis), extent, span))
+            .collect()
     }
 
     fn pack_update_subscript(
@@ -78,10 +113,10 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         subscript: Option<dae::SubscriptView<'dae>>,
         extent: u32,
         span: Span,
-    ) -> Result<(solve::TensorUpdateSubscript, usize), LowerError> {
+    ) -> Result<solve::TensorUpdateSubscript, LowerError> {
         match subscript {
             Some(dae::SubscriptView::Whole { .. }) | None => {
-                Ok((solve::TensorUpdateSubscript::Whole, extent as usize))
+                Ok(solve::TensorUpdateSubscript::Whole)
             }
             Some(dae::SubscriptView::Index { expression, .. }) => {
                 let register = self.expression(expression, 0)?;
@@ -89,19 +124,15 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                     || Ok(solve::TensorIndex::Runtime(register)),
                     |index| checked_index(index, extent, span).map(solve::TensorIndex::Constant),
                 )?;
-                Ok((solve::TensorUpdateSubscript::Index(index), 1))
+                Ok(solve::TensorUpdateSubscript::Index(index))
             }
             Some(dae::SubscriptView::Slice { expression, .. }) => {
                 let dimensions = self.node(expression).value_type().dimensions().to_vec();
-                let count = scalar_count(self.view, expression);
                 let start = self.pack_expression(expression)?;
-                Ok((
-                    solve::TensorUpdateSubscript::Slice {
-                        start,
-                        dimensions: dimensions.into_boxed_slice(),
-                    },
-                    count,
-                ))
+                Ok(solve::TensorUpdateSubscript::Slice {
+                    start,
+                    dimensions: dimensions.into_boxed_slice(),
+                })
             }
         }
     }
@@ -175,11 +206,11 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         let mut result_axis = 0usize;
         let mut indices = Vec::with_capacity(base_dimensions.len());
         for (axis, &extent) in base_dimensions.iter().enumerate() {
-            let coordinate = result_coordinates.get(result_axis).copied();
-            let (index, consumes_result_axis) =
-                self.dynamic_index_subscript(subscripts.get(axis), extent, coordinate, span)?;
+            let remaining = result_coordinates.get(result_axis..).unwrap_or_default();
+            let (index, consumed) =
+                self.dynamic_index_subscript(subscripts.get(axis), extent, remaining, span)?;
             indices.push(index);
-            result_axis += usize::from(consumes_result_axis);
+            result_axis += consumed;
         }
         // Deciding that every subscript is constant and reading the constants
         // out is one pass, not two: the proof and the use are the same
@@ -198,35 +229,35 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         }
         if let Some(carried_base) = self.fold_carried_tensor_base(base) {
             let dst = self.register(span)?;
-            self.ops.push(solve::LinearOp::LoadIndexedFoldCarried {
+            self.emit(solve::LinearOp::LoadIndexedFoldCarried {
                 dst,
                 base: carried_base,
                 stride: 1,
                 dimensions: base_dimensions.into_boxed_slice(),
                 indices: indices.into_boxed_slice(),
-            });
+            })?;
             return Ok(dst);
         }
         if let Some(capture_base) = self.fold_capture_tensor_base(base, span)? {
             let dst = self.register(span)?;
-            self.ops.push(solve::LinearOp::LoadIndexedFoldCapture {
+            self.emit(solve::LinearOp::LoadIndexedFoldCapture {
                 dst,
                 base: capture_base,
                 stride: 1,
                 dimensions: base_dimensions.into_boxed_slice(),
                 indices: indices.into_boxed_slice(),
-            });
+            })?;
             return Ok(dst);
         }
         let base = self.pack_expression(base)?;
         let dst = self.register(span)?;
-        self.ops.push(solve::LinearOp::LoadIndexedRegister {
+        self.emit(solve::LinearOp::LoadIndexedRegister {
             dst,
             base,
             stride: 1,
             dimensions: base_dimensions.into_boxed_slice(),
             indices: indices.into_boxed_slice(),
-        });
+        })?;
         Ok(dst)
     }
 
@@ -234,9 +265,9 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         &mut self,
         subscript: Option<dae::SubscriptView<'dae>>,
         extent: u32,
-        result_coordinate: Option<u32>,
+        result_coordinates: &[u32],
         span: Span,
-    ) -> Result<(solve::TensorIndex, bool), LowerError> {
+    ) -> Result<(solve::TensorIndex, usize), LowerError> {
         match subscript {
             Some(dae::SubscriptView::Index { expression, .. }) => {
                 let register = self.expression(expression, 0)?;
@@ -244,24 +275,43 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                     || Ok(solve::TensorIndex::Runtime(register)),
                     |index| checked_index(index, extent, span).map(solve::TensorIndex::Constant),
                 )?;
-                Ok((index, false))
+                Ok((index, 0))
             }
-            Some(dae::SubscriptView::Whole { .. }) | None => result_coordinate
-                .map(|coordinate| (solve::TensorIndex::Constant(coordinate), true))
+            Some(dae::SubscriptView::Whole { .. }) | None => result_coordinates
+                .first()
+                .map(|&coordinate| (solve::TensorIndex::Constant(coordinate), 1))
                 .ok_or_else(|| {
                     LowerError::contract(
                         "runtime indexed result rank does not match its base projection",
                         span,
                     )
                 }),
-            Some(dae::SubscriptView::Slice { .. }) => Err(LowerError::non_computable(
-                "runtime indexed slices do not yet have a compact Solve owner",
-                span,
-            )),
+            Some(dae::SubscriptView::Slice { expression, .. }) => {
+                // The window is a vector of one-based coordinates (a constant
+                // extent over a run-time start); each result coordinate along
+                // it selects one of them.
+                let slice_dimensions = self.node(expression).value_type().dimensions().to_vec();
+                let consumed = slice_dimensions.len();
+                let slice_scalar = result_coordinates
+                    .get(..consumed)
+                    .and_then(|coordinates| flatten_coordinates(&slice_dimensions, coordinates))
+                    .ok_or_else(|| {
+                        LowerError::contract(
+                            "runtime indexed result rank does not match its slice shape",
+                            span,
+                        )
+                    })?;
+                let register = self.expression(expression, slice_scalar)?;
+                let index = self.integer_register(register).map_or_else(
+                    || Ok(solve::TensorIndex::Runtime(register)),
+                    |index| checked_index(index, extent, span).map(solve::TensorIndex::Constant),
+                )?;
+                Ok((index, consumed))
+            }
         }
     }
 
-    fn fold_capture_tensor_base(
+    pub(super) fn fold_capture_tensor_base(
         &mut self,
         expression: dae::ExprId<'dae>,
         span: Span,
@@ -269,22 +319,24 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         let Some(deferred) = self.deferred_fold_captures.as_ref() else {
             return Ok(None);
         };
-        if let Some(&base) = deferred.packed_capture_ranges.get(&expression) {
-            return Ok(Some(base));
-        }
         let Some(&(source, count)) = deferred.packed_expressions.get(&expression) else {
             return Ok(None);
         };
-        let capture_base = deferred.sources.len();
-        let mut sources = Vec::with_capacity(count);
-        for offset in 0..count {
-            let offset = u32::try_from(offset).map_err(|_| {
-                LowerError::contract("fold tensor capture offset exceeds u32", span)
-            })?;
-            sources.push(source.checked_add(offset).ok_or_else(|| {
-                LowerError::contract("fold tensor capture register overflows", span)
-            })?);
+        if let Some(&base) = deferred.packed_capture_ranges.get(&(source, count)) {
+            return Ok(Some(base));
         }
+        let capture_base = deferred.sources.len();
+        let sources = if count == 0 {
+            Vec::new()
+        } else {
+            let last = u32::try_from(count - 1)
+                .ok()
+                .and_then(|offset| source.checked_add(offset))
+                .ok_or_else(|| {
+                    LowerError::contract("fold tensor capture register overflows", span)
+                })?;
+            (source..=last).collect::<Vec<_>>()
+        };
         let deferred = self
             .deferred_fold_captures
             .as_mut()
@@ -292,7 +344,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
         deferred.sources.extend(sources);
         deferred
             .packed_capture_ranges
-            .insert(expression, capture_base);
+            .insert((source, count), capture_base);
         Ok(Some(capture_base))
     }
 

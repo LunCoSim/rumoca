@@ -1,4 +1,5 @@
 mod affine;
+mod block_jacobian;
 mod branch_continuity;
 mod homotopy;
 mod initial;
@@ -22,8 +23,8 @@ use rumoca_ir_solve as solve;
 
 use super::fallbacks::ProjectionFallback;
 use super::solve_ops::RuntimeSolveError;
+pub(crate) use block_jacobian::BlockJacobian;
 use initial_diagnostics::initial_projection_error;
-pub(crate) use scaling::scaled_newton_delta_with_tearing;
 use scaling::{
     CertificateScales, OriginRowScales, algebraic_block_scales, algebraic_plan_row_scales,
     fallback_targets, initial_block_fallback_scales, initial_residual_scales, jacobian_row_derived,
@@ -32,6 +33,7 @@ use scaling::{
     scaled_residual_norm, scaled_tolerance,
 };
 pub(crate) use scaling::{ScaledNewtonSystem, scaled_newton_delta, scaled_newton_delta_with_cache};
+pub(crate) use scaling::{scaled_newton_delta_issued_torn, scaled_newton_delta_with_tearing};
 use singleton::{SingletonAssignmentStep, initial_row_target_name, singleton_assignment_improves};
 pub(crate) use sparse_newton::SparseNewtonCache;
 use step_limit::StepLimit;
@@ -65,7 +67,7 @@ pub(crate) type JacobianEntries = Vec<(usize, usize, f64)>;
 pub(crate) trait ImplicitProjectionModel {
     fn eval_prepared_implicit_jacobian(
         &self,
-        _structure: &solve::JacobianStructure,
+        _structure: &solve::ColoredJacobianStructure,
         _coordinates: (&[usize], &[usize]),
         _y: &[f64],
         _p: &[f64],
@@ -127,7 +129,11 @@ pub(crate) trait ImplicitProjectionModel {
     fn implicit_target(&self, row_idx: usize) -> Option<solve::ScalarSlot>;
     #[cfg(test)]
     fn algebraic_projection_plan(&self) -> &solve::AlgebraicProjectionPlan;
-    fn target_name_for_row(&self, row_idx: usize) -> Option<&str>;
+    /// Return the diagnostic name of the variable one implicit row solves for.
+    /// Implementations may omit names without changing projection semantics.
+    fn target_name_for_row(&self, _row_idx: usize) -> Option<String> {
+        None
+    }
 
     /// Whether this plan is a projection of the constructor-validated Solve
     /// aggregate rather than a third-party runtime plan.
@@ -143,7 +149,7 @@ pub(crate) trait ImplicitProjectionModel {
 
     /// Return the diagnostic name for a solver variable. Implementations may
     /// omit names without changing projection semantics.
-    fn variable_name_for_y_index(&self, _y_index: usize) -> Option<&str> {
+    fn variable_name_for_y_index(&self, _y_index: usize) -> Option<String> {
         None
     }
 
@@ -166,6 +172,18 @@ pub(crate) trait ImplicitProjectionModel {
         _t: f64,
     ) -> Result<Option<f64>, RuntimeSolveError> {
         Ok(None)
+    }
+
+    /// The implicit residuals of `rows`, in order, into `out`: exactly the
+    /// values [`Self::eval_implicit_residual_row`] yields row by row. `false`
+    /// leaves the rows to that per-row evaluation.
+    fn eval_implicit_residual_rows(
+        &self,
+        _rows: &[usize],
+        _point: (&[f64], &[f64], f64),
+        _out: &mut [f64],
+    ) -> Result<bool, RuntimeSolveError> {
+        Ok(false)
     }
 
     /// Evaluate a constructor-issued residual output selection once per source
@@ -237,7 +255,7 @@ pub(crate) trait ImplicitProjectionModel {
     fn algebraic_projection_block_structure(
         &self,
         _block_index: usize,
-    ) -> Option<&solve::JacobianStructure> {
+    ) -> Option<&solve::ColoredJacobianStructure> {
         None
     }
 
@@ -278,6 +296,40 @@ pub(crate) trait ImplicitProjectionModel {
         &self,
         _block_index: usize,
     ) -> Option<&std::cell::RefCell<SparseNewtonCache>> {
+        None
+    }
+
+    /// Block `block_index`'s residual at `(y, p, t)` from one fused compiled
+    /// entry, in block row order: exactly the values of its rows' implicit
+    /// residuals. `false` leaves the residual to the per-row evaluation.
+    fn eval_block_residual(
+        &self,
+        _block_index: usize,
+        _point: (&[f64], &[f64], f64),
+        _out: &mut [f64],
+    ) -> bool {
+        false
+    }
+
+    /// Block `block_index`'s rows' directional derivatives along
+    /// `seed` from one fused compiled entry, in block row order: exactly the
+    /// values [`Self::eval_implicit_jacobian_v_row`] gives per row. `false`
+    /// leaves them to the per-row evaluation.
+    fn eval_block_jacobian_v(
+        &self,
+        _block_index: usize,
+        _point: (&[f64], &[f64], f64),
+        _seed: &[f64],
+        _out: &mut [f64],
+    ) -> bool {
+        false
+    }
+
+    /// The exact parameter slots that key implicit residual `row_idx`'s
+    /// certified solver-Y gradient (SPEC_0043 parameter-static gradient), or
+    /// `None` when the gradient is not certified invariant under solver-Y and
+    /// time.
+    fn implicit_row_static_gradient_parameters(&self, _row_idx: usize) -> Option<&[usize]> {
         None
     }
 
@@ -383,7 +435,7 @@ pub(crate) enum KernelRequest<'a> {
     /// Every structural entry `(row, column, value)` of a block's Jacobian
     /// from its issued colored tangent plan.
     ColoredEntries {
-        structure: &'a solve::JacobianStructure,
+        structure: &'a solve::ColoredJacobianStructure,
         coordinates: (&'a [usize], &'a [usize]),
         point: (&'a [f64], &'a [f64], f64),
     },
@@ -416,12 +468,47 @@ pub(crate) enum KernelAnswer {
     TornJacobianSingular,
 }
 
+/// Receives one Jacobian column, with its position among the requested
+/// columns.
+pub(crate) type JacobianColumnSink<'a> =
+    dyn FnMut(usize, &[f64]) -> Result<(), RuntimeSolveError> + 'a;
+
+/// Evaluate `eval(seed, out)` along each unit direction `y_indices[column]` of
+/// a `seed_len`-value seed into an `out_len`-value buffer, handing each result
+/// to `column` in order.
+pub(crate) fn unit_jacobian_columns(
+    (seed_len, out_len): (usize, usize),
+    y_indices: &[usize],
+    mut eval: impl FnMut(&[f64], &mut [f64]) -> Result<(), RuntimeSolveError>,
+    column: &mut JacobianColumnSink<'_>,
+) -> Result<(), RuntimeSolveError> {
+    let mut seed = vec![0.0; seed_len];
+    let mut jvp = vec![0.0; out_len];
+    for (col, y_idx) in y_indices.iter().copied().enumerate() {
+        if y_idx >= seed.len() {
+            return Err(RuntimeSolveError::solve_ir(format!(
+                "initial projection Jacobian references y index {y_idx}, but the model has only {seed_len} variables"
+            )));
+        }
+        seed[y_idx] = 1.0;
+        eval(&seed, &mut jvp)?;
+        seed[y_idx] = 0.0;
+        column(col, &jvp)?;
+    }
+    Ok(())
+}
+
 pub(crate) trait AlgebraicProjectionModel: ImplicitProjectionModel {
+    /// The initialization residual at `(y, p, t)`. With `rows`, only those
+    /// entries are exact and the others unspecified: a model evaluating its
+    /// rows on a settled view reconstructs only the algebraic blocks those
+    /// rows read.
     fn eval_initial_residual(
         &self,
         y: &[f64],
         p: &[f64],
         t: f64,
+        rows: Option<&[usize]>,
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError>;
 
@@ -432,7 +519,7 @@ pub(crate) trait AlgebraicProjectionModel: ImplicitProjectionModel {
     fn initial_projection_block_structure(
         &self,
         _block_index: usize,
-    ) -> Option<&solve::JacobianStructure> {
+    ) -> Option<&solve::ColoredJacobianStructure> {
         None
     }
 
@@ -459,6 +546,27 @@ pub(crate) trait AlgebraicProjectionModel: ImplicitProjectionModel {
         rows: Option<&[usize]>,
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError>;
+
+    /// The initialization residual's Jacobian columns at one point: for each
+    /// `y_indices[column]`, the directional derivative along that unit
+    /// direction of a `seed_len`-value seed, exact on `rows` (every row when
+    /// `None`), handed to `column` in order. Each column is [`Self::eval_initial_jacobian_v`]
+    /// along that direction; a model that prepares the point before
+    /// differentiating can prepare it once for every column.
+    fn eval_initial_jacobian_columns(
+        &self,
+        (y, p, t): (&[f64], &[f64], f64),
+        seed_len: usize,
+        (rows, y_indices): (Option<&[usize]>, &[usize]),
+        column: &mut JacobianColumnSink<'_>,
+    ) -> Result<(), RuntimeSolveError> {
+        unit_jacobian_columns(
+            (seed_len, self.initial_residual_len()),
+            y_indices,
+            |seed, out| self.eval_initial_jacobian_v(y, p, t, seed, rows, out),
+            column,
+        )
+    }
 
     fn eval_initial_target_value(
         &self,
@@ -550,20 +658,18 @@ fn project_algebraic_seed_with_plan_inner<M: ImplicitProjectionModel>(
     (args, singular_mode): (AlgebraicProjectionArgs<'_>, SingularModeNames<'_>),
     seed: &mut [f64],
 ) -> Result<(), RuntimeSolveError> {
-    for block in &plan.blocks {
+    for block in plan.blocks.scalar_blocks() {
         for &y_index in &block.y_indices {
             seed[y_index] = 0.0;
         }
     }
     let mut row_scales = Vec::new();
-    for (block_index, block) in plan.blocks.iter().enumerate() {
-        let block_residual = implicit_selected_jacobian_v_rows(
+    for (block_index, block) in plan.blocks.scalar_blocks().iter().enumerate() {
+        let block_residual = block_jacobian_v_rows(
             model,
-            y,
-            args.parameters,
-            args.time,
+            (y, args.parameters, args.time),
             seed,
-            &block.rows,
+            (block_index, block),
             "algebraic seed projection",
         )?;
         let linearization = model.algebraic_seed_linearization(block_index, block, y, args)?;
@@ -649,7 +755,7 @@ fn project_algebraics_with_plan_inner<M: ImplicitProjectionModel>(
         let mut changed = false;
         let mut all_settled = true;
         let mut earlier_row_invalidated = false;
-        for (block_index, block) in plan.blocks.iter().enumerate() {
+        for (block_index, block) in plan.blocks.scalar_blocks().iter().enumerate() {
             // One call changes only this block's unknowns: the invariant parts
             // of its residual programs hold for the whole call.
             model.linked_kernel(KernelRequest::BeginBlock {
@@ -920,7 +1026,7 @@ fn project_algebraic_residual_block<M: ImplicitProjectionModel>(
     let structure = model.algebraic_projection_block_structure(block_index);
     let jacobian =
         algebraic_block_jacobian(model, y, p, t, &block.rows, &block.y_indices, structure)?;
-    let pattern = structure.map(solve::JacobianStructure::pattern);
+    let pattern = structure.map(solve::ColoredJacobianStructure::pattern);
     let (row_scales, variable_scales) = algebraic_block_scales(model, y, block, &jacobian, pattern);
     let residual_converged = scaled_residual_converged(&residual, &row_scales, tol);
     if residual_converged && !certify_coordinates {
@@ -933,6 +1039,7 @@ fn project_algebraic_residual_block<M: ImplicitProjectionModel>(
     let delta = model.solve_algebraic_newton_delta(
         block_index,
         ScaledNewtonSystem {
+            revision: None,
             jacobian: &jacobian,
             residual: &residual,
             row_scales: &row_scales,
@@ -946,7 +1053,9 @@ fn project_algebraic_residual_block<M: ImplicitProjectionModel>(
             model.projection_site(block_index),
             ProjectionFallback::JacobianDeclined,
         );
-        if !residual_converged && nudge_singular_zero_seed(y, block, &jacobian, &variable_scales) {
+        if !residual_converged
+            && nudge_singular_zero_seed(y, block, &jacobian.as_dense(), &variable_scales)
+        {
             return Ok(ProjectionBlockUpdate {
                 changed: true,
                 settled: false,
@@ -986,7 +1095,7 @@ fn project_algebraic_residual_block<M: ImplicitProjectionModel>(
     // regular iterate instead of reporting a false non-convergence.
     if !update.changed
         && !residual_converged
-        && nudge_singular_zero_seed(y, block, &jacobian, &variable_scales)
+        && nudge_singular_zero_seed(y, block, &jacobian.as_dense(), &variable_scales)
     {
         return Ok(ProjectionBlockUpdate {
             changed: true,
@@ -1437,7 +1546,11 @@ fn implicit_selected_residuals<M: ImplicitProjectionModel + ?Sized>(
     rows: &[usize],
     context: &str,
 ) -> Result<Vec<f64>, RuntimeSolveError> {
-    let mut selected = Vec::with_capacity(rows.len());
+    let mut selected = vec![0.0; rows.len()];
+    if model.eval_implicit_residual_rows(rows, (y, p, t), &mut selected)? {
+        return Ok(selected);
+    }
+    selected.clear();
     for row in rows {
         let Some(value) = model.eval_implicit_residual_row(*row, y, p, t)? else {
             let mut residual = vec![0.0; y.len()];
@@ -1553,11 +1666,11 @@ impl<M: AlgebraicProjectionModel> ImplicitProjectionModel
         self.model.algebraic_projection_plan()
     }
 
-    fn target_name_for_row(&self, row_idx: usize) -> Option<&str> {
+    fn target_name_for_row(&self, row_idx: usize) -> Option<String> {
         self.model.target_name_for_row(row_idx)
     }
 
-    fn variable_name_for_y_index(&self, index: usize) -> Option<&str> {
+    fn variable_name_for_y_index(&self, index: usize) -> Option<String> {
         (index < self.y_len)
             .then(|| self.model.variable_name_for_y_index(index))
             .flatten()
@@ -1577,7 +1690,7 @@ impl<M: AlgebraicProjectionModel> ImplicitProjectionModel
     fn algebraic_projection_block_structure(
         &self,
         block_index: usize,
-    ) -> Option<&solve::JacobianStructure> {
+    ) -> Option<&solve::ColoredJacobianStructure> {
         self.model.algebraic_projection_block_structure(block_index)
     }
 
@@ -1624,10 +1737,11 @@ impl<M: AlgebraicProjectionModel> AlgebraicProjectionModel
         values: &[f64],
         _p: &[f64],
         t: f64,
+        rows: Option<&[usize]>,
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         let (y, p) = self.split_values(values)?;
-        self.model.eval_initial_residual(y, p, t, out)
+        self.model.eval_initial_residual(y, p, t, rows, out)
     }
 
     fn initial_residual_len(&self) -> usize {
@@ -1641,7 +1755,7 @@ impl<M: AlgebraicProjectionModel> AlgebraicProjectionModel
     fn initial_projection_block_structure(
         &self,
         block_index: usize,
-    ) -> Option<&solve::JacobianStructure> {
+    ) -> Option<&solve::ColoredJacobianStructure> {
         self.model.initial_projection_block_structure(block_index)
     }
 
@@ -1660,6 +1774,18 @@ impl<M: AlgebraicProjectionModel> AlgebraicProjectionModel
     ) -> Result<(), RuntimeSolveError> {
         let (y, p) = self.split_values(values)?;
         self.model.eval_initial_jacobian_v(y, p, t, v, rows, out)
+    }
+
+    fn eval_initial_jacobian_columns(
+        &self,
+        (values, _p, t): (&[f64], &[f64], f64),
+        seed_len: usize,
+        selection: (Option<&[usize]>, &[usize]),
+        column: &mut JacobianColumnSink<'_>,
+    ) -> Result<(), RuntimeSolveError> {
+        let (y, p) = self.split_values(values)?;
+        self.model
+            .eval_initial_jacobian_columns((y, p, t), seed_len, selection, column)
     }
 
     fn eval_initial_target_value(
@@ -1720,6 +1846,7 @@ fn unlocalizable_fold(
         .map(|(row, _)| *row)
         .collect::<std::collections::BTreeSet<_>>();
     plan.blocks
+        .scalar_blocks()
         .iter()
         .filter(|block| block.rows.iter().any(|row| unsettled.contains(row)))
         .find_map(|block| {
@@ -1732,4 +1859,31 @@ fn unlocalizable_fold(
             fold: guard.fold(),
             time: args.time,
         })
+}
+
+/// Block `block_index`'s rows' directional derivatives along `v`, in
+/// block row order: the fused block entry when the model has one, else the
+/// per-row evaluation.
+pub(super) fn block_jacobian_v_rows(
+    model: &dyn ImplicitProjectionModel,
+    (y, p, t): (&[f64], &[f64], f64),
+    v: &[f64],
+    (block_index, block): (usize, &solve::AlgebraicProjectionBlock),
+    context: &str,
+) -> Result<Vec<f64>, RuntimeSolveError> {
+    let mut fused = vec![0.0; block.rows.len()];
+    if model.eval_block_jacobian_v(block_index, (y, p, t), v, &mut fused) {
+        #[cfg(debug_assertions)]
+        {
+            let rows = implicit_selected_jacobian_v_rows(model, y, p, t, v, &block.rows, context)?;
+            let bits = |values: &[f64]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&fused),
+                bits(&rows),
+                "a fused block directional derivative is its rows' bit for bit"
+            );
+        }
+        return Ok(fused);
+    }
+    implicit_selected_jacobian_v_rows(model, y, p, t, v, &block.rows, context)
 }

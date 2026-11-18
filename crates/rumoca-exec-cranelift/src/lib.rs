@@ -5,8 +5,17 @@
 //! Cranelift is a programmatic JIT API rather than a textual-code target, and
 //! it must not own Modelica semantics, DAE lowering, or structural rewrites.
 
+mod checked_observation;
+mod compute_block;
+mod selected_program;
+pub use checked_observation::{CompiledEventObservation, compile_event_observation};
 mod emit;
 pub mod native_code_cache;
+
+pub use compute_block::{
+    CompiledComputeExpression, CompiledComputeJacobian, compile_expression_compute_block,
+    compile_jacobian_compute_block,
+};
 
 use rumoca_core::ExternalTableData;
 use rumoca_ir_solve::{LinearOp, ScalarProgramBlock};
@@ -16,6 +25,24 @@ use std::{cell::RefCell, rc::Rc};
 pub enum CompileError {
     Backend(String),
     Input(String),
+    MessageFormatting(rumoca_eval_solve::EvalSolveError),
+    SourceOperation {
+        kind: NativeSourceFault,
+        message: String,
+        span: Option<rumoca_core::Span>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeSourceFault {
+    TensorIndex,
+    LinearSolve,
+    IntegerQuotient,
+    ForeignBody,
+    RecursionDepth,
+    ScalarPayload,
+    IntegerArithmetic,
+    ExternalTable,
 }
 
 impl std::fmt::Display for CompileError {
@@ -23,6 +50,8 @@ impl std::fmt::Display for CompileError {
         match self {
             Self::Backend(msg) => write!(f, "cranelift execution error: {msg}"),
             Self::Input(msg) => write!(f, "invalid input: {msg}"),
+            Self::MessageFormatting(error) => std::fmt::Display::fmt(error, f),
+            Self::SourceOperation { message, .. } => write!(f, "invalid input: {message}"),
         }
     }
 }
@@ -30,6 +59,20 @@ impl std::fmt::Display for CompileError {
 impl std::error::Error for CompileError {}
 
 impl CompiledPureCallTable {
+    /// The admission of `owner`, decided once when the table was built.
+    pub fn owner_support(
+        &self,
+        owner: rumoca_ir_solve::SolvePureCallOwnerId,
+    ) -> Option<&NativeOwnerSupport> {
+        self.jit.owner_support(owner)
+    }
+
+    /// Whether the native helpers run the form `site` invokes; a form without
+    /// one runs in the typed interpreter.
+    pub fn executes(&self, site: rumoca_eval_solve::PureCallInvocation<'_>) -> bool {
+        self.jit.executes(site)
+    }
+
     /// Invoke one exact checked owner from flattened runtime storage values.
     ///
     /// `input_cells` and `output_cells` are caller-owned reusable final-ABI
@@ -68,6 +111,14 @@ impl CompiledPureCallTable {
         output_cells.clear();
         output_cells.resize(output_count, 0);
         self.jit.call_cells(site, input_cells, output_cells)?;
+        let mut checked_offset = 0;
+        for value in site.outputs() {
+            let end = checked_offset + value.value_type().scalar_count() as usize;
+            for &cell in &output_cells[checked_offset..end] {
+                checked_typed_scalar(value.value_type(), cell)?;
+            }
+            checked_offset = end;
+        }
         let mut output_offset = 0usize;
         for value in site.outputs() {
             let count = value.value_type().scalar_count() as usize;
@@ -76,7 +127,7 @@ impl CompiledPureCallTable {
                 value.value_type(),
                 &output_cells[output_offset..end],
                 &mut output[output_offset..end],
-            );
+            )?;
             output_offset = end;
         }
         Ok(())
@@ -88,39 +139,16 @@ fn encode_typed_cells(
     values: &[f64],
     cells: &mut Vec<u64>,
 ) -> Result<(), CompileError> {
-    use rumoca_ir_solve::{SolveRealFormat, SolveScalarType};
-    match value_type.element_type() {
-        SolveScalarType::Real {
-            format: SolveRealFormat::Binary32,
-            ..
-        } => cells.extend(
-            values
-                .iter()
-                .map(|value| u64::from((*value as f32).to_bits())),
-        ),
-        SolveScalarType::Real {
-            format: SolveRealFormat::Binary64,
-            ..
-        } => cells.extend(values.iter().map(|value| value.to_bits())),
-        SolveScalarType::Integer(domain) => {
-            for &value in values {
-                if !value.is_finite() || value.fract() != 0.0 {
-                    return Err(CompileError::Input(
-                        "typed Integer input is not integral".into(),
-                    ));
-                }
-                let integer = value as i64;
-                if !domain.contains(integer) || integer as f64 != value {
-                    return Err(CompileError::Input(
-                        "typed Integer input is outside its domain".into(),
-                    ));
-                }
-                cells.push(integer as u64);
-            }
-        }
-        SolveScalarType::Boolean => {
-            cells.extend(values.iter().map(|value| u64::from(*value != 0.0)));
-        }
+    use rumoca_ir_solve::SolveValueKind;
+    for &value in values {
+        let value = rumoca_eval_solve::typed_kind_from_scalar(value, value_type)
+            .map_err(|error| CompileError::Input(error.to_string()))?;
+        cells.push(match value {
+            SolveValueKind::Real32(bits) => u64::from(bits),
+            SolveValueKind::Real64(bits) => bits,
+            SolveValueKind::Integer(integer) => integer as u64,
+            SolveValueKind::Boolean(value) => u64::from(value),
+        });
     }
     Ok(())
 }
@@ -129,22 +157,32 @@ fn decode_typed_cells(
     value_type: &rumoca_ir_solve::SolveValueType,
     cells: &[u64],
     values: &mut [f64],
-) {
-    use rumoca_ir_solve::{SolveRealFormat, SolveScalarType};
+) -> Result<(), CompileError> {
     for (value, cell) in values.iter_mut().zip(cells) {
-        *value = match value_type.element_type() {
-            SolveScalarType::Real {
-                format: SolveRealFormat::Binary32,
-                ..
-            } => f32::from_bits(*cell as u32) as f64,
-            SolveScalarType::Real {
-                format: SolveRealFormat::Binary64,
-                ..
-            } => f64::from_bits(*cell),
-            SolveScalarType::Integer(_) => *cell as i64 as f64,
-            SolveScalarType::Boolean => f64::from(*cell != 0),
-        };
+        *value = checked_typed_scalar(value_type, *cell)?;
     }
+    Ok(())
+}
+
+fn checked_typed_scalar(
+    value_type: &rumoca_ir_solve::SolveValueType,
+    cell: u64,
+) -> Result<f64, CompileError> {
+    use rumoca_ir_solve::{SolveRealFormat, SolveScalarType, SolveValueKind};
+    let value = match value_type.element_type() {
+        SolveScalarType::Real {
+            format: SolveRealFormat::Binary32,
+            ..
+        } => SolveValueKind::Real32(cell as u32),
+        SolveScalarType::Real {
+            format: SolveRealFormat::Binary64,
+            ..
+        } => SolveValueKind::Real64(cell),
+        SolveScalarType::Integer(_) => SolveValueKind::Integer(cell as i64),
+        SolveScalarType::Boolean => SolveValueKind::Boolean(cell != 0),
+    };
+    rumoca_eval_solve::checked_scalar_payload_value(value)
+        .map_err(|error| CompileError::Input(error.to_string()))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -164,6 +202,10 @@ impl CompiledInputRequirements {
     }
 }
 
+/// Receives one program's staged outputs and may write the seed later
+/// programs read; see [`CompiledJacobianV::call_selected_programs_committing`].
+pub type ProgramCommit<'a, E> = dyn FnMut(usize, &[f64], &mut [f64]) -> Result<(), E> + 'a;
+
 pub struct CompiledJacobianV {
     jit: Rc<emit::CompiledJacobianRows>,
     source: ScalarProgramBlock,
@@ -174,6 +216,7 @@ pub struct CompiledJacobianV {
 }
 
 pub use emit::projection_jacobian::CompiledProjectionJacobian;
+pub use emit::typed_program::{NativeFormDecline, NativeFormSupport, NativeOwnerSupport};
 
 impl CompiledJacobianV {
     /// Retain one exact colored application of this compiled source owner.
@@ -181,23 +224,42 @@ impl CompiledJacobianV {
         &self,
         application: &rumoca_ir_solve::ProjectionJacobianApplication,
     ) -> Result<CompiledProjectionJacobian, CompileError> {
-        if !self
-            .source
-            .shares_program_owner(application.canonical_source())
-        {
-            return Err(CompileError::Input(
-                "projection application belongs to a different scalar-program owner".into(),
-            ));
+        let mut prepared = self.prepare_projections(&[application])?;
+        Ok(prepared.remove(0))
+    }
+
+    /// Retain exact colored applications of this compiled source owner, all
+    /// compiled into its one projection module and finalized together.
+    pub fn prepare_projections(
+        &self,
+        applications: &[&rumoca_ir_solve::ProjectionJacobianApplication],
+    ) -> Result<Vec<CompiledProjectionJacobian>, CompileError> {
+        if applications.is_empty() {
+            return Ok(Vec::new());
         }
-        let jit = if self.source.shares_program_owner(application.source()) {
-            self.jit.clone()
-        } else {
-            Rc::new(self.jit.compile_projection_rows(
-                application.source().programs(),
-                application.block_index(),
-            )?)
-        };
-        CompiledProjectionJacobian::new(jit, application.clone(), &self.projections)
+        let prepared = applications
+            .iter()
+            .map(|application| {
+                if !self
+                    .source
+                    .shares_program_owner(application.canonical_source())
+                {
+                    return Err(CompileError::Input(
+                        "projection application belongs to a different scalar-program owner".into(),
+                    ));
+                }
+                let jit = if self.source.shares_program_owner(application.source()) {
+                    self.jit.clone()
+                } else {
+                    Rc::new(self.jit.compile_projection_rows(
+                        application.source().programs(),
+                        application.block_index(),
+                    )?)
+                };
+                Ok((jit, (*application).clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        CompiledProjectionJacobian::new_all(prepared, &self.projections)
     }
     /// Execute one existing program once, retaining all local outputs.
     pub fn call_program_outputs(
@@ -209,6 +271,34 @@ impl CompiledJacobianV {
     ) -> Result<(), CompileError> {
         self.jit
             .call_program_outputs(program, inputs, external_tables, out)
+    }
+
+    /// Run only the listed programs in list order, committing each one's
+    /// outputs before the next reads its seed. A failing program commits
+    /// nothing and stops the sequence with earlier commits standing.
+    pub fn call_selected_programs_committing<E: From<CompileError>>(
+        &self,
+        programs: &[usize],
+        inputs: (&[f64], &[f64], f64),
+        seed: &mut [f64],
+        external_tables: &[ExternalTableData],
+        commit: &mut ProgramCommit<'_, E>,
+    ) -> Result<(), E> {
+        self.jit
+            .call_selected_programs_committing(programs, inputs, seed, external_tables, commit)
+    }
+
+    /// Output `offset` of each program at `coordinates`, in order, into `out`:
+    /// what [`Self::call_program_output`] returns one call at a time.
+    pub fn call_program_outputs_at(
+        &self,
+        coordinates: &[(usize, usize)],
+        inputs: rumoca_eval_solve::JacobianEvalInputs<'_>,
+        external_tables: &[ExternalTableData],
+        out: &mut [f64],
+    ) -> Result<(), CompileError> {
+        self.jit
+            .call_program_outputs_at(coordinates, inputs, external_tables, out)
     }
 
     /// Execute one output of one compiled program, using the prepared scalar
@@ -263,9 +353,12 @@ impl CompiledJacobianV {
 }
 
 pub struct CompiledExpressionRows {
-    jit: emit::CompiledResidualRows,
+    jit: Rc<emit::CompiledResidualRows>,
+    source: ScalarProgramBlock,
     output_placement: Option<OutputPlacement>,
 }
+
+pub use selected_program::{CompiledExpressionProgram, CompiledJacobianProgram};
 
 struct OutputPlacement {
     indices: Box<[usize]>,
@@ -372,6 +465,20 @@ impl CompiledExpressionRows {
             .call_program_outputs(program, y, p, t, external_tables, out)
     }
 
+    /// Output `offset` of each program at `coordinates`, in order, into `out`:
+    /// what [`Self::call_program_output`] returns one call at a time. `false`
+    /// declines before any execution exactly when those calls would decline.
+    pub fn call_program_outputs_at(
+        &self,
+        coordinates: &[(usize, usize)],
+        inputs: (&[f64], &[f64], f64),
+        external_tables: &[ExternalTableData],
+        out: &mut [f64],
+    ) -> Result<bool, CompileError> {
+        self.jit
+            .call_program_outputs_at(coordinates, inputs, external_tables, out)
+    }
+
     /// Execute a complete source program and select its local output offset.
     /// Batched products without an independent program entry return `None`.
     pub fn call_program_output(
@@ -430,7 +537,8 @@ pub fn compile_expression_scalar_program_block(
 ) -> Result<CompiledExpressionRows, CompileError> {
     let jit = emit::compile_residual_rows(rows.programs())?;
     Ok(CompiledExpressionRows {
-        jit,
+        jit: Rc::new(jit),
+        source: rows.clone(),
         output_placement: OutputPlacement::for_block(rows),
     })
 }
@@ -447,7 +555,8 @@ pub fn compile_selectable_expression_scalar_program_block(
         pure_calls.map(|table| table.jit.clone()),
     )?;
     Ok(CompiledExpressionRows {
-        jit,
+        jit: Rc::new(jit),
+        source: rows.clone(),
         output_placement: OutputPlacement::for_block(rows),
     })
 }
@@ -458,7 +567,8 @@ pub fn compile_expression_scalar_program_block_with_pure_calls(
 ) -> Result<CompiledExpressionRows, CompileError> {
     let jit = emit::compile_residual_rows_with_pure_calls(rows.programs(), pure_calls.jit.clone())?;
     Ok(CompiledExpressionRows {
-        jit,
+        jit: Rc::new(jit),
+        source: rows.clone(),
         output_placement: OutputPlacement::for_block(rows),
     })
 }
@@ -517,11 +627,18 @@ mod tangent_lane_refusal_tests;
 
 #[cfg(test)]
 mod tests {
+    mod assertions;
+    mod observation;
+    mod owner_admission;
     mod projection_jacobian;
+    mod recursive_groups;
     mod register_constants;
+    mod scalar_integer_payload;
+    mod selected_faults;
     mod selected_jvp;
     mod selected_residual;
     mod torn_tangent;
+    mod tensor_cross_order;
 
     use super::*;
     use rumoca_ir_solve::{LinearOp, ScalarProgramBlock};
@@ -1105,9 +1222,7 @@ mod tests {
         let schedule = owners
             .exact_assignment_schedule(owners.algebraic().dynamic_causal_sequence)
             .expect("construction should freeze the exact order");
-        let shared = schedule
-            .shared_segments(&source, &owners)
-            .expect("prove owner schedule");
+        let shared = schedule.shared_segments(&source, &owners).expect("prove owner schedule");
         let compiled = compile_exact_assignment_schedule(&shared).expect("compile owner schedule");
         let mut y = [0.0, 0.0];
 
@@ -1212,3 +1327,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod native_admission_tests;

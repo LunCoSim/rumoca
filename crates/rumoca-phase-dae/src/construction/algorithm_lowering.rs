@@ -8,6 +8,8 @@ pub(super) struct AlgorithmEnvironment<'scope, 'shape, 'dae> {
     pub(super) tensor_loops: Option<&'scope HashMap<Span, ModelEventTensorLoopPlan>>,
     pub(super) function_calls: Option<&'scope HashMap<Span, ModelEventFunctionCallPlan>>,
     pub(super) transaction_steps: Option<&'scope RefCell<Vec<dae::ModelEventStep<'dae>>>>,
+    /// See [`AlgorithmStatementContext::deferred_reals`].
+    pub(super) deferred_reals: Option<&'scope RefCell<Vec<(VarName, dae::DaeProvenance)>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -161,6 +163,34 @@ fn lower_algorithm_plan<'dae>(
                 assertions,
             )?;
         }
+        ModelAlgorithmPlan::DeclarativeFunctionCall { receivers, plan } => {
+            let [
+                rumoca_core::Statement::FunctionCall {
+                    comp, args, span, ..
+                },
+            ] = algorithm.statements.as_slice()
+            else {
+                unreachable!("a declarative function-call plan owns one call statement")
+            };
+            multi_output_equations::lower_multi_output_source(
+                lowering.construction,
+                lowering.coordinates,
+                lowering.functions,
+                multi_output_equations::MultiOutputSource {
+                    receivers,
+                    name: comp,
+                    arguments: args,
+                    provenance: dae::DaeProvenance::source(*span)?,
+                },
+                plan,
+                owner_provenance,
+                Some(multi_output_equations::MultiOutputDiscreteOwners {
+                    discrete_values: lowering.discrete_values,
+                    topology: request.topology,
+                    owner_clock: None,
+                }),
+            )?;
+        }
         ModelAlgorithmPlan::Declarative { target } => {
             lower_declarative_model_algorithm(&mut lowering, algorithm, target)?;
         }
@@ -296,8 +326,13 @@ fn preclaim_algorithm_clock_targets<'dae>(
     for statement in statements {
         match statement {
             rumoca_core::Statement::When { blocks, .. } => {
+                let clock = chain_owner_clock(
+                    blocks
+                        .iter()
+                        .map(|block| condition_owner_clock(environment.functions, &block.cond))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
                 for block in blocks {
-                    let clock = condition_owner_clock(environment.functions, &block.cond)?;
                     preclaim_algorithm_clock_targets(
                         construction,
                         environment,
@@ -341,7 +376,7 @@ fn lower_algorithm_statements<'dae>(
     values: &mut HashMap<VarName, dae::ExprId<'dae>>,
     statements: &[rumoca_core::Statement],
 ) -> Result<(), dae::DaeConstructionError> {
-    for statement in statements {
+    for (index, statement) in statements.iter().enumerate() {
         lower_algorithm_statement(
             construction,
             discrete_values,
@@ -350,8 +385,38 @@ fn lower_algorithm_statements<'dae>(
             values,
             statement,
         )?;
+        if let rumoca_core::Statement::When { blocks, .. } = statement {
+            release_when_written_values(values, blocks, &statements[index + 1..]);
+        }
     }
     Ok(())
+}
+
+/// After a `when` statement, a value its body writes and no later statement
+/// writes again is the value after the algorithm (MLS §11.1.2), so a later
+/// read takes the variable's current value instead of the pre-seeded one.
+/// MLS §11.2.7 places `when` statements only at the top level of a section,
+/// so the statements after it in this sequence are every later write.
+///
+/// The seeded values are keyed by leaf variable, so a write releases every
+/// seeded key it shares storage with: a whole record write `r := make(1, 2)`
+/// releases `r.a` and `r.b`, unless a later statement writes that field
+/// (or the whole record) again.
+fn release_when_written_values(
+    values: &mut HashMap<VarName, dae::ExprId<'_>>,
+    blocks: &[rumoca_core::StatementBlock],
+    later: &[rumoca_core::Statement],
+) {
+    let mut written = HashSet::new();
+    for block in blocks {
+        collect_algorithm_writes(&block.stmts, &mut written);
+    }
+    let mut later_writes = HashSet::new();
+    collect_algorithm_writes(later, &mut later_writes);
+    values.retain(|key, _| {
+        !written.iter().any(|name| names_overlap(name, key))
+            || later_writes.iter().any(|name| names_overlap(name, key))
+    });
 }
 
 fn lower_algorithm_statement<'dae>(
@@ -567,6 +632,7 @@ fn algorithm_statement_context<'scope, 'shape, 'dae>(
         values,
         parent: Some(owner.activation()),
         owner_span: owner.span,
+        deferred_reals: environment.deferred_reals,
     }
 }
 
@@ -577,6 +643,10 @@ fn lower_algorithm_call_statement<'dae>(
     context: AlgorithmStatementContext<'_, '_, 'dae>,
     call: AlgorithmFunctionCall<'_>,
 ) -> Result<Vec<(VarName, dae::ExprId<'dae>)>, dae::DaeConstructionError> {
+    if call.plan.terminal_print {
+        lower_algorithm_print(construction, owner, context, &call)?;
+        return Ok(Vec::new());
+    }
     lower_algorithm_function_call(
         construction,
         discrete_values,
@@ -646,13 +716,34 @@ fn lower_algorithm_assertion<'dae>(
         })?;
         return Ok(());
     }
-    let (condition, _) = lower_condition(
-        construction,
-        environment.coordinates,
-        environment.functions,
-        environment.sample_lattices,
-        condition,
-    )?;
+    // MLS 3.7 §11.2.7 and §8.6: a when body runs only on its activation, so a
+    // relation in an assertion there is evaluated only at that event and is not
+    // a crossing function. As the when-equation body does
+    // (`lower_body_condition`), it lowers to a discrete value with no relation
+    // roots; only an unconditional algorithm assertion keeps them.
+    let condition = if activation.always {
+        lower_condition(
+            construction,
+            environment.coordinates,
+            environment.functions,
+            environment.sample_lattices,
+            condition,
+        )?
+        .0
+    } else {
+        let value = lower_expression(
+            construction,
+            environment.coordinates,
+            environment.functions,
+            condition,
+            None,
+        )?;
+        let lowered = construction.conditions(|conditions| conditions.reserve(provenance))?;
+        construction.conditions(|conditions| {
+            conditions.define(lowered, dae::ConditionInput::Discrete(value), provenance)
+        })?;
+        lowered
+    };
     let failed = negate_condition(construction, condition, span)?;
     // An unconditional activation contributes nothing to conjoin: the failure
     // condition alone is the action guard.
@@ -721,6 +812,7 @@ fn lower_algorithm_if<'dae>(
             condition_span,
             span,
         )?;
+        discrete_values.register_algorithm_guard(owner.discrete_owner, guard)?;
         if let Some(clock) = guard.owner_clock {
             own_clocked_algorithm_targets(
                 construction,
@@ -1005,6 +1097,7 @@ fn lower_algorithm_else<'dae>(
         None => always_condition(construction, span)?,
     };
     let guard = algorithm_if_guard(construction, owner.parent, available, None, span, span)?;
+    discrete_values.register_algorithm_guard(owner.discrete_owner, guard)?;
     lower_algorithm_statements(
         construction,
         discrete_values,
@@ -1028,15 +1121,24 @@ fn lower_algorithm_when<'dae>(
     blocks: &[rumoca_core::StatementBlock],
     span: Span,
 ) -> Result<(), dae::DaeConstructionError> {
+    let owner_clock = chain_owner_clock(
+        blocks
+            .iter()
+            .map(|block| condition_owner_clock(environment.functions, &block.cond))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     let mut guarded_blocks = Vec::with_capacity(blocks.len());
     for block in blocks {
-        let (condition, owner_clock) = lower_condition(
+        let (mut condition, block_clock) = lower_condition(
             construction,
             environment.coordinates,
             environment.functions,
             environment.sample_lattices,
             &block.cond,
         )?;
+        if block_clock.is_some() && owner_clock.is_none() {
+            condition = unowned_tick_activation(construction, condition, span)?;
+        }
         // MLS §8.3.5 activates each branch of a `when`/`elsewhen` chain on its
         // own rising edge; the textual order of the branches resolves the
         // simultaneous ones. See `lower_chain_guards` for the equation form —
@@ -1097,20 +1199,253 @@ fn lower_algorithm_when<'dae>(
             )?;
         }
     }
-    for (block, guard) in guarded_blocks {
-        let mut branch_values = values.clone();
-        lower_algorithm_statements(
+    let holds = chain_holds(environment.coordinates, blocks, span)?.into_iter();
+    for ((block, guard), held) in guarded_blocks.iter().zip(holds) {
+        discrete_values.register_algorithm_guard(owner.discrete_owner, *guard)?;
+        lower_algorithm_when_block(
             construction,
             discrete_values,
             environment,
             AlgorithmOwner {
-                parent: Some(guard),
+                parent: Some(*guard),
                 span,
                 ..owner
             },
-            &mut branch_values,
+            values.clone(),
             &block.stmts,
+            &held,
         )?;
     }
+    retain_chain_values(discrete_values, owner.discrete_owner, &guarded_blocks)?;
+    Ok(())
+}
+
+/// Discrete-value targets of one `when`/`elsewhen` chain: every block retains
+/// every target, so an active earlier block wins even where it assigns nothing
+/// (MLS 3.7 §§11.1.2, 11.2.7). Discrete `Real` targets are held per block by
+/// [`lower_algorithm_when_block`].
+fn retain_chain_values<'dae>(
+    discrete_values: &mut DiscreteValueStaging<'dae>,
+    owner: Option<DiscreteValueOwnerHandle>,
+    guarded_blocks: &[(&rumoca_core::StatementBlock, EventGuard<'dae>)],
+) -> Result<(), dae::DaeConstructionError> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let guards = guarded_blocks
+        .iter()
+        .map(|(_, guard)| *guard)
+        .collect::<Vec<_>>();
+    discrete_values.retain_when_branches(owner, &guards)
+}
+
+/// The targets each block of one algorithm `when`/`elsewhen` chain must hold
+/// (see [`later_block_targets`]), resolved to model coordinates.
+///
+/// An event action in a later block is refused: an earlier block becoming
+/// active at the same instant must suppress it (MLS §8.3.5), and a guard cannot
+/// yet name another block's rising edge.
+fn chain_holds(
+    coordinates: &HashMap<VarName, Coordinate<'_>>,
+    blocks: &[rumoca_core::StatementBlock],
+    span: Span,
+) -> Result<Vec<Vec<VarName>>, dae::DaeConstructionError> {
+    if let Some(span) = blocks
+        .iter()
+        .skip(1)
+        .find_map(|block| later_block_action(&block.stmts))
+    {
+        return Err(dae::DaeConstructionError::UnsupportedLaterWhenAction { span });
+    }
+    later_block_targets(blocks)
+        .into_iter()
+        .map(|names| resolve_held_targets(coordinates, names, span))
+        .collect()
+}
+
+/// The first event action (not an assignment) in a block's statements.
+fn later_block_action(statements: &[rumoca_core::Statement]) -> Option<Span> {
+    statements.iter().find_map(|statement| match statement {
+        rumoca_core::Statement::Reinit { span, .. }
+        | rumoca_core::Statement::Assert { span, .. } => Some(*span),
+        rumoca_core::Statement::FunctionCall { outputs, span, .. }
+            if outputs.iter().all(Option::is_none) =>
+        {
+            Some(*span)
+        }
+        rumoca_core::Statement::If {
+            cond_blocks,
+            else_block,
+            ..
+        } => cond_blocks
+            .iter()
+            .find_map(|block| later_block_action(&block.stmts))
+            .or_else(|| else_block.as_deref().and_then(later_block_action)),
+        rumoca_core::Statement::For { equations, .. } => later_block_action(equations),
+        rumoca_core::Statement::While { block, .. } => later_block_action(&block.stmts),
+        _ => None,
+    })
+}
+
+/// Resolve written base names to the model coordinates they write: the name
+/// itself, or every coordinate it overlaps (a record's fields).
+fn resolve_held_targets(
+    coordinates: &HashMap<VarName, Coordinate<'_>>,
+    names: Vec<VarName>,
+    span: Span,
+) -> Result<Vec<VarName>, dae::DaeConstructionError> {
+    let mut resolved = Vec::with_capacity(names.len());
+    for name in names {
+        if coordinates.contains_key(&name) {
+            resolved.push(name);
+            continue;
+        }
+        let mut leaves = coordinates
+            .keys()
+            .filter(|key| names_overlap(&name, key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if leaves.is_empty() {
+            return Err(dae::DaeConstructionError::UnresolvedAlgorithmHoldTarget {
+                target: name,
+                span,
+            });
+        }
+        leaves.sort_by(|lhs, rhs| lhs.as_str().cmp(rhs.as_str()));
+        resolved.extend(leaves);
+    }
+    resolved.sort_by(|lhs, rhs| lhs.as_str().cmp(rhs.as_str()));
+    resolved.dedup();
+    Ok(resolved)
+}
+
+/// For each block of one `when`/`elsewhen` chain, the targets a LATER block writes.
+///
+/// MLS §8.3.5: when several blocks of the chain become active at one instant,
+/// only the first runs. Definitions resolve that per target in textual order,
+/// which is exact only if the earlier block defines the target too: an
+/// equation chain always does, an algorithm block need not. Each block
+/// therefore holds every later-written target it does not otherwise change.
+fn later_block_targets(blocks: &[rumoca_core::StatementBlock]) -> Vec<Vec<VarName>> {
+    let writes = blocks
+        .iter()
+        .map(|block| {
+            let mut written = HashSet::new();
+            collect_algorithm_writes(&block.stmts, &mut written);
+            written
+        })
+        .collect::<Vec<_>>();
+    (0..blocks.len())
+        .map(|index| {
+            let mut later = writes[index + 1..]
+                .iter()
+                .flatten()
+                .cloned()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            later.sort_by(|lhs, rhs| lhs.as_str().cmp(rhs.as_str()));
+            later
+        })
+        .collect()
+}
+
+/// Lower one `when`/`elsewhen` block, then issue one definition per discrete
+/// `Real` it writes, from its value after the block's last statement
+/// (MLS §11.1.2).
+///
+/// `held` are the targets a later block of the chain writes. The block holds
+/// each discrete `Real` among them at its entry value (`pre`) unless it writes
+/// it, so that when this block is active a later block's definition cannot win.
+/// Discrete-value targets get the same guarantee from the chain's
+/// `retain_when_branches`, so they are not held here.
+fn lower_algorithm_when_block<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    discrete_values: &mut DiscreteValueStaging<'dae>,
+    environment: AlgorithmEnvironment<'_, '_, 'dae>,
+    owner: AlgorithmOwner<'dae>,
+    mut branch_values: HashMap<VarName, dae::ExprId<'dae>>,
+    statements: &[rumoca_core::Statement],
+    held: &[VarName],
+) -> Result<(), dae::DaeConstructionError> {
+    let deferred = RefCell::new(Vec::new());
+    let activation = owner.activation();
+    for target in held {
+        if let Some(Coordinate::DiscreteReal(_)) = environment.coordinates.get(target) {
+            deferred
+                .borrow_mut()
+                .push((target.clone(), activation.branch_provenance));
+        }
+    }
+    lower_algorithm_statements(
+        construction,
+        discrete_values,
+        AlgorithmEnvironment {
+            deferred_reals: Some(&deferred),
+            ..environment
+        },
+        owner,
+        &mut branch_values,
+        statements,
+    )?;
+    for (target, provenance) in deferred.into_inner() {
+        let value = *branch_values.get(&target).ok_or_else(|| {
+            dae::DaeConstructionError::MissingAlgorithmBlockValue {
+                target: target.clone(),
+                span: provenance.span(),
+            }
+        })?;
+        lower_when_assignment(
+            construction,
+            discrete_values,
+            owner.discrete_owner,
+            environment.coordinates[&target],
+            owner.activation(),
+            value,
+            provenance,
+        )?;
+    }
+    Ok(())
+}
+
+/// Lower one terminal print (MLS 3.7 §12.9) to the event action that reports
+/// its message each time its `when` activation is active. An impure call is
+/// legal only inside a `when` statement of a model algorithm (MLS §12.3).
+fn lower_algorithm_print<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    owner: AlgorithmOwner<'dae>,
+    context: AlgorithmStatementContext<'_, '_, 'dae>,
+    call: &AlgorithmFunctionCall<'_>,
+) -> Result<(), dae::DaeConstructionError> {
+    let activation = owner.activation();
+    if activation.always {
+        return Err(dae::DaeConstructionError::IllegalImpureCallContext {
+            name: call.component.var_name().clone(),
+            span: call.span,
+        });
+    }
+    let Some(message) = call.arguments.first() else {
+        return Err(dae::DaeConstructionError::InvalidArity {
+            expected: 1,
+            found: 0,
+            span: call.span,
+        });
+    };
+    let message = lower_expression(
+        construction,
+        context.coordinates,
+        context.functions,
+        message,
+        None,
+    )?;
+    let provenance = dae::DaeProvenance::source(call.span)?;
+    construction.events(|events| {
+        events.print(
+            activation.trigger,
+            activation.condition,
+            message,
+            provenance,
+        )
+    })?;
     Ok(())
 }

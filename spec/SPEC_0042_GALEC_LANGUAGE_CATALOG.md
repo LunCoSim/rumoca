@@ -45,13 +45,13 @@ governing rules.
 | # | Trap | Emitter consequence |
 |---|------|---------------------|
 | T1 | Methods are parameter-free; I/O via `self.*` | Never emit parameters on block interface methods |
-| T2 | `previous()`/`derivative()` are NOT operators — only quoted-name conventions for materialized state | `pre(x)` lowers to `'previous(x)'` state assigned at END of DoStep; `firstTick` for first-sample behavior |
+| T2 | `previous()`/`derivative()` are NOT operators — only quoted-name conventions for materialized state | `pre(x)` lowers to `'previous(x)'` state. DoStep runs the sampled actions on their entry snapshots, commits the previous values equation-section definitions read, assigns those definitions (the settled event, MLS 3.7.5), then commits the rest; `firstTick` for first-sample behavior |
 | T3 | min/max ranges saturate (implicit `limit self` at method entry/return; Startup: return only); no assertions exist | Opposite of Modelica semantics; `limit` leaves qNaN as qNaN |
-| T4 | Unary minus binds only to references: `a := -b^2` means `(-b)^2`; `-(b^2)`, `-f(x)` don't parse | Template renders the checked semantic rewrite as `0.0 - (expr)` or `(-1.0)*(expr)` |
+| T4 | Unary minus binds only to references: `a := -b^2` means `(-b)^2`; `-(b^2)`, `-f(x)` don't parse | Template renders the checked semantic rewrite as `(-1.0)*(expr)`, which keeps the sign of zero; `0.0 - (expr)` maps `+0.0` to `+0.0` and is not used for Real |
 | T5 | No implicit Integer↔Real promotion; equal-typed operands; `/` Real-only; no `%`; `^` returns Real | Insert explicit `real()`/`integer()` casts during lowering |
 | T6 | Cross-precedence-class mixes need explicit parentheses (`a^2*b` invalid); evaluation order normative (no re-association, even `a+b+c`) | Parenthesize every cross-class mix; preserve order end-to-end |
 | T7 | Real literals: decimal places and exponent sign mandatory (`1.0e+5` ✓; `1e5`, `1.`, `.5`, `1.0e5` ✗); `//` comments invalid | Strict literal formatter |
-| T8 | `absolute`/`ln`/`lg`/`roundDown`/`roundUp`/`imin`/`imax`, not `abs`/`log`/`log10`/`floor`/`ceil`/Integer min-max; `min`/`max` 2-arg scalar Real only; no array reductions; `atan2(y,x)`; `sign` returns Real; GALEC `integer()` truncates toward zero and can signal, so MLS floor conversion lowers as `integer(roundDown(x))`; `mod` → reserved `remainderDown`, not callable in Beta-1 | §3.2.6 mapping table is normative; unlowerable ops get stable `unsupported-feature` diagnostics |
+| T8 | `absolute`/`ln`/`lg`/`roundDown`/`roundUp`/`imin`/`imax`, not `abs`/`log`/`log10`/`floor`/`ceil`/Integer min-max; `min`/`max` 2-arg scalar Real only; no array reductions; `atan2(y,x)`; `sign` and `absolute` take and return Real, so MLS Integer-typed `sign(v)` (either operand type) and `abs(i)` lower as `integer(sign(x))` and `integer(absolute(real(i)))`, exact because the Real result is an integer value; GALEC `integer()` truncates toward zero and can signal, so MLS floor conversion lowers as `integer(roundDown(x))`; `mod` → reserved `remainderDown`, not callable in Beta-1 | §3.2.6 mapping table is normative; unlowerable ops get stable `unsupported-feature` diagnostics |
 | T9 | Relational operators on qNaN signal NAN and return false — comparisons are side-effecting | Escape sets account NAN for any Real comparison (slice 2, D8) |
 | T10 | Signal checks catch (unset before the branch); `signals` clause must EXACTLY equal the computed escape set; testing an unsettable/caught signal is a compile error | Signal dataflow mandatory in the validator |
 | T11 | No `while`/`break`/`return`/`String`/enumerations (reserved words only); loop bounds, dims, subscripts statically evaluable | No runtime-computed subscripts |
@@ -62,7 +62,12 @@ governing rules.
 ### 3. Rule Rationale (SPEC_0034 GAL-016, GAL-024)
 
 **GAL-016.** GALEC has no `previous()`/`sample()` (T2); `pre(x)` becomes
-protected state `'previous(x)'` committed at end of DoStep; the sample period is a
+protected state `'previous(x)'`, committed once per DoStep. Sampled actions read
+the entry snapshot; an equation-section definition outside any `when` publishes
+the settled event, where event iteration has made `pre(x)` equal `x` (MLS
+3.7.5), so the previous values it reads are committed before it and the others
+after it; one reading the previous value of a variable those definitions
+assign is refused (`pre-of-causal-definition`); the sample period is a
 `constant` (seconds) named by the XSD-strict manifest `<Clock>` (§3.1.2).
 
 **GAL-024.** The manifest LogicalData mapping (every interface variable and

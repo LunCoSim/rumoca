@@ -78,6 +78,7 @@ fn validate_function_loop_domain(
             ));
         };
         binders.push(StructuredIndexBinder {
+            provenance: index.binder,
             id: ordinal,
             display_name: index.ident.clone(),
             lower,
@@ -172,6 +173,7 @@ fn validate_nested_function_loop(
         &statements,
         context.function,
         &validated.shapes,
+        context.inside_fold,
     );
     Ok(Some(FunctionStatementPlan::For {
         domain: validated.domain,
@@ -192,6 +194,7 @@ fn validate_function_loop_body(
         roles: &validated.roles,
         shapes: &validated.shapes,
         call_scoped_actions: true,
+        inside_fold: true,
         ..context
     };
     let statements = plan_function_statements(equations, body_context)?;
@@ -207,20 +210,21 @@ fn validate_function_loop_body(
                 | FunctionStatementPlan::ProvenAssertion
                 | FunctionStatementPlan::RuntimeAssertion
                 | FunctionStatementPlan::MultiOutputCall { .. }
+                | FunctionStatementPlan::GeneratedBooleanAssignment { .. }
                 | FunctionStatementPlan::For { .. }
                 | FunctionStatementPlan::If { .. }
                 | FunctionStatementPlan::ProvenBranch { .. }
         ) {
             continue;
         }
-        let statement_span = required_statement_span(statement, "function loop body statement")?;
-        return Err(ToDaeError::unsupported_flat(
+        return Err(unsupported_statement(
+            statement,
+            "function loop body statement",
             "function loop transition",
             format!(
                 "`{}` requires direct value assignments or assertions in a loop body",
                 context.function.name
             ),
-            statement_span,
         ));
     }
     // An assertion-only loop has no value transition, but it still owns one
@@ -236,6 +240,7 @@ fn validate_function_loop_body(
         &statements,
         context.function,
         &validated.shapes,
+        context.inside_fold,
     );
     Ok(FunctionStatementPlan::For {
         domain: validated.domain,
@@ -253,16 +258,22 @@ fn classify_function_loop(
     plans: &[FunctionStatementPlan],
     function: &rumoca_core::Function,
     shapes: &ShapeEnvironment,
+    inside_fold: bool,
 ) -> FunctionLoopLowering {
     let targets = function_loop_targets(plans);
-    if loop_is_ordered_total_array_definitions(
-        domain, indices, statements, plans, function, shapes, &targets,
-    ) {
+    if !inside_fold
+        && loop_is_ordered_total_array_definitions(
+            domain, indices, statements, plans, function, shapes, &targets,
+        )
+    {
         FunctionLoopLowering::TotalArrayDefinition
     } else {
         FunctionLoopLowering::Fold {
             targets,
             iteration_locals: Vec::new(),
+            selected_entry: None,
+            entry_reads: Vec::new(),
+            entry_seeds: Vec::new(),
         }
     }
 }
@@ -490,17 +501,32 @@ pub(in crate::construction) fn flattened_function_loop_source<'statement>(
     (flattened, statements)
 }
 
+/// The values one iteration of this loop writes.
+///
+/// A generated branch selection is certified to be defined and read only in
+/// the sequence that holds its definition, so it belongs to the innermost loop
+/// whose body holds that definition and is never a value of an enclosing loop.
+/// A mutable function exit state escapes each nested loop and remains carried.
 fn function_loop_targets(plans: &[FunctionStatementPlan]) -> Vec<VarName> {
+    loop_targets(plans, true)
+}
+
+fn loop_targets(plans: &[FunctionStatementPlan], own_generated: bool) -> Vec<VarName> {
     let mut targets = Vec::new();
     for plan in plans {
         match plan {
             FunctionStatementPlan::Assignment(assignment) => {
                 extend_unique_targets(&mut targets, [assignment.target().clone()]);
             }
+            FunctionStatementPlan::GeneratedBooleanAssignment {
+                target, mutable, ..
+            } if own_generated || *mutable => {
+                extend_unique_targets(&mut targets, [target.clone()]);
+            }
             FunctionStatementPlan::RecordAssembly(assembly) => {
                 extend_unique_targets(&mut targets, [assembly.target.clone()]);
             }
-            FunctionStatementPlan::MultiOutputCall { outputs } => {
+            FunctionStatementPlan::MultiOutputCall { outputs, .. } => {
                 extend_unique_targets(
                     &mut targets,
                     outputs
@@ -514,18 +540,18 @@ fn function_loop_targets(plans: &[FunctionStatementPlan]) -> Vec<VarName> {
             } => {
                 let mut branch_targets = branches
                     .iter()
-                    .flat_map(|branch| function_loop_targets(branch))
+                    .flat_map(|branch| loop_targets(branch, own_generated))
                     .collect::<Vec<_>>();
                 if let Some(fallback) = fallback {
-                    branch_targets.extend(function_loop_targets(fallback));
+                    branch_targets.extend(loop_targets(fallback, own_generated));
                 }
                 extend_unique_targets(&mut targets, branch_targets);
             }
             FunctionStatementPlan::ProvenBranch { statements, .. } => {
-                extend_unique_targets(&mut targets, function_loop_targets(statements));
+                extend_unique_targets(&mut targets, loop_targets(statements, own_generated));
             }
             FunctionStatementPlan::For { statements, .. } => {
-                extend_unique_targets(&mut targets, function_loop_targets(statements));
+                extend_unique_targets(&mut targets, loop_targets(statements, false));
             }
             _ => {}
         }

@@ -84,6 +84,29 @@ pub enum VisitScope<'a> {
     ArrayComprehension(&'a [ForIndex]),
 }
 
+fn walk_comprehension_scopes<V: Visitor + ?Sized>(
+    visitor: &mut V,
+    expr: &Expression,
+    indices: &[ForIndex],
+    filter: Option<&Expression>,
+) -> ControlFlow<()> {
+    if let Some((index, remaining)) = indices.split_last() {
+        visitor.visit_for_index(index)?;
+        visitor.enter_scope(VisitScope::ArrayComprehension(std::slice::from_ref(index)))?;
+        let result = walk_comprehension_scopes(visitor, expr, remaining, filter);
+        finish_scope(
+            result,
+            visitor.exit_scope(VisitScope::ArrayComprehension(std::slice::from_ref(index))),
+        )
+    } else {
+        visitor.visit_expression(expr)?;
+        if let Some(filter) = filter {
+            visitor.visit_expression(filter)?;
+        }
+        Continue(())
+    }
+}
+
 /// Default recursion for function calls with context-aware call-target traversal.
 pub fn walk_expr_function_call_ctx_default<V: Visitor + ?Sized>(
     visitor: &mut V,
@@ -185,21 +208,7 @@ pub fn walk_expression_default<V: Visitor + ?Sized>(
             indices,
             filter,
             ..
-        } => {
-            visitor.visit_each(indices, V::visit_for_index)?;
-            visitor.enter_scope(VisitScope::ArrayComprehension(indices))?;
-            let result = (|| {
-                visitor.visit_expression(expr)?;
-                if let Some(f) = filter {
-                    visitor.visit_expression(f)?;
-                }
-                Continue(())
-            })();
-            finish_scope(
-                result,
-                visitor.exit_scope(VisitScope::ArrayComprehension(indices)),
-            )
-        }
+        } => walk_comprehension_scopes(visitor, expr, indices, filter.as_deref()),
         Expression::ArrayIndex {
             base, subscripts, ..
         } => {
@@ -221,7 +230,7 @@ pub fn walk_equation_default<V: Visitor + ?Sized>(
     match eq {
         Equation::Empty => Continue(()),
         Equation::Simple { lhs, rhs } => visitor.visit_simple_equation(lhs, rhs),
-        Equation::Connect { lhs, rhs } => visitor.visit_connect(lhs, rhs),
+        Equation::Connect { lhs, rhs, .. } => visitor.visit_connect(lhs, rhs),
         Equation::For { indices, equations } => visitor.visit_for_equation(indices, equations),
         Equation::When(blocks) => visitor.visit_when_equation(blocks),
         Equation::If {
@@ -334,6 +343,10 @@ pub fn walk_class_def_default<V: Visitor + ?Sized>(
         }
         for ext in &class.extends {
             visitor.visit_extend(ext)?;
+        }
+        for modification in &class.constraining_modifications {
+            visitor
+                .visit_expression_ctx(&modification.expr, ExpressionContext::ExtendModification)?;
         }
         visitor.visit_each(&class.imports, V::visit_import)?;
         for subscript in &class.array_subscripts {

@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 
 use lsp_types::{Position, Url};
 use rumoca_compile::codegen::targets::{TargetBundle, TargetTemplateSource};
+use rumoca_compile::source_roots::decode_source_root_snapshot;
 use rumoca_compile::{Session, SessionConfig};
 use rumoca_core::{PhaseError, SourceMap};
 use rumoca_phase_parse_galec::parse as parse_galec;
@@ -57,7 +58,33 @@ pub fn init() {
 /// (Algorithm Code only). Failure shape: `{ "ok": false, "error": "<msg>" }`.
 #[wasm_bindgen]
 pub fn render_galec(workspace_sources: &str, model_name: &str, target: &str) -> String {
-    let value = match render_galec_impl(workspace_sources, model_name, target) {
+    render_galec_response(render_galec_impl(
+        workspace_sources,
+        model_name,
+        target,
+        None,
+    ))
+}
+
+/// Render with a compiler-issued portable source-root snapshot.
+/// Invalid snapshots are refused before model compilation.
+#[wasm_bindgen]
+pub fn render_galec_with_source_roots_binary(
+    workspace_sources: &str,
+    model_name: &str,
+    target: &str,
+    source_roots: &[u8],
+) -> String {
+    render_galec_response(render_galec_impl(
+        workspace_sources,
+        model_name,
+        target,
+        Some(source_roots),
+    ))
+}
+
+fn render_galec_response(result: Result<Value, String>) -> String {
+    let value = match result {
         Ok(value) => value,
         Err(error) => json!({ "ok": false, "error": error }),
     };
@@ -161,20 +188,21 @@ fn render_galec_c_from_alg_impl(
     let source = bundle
         .template_source("model.c.jinja")
         .map_err(|error| error.to_string())?;
-    let c_header = rumoca_phase_codegen::render_checked_algorithm_block_template_with_artifact(
-        &checked,
-        &artifact,
-        header.as_ref(),
-        &model_id,
-    )
-    .map_err(|error| error.to_string())?;
-    let c_source = rumoca_phase_codegen::render_checked_algorithm_block_template_with_artifact(
-        &checked,
-        &artifact,
-        source.as_ref(),
-        &model_id,
-    )
-    .map_err(|error| error.to_string())?;
+    // The C targets print from the block's Solve refinement (#483), refused
+    // with a typed error before any file is rendered.
+    let manifest = bundle.parse_manifest().map_err(|error| error.to_string())?;
+    let refined = refine(&edited_package(&checked)?, &manifest)?;
+    // An edited block carries no start values, so it renders from the
+    // checked-block view (as before) plus its Solve refinement.
+    let sources = SourceMap::new();
+    let render = |template: &str| {
+        rumoca_phase_codegen::render_checked_algorithm_block_template_with_solve(
+            &checked, &refined, &sources, &artifact, template, &model_id,
+        )
+        .map_err(|error| error.to_string())
+    };
+    let c_header = render(header.as_ref())?;
+    let c_source = render(source.as_ref())?;
     Ok(json!({
         "ok": true,
         "target": target,
@@ -188,6 +216,7 @@ fn render_galec_impl(
     workspace_sources: &str,
     model_name: &str,
     target: &str,
+    source_roots: Option<&[u8]>,
 ) -> Result<Value, String> {
     // 1. Load every workspace document into an in-memory Session, then compile
     //    the requested (resolved) model across all of them — a model defined in
@@ -200,6 +229,11 @@ fn render_galec_impl(
     }
     let mut session = Session::new(SessionConfig::default());
     let mut source_map = SourceMap::new();
+    if let Some(bytes) = source_roots {
+        let parsed = decode_source_root_snapshot(bytes)
+            .map_err(|error| format!("invalid source-root cache: {error:#}"))?;
+        session.add_in_memory_parsed_batch(parsed);
+    }
     for (path, content) in &documents {
         source_map.add(path, content);
         session
@@ -207,14 +241,19 @@ fn render_galec_impl(
             .map_err(|error| format!("failed to load `{path}`: {error}"))?;
     }
     let result = session
-        .compile_model(model_name)
+        .compile_model_dae_strict_reachable_uncached_with_recovery(model_name)
         .map_err(|error| format!("compilation error: {error}"))?;
 
     // 2. Delegate to the shared identity-free renderer (validates the target,
     //    projects to GALEC, and renders the .alg + C with the target's
     //    conformance header). GALEC identifiers/C names cannot contain dots.
     let model_id = model_name.replace('.', "_");
-    let sources = render_checked_sources(&result.dae, &source_map, &model_id, target)?;
+    let sources = render_checked_sources(
+        &result.dae,
+        result.source_map.as_ref().unwrap_or(&source_map),
+        &model_id,
+        target,
+    )?;
 
     Ok(json!({
         "ok": true,
@@ -326,6 +365,13 @@ fn render_checked_sources(
         c_header: String::new(),
         c_source: String::new(),
     };
+    // A C target prints from the package's Solve refinement (#483), refused
+    // with a typed error before any file is rendered.
+    let c_renderer = if matches!(target, EMBEDDED_C_GALEC_TARGET | GALEC_PRODUCTION_TARGET) {
+        Some(solve_renderer(&package, &manifest, source_map)?)
+    } else {
+        None
+    };
     for file in &manifest.files {
         let extension = std::path::Path::new(&file.path)
             .extension()
@@ -336,12 +382,17 @@ fn render_checked_sources(
         let source = bundle
             .template_source(&file.template)
             .map_err(|error| error.to_string())?;
-        let content = rumoca_phase_codegen::render_algorithm_code_template_with_artifact(
-            &package,
-            &artifact,
-            source.as_ref(),
-            model_id,
-        )
+        let content = match (&c_renderer, extension) {
+            (Some(renderer), Some("h" | "c")) => {
+                renderer.render_with_name_and_artifact(source.as_ref(), model_id, &artifact)
+            }
+            _ => rumoca_phase_codegen::render_algorithm_code_template_with_artifact(
+                &package,
+                &artifact,
+                source.as_ref(),
+                model_id,
+            ),
+        }
         .map_err(|error| error.to_string())?;
         match extension {
             Some("alg") => rendered.alg = content,
@@ -351,6 +402,67 @@ fn render_checked_sources(
         }
     }
     Ok(rendered)
+}
+
+/// The renderer for a C target: the package's refinement under the target's
+/// arithmetic profile, refused with a typed error before any output.
+fn solve_renderer(
+    package: &rumoca_ir_galec::package::AlgorithmCodePackage,
+    manifest: &rumoca_compile::codegen::targets::TargetManifest,
+    sources: &SourceMap,
+) -> Result<rumoca_compile::codegen::AlgorithmCodeTemplateRenderer, String> {
+    let block = refine(package, manifest)?;
+    rumoca_compile::codegen::AlgorithmCodeTemplateRenderer::with_solve_block(
+        package, &block, sources,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// A package's refinement under the target's arithmetic profile, refused
+/// with a typed error before any output.
+fn refine(
+    package: &rumoca_ir_galec::package::AlgorithmCodePackage,
+    manifest: &rumoca_compile::codegen::targets::TargetManifest,
+) -> Result<rumoca_ir_solve::SolveAlgorithmBlock, String> {
+    let profile = manifest
+        .algorithm_block_profile()
+        .map_err(|error| error.to_string())?;
+    rumoca_phase_solve::lower_algorithm_block(package, profile)
+        .map_err(|error| format!("Solve refinement refused the block before any output: {error}"))
+}
+
+/// The package of an edited `.alg` block: its clock reference is the
+/// `clockSamplePeriod<n>` constant the projection appends, else its first
+/// constant or tunable parameter.
+fn edited_package(
+    checked: &rumoca_ir_galec::package::CheckedAlgorithmBlock,
+) -> Result<rumoca_ir_galec::package::AlgorithmCodePackage, String> {
+    use rumoca_ir_galec::ast::{InterfaceKind, ProtectedKind};
+    let block = checked.block().clone();
+    let constants = block
+        .protected
+        .iter()
+        .filter(|entity| matches!(entity.kind, ProtectedKind::Constant))
+        .map(|entity| entity.decl.name.lexeme().to_owned());
+    let tunables = block
+        .interface
+        .iter()
+        .filter(|variable| matches!(variable.kind, InterfaceKind::TunableParameter))
+        .map(|variable| variable.decl.name.lexeme().to_owned());
+    let candidates = constants.chain(tunables).collect::<Vec<_>>();
+    let clock = candidates
+        .iter()
+        .rfind(|name| name.starts_with("clockSamplePeriod"))
+        .or_else(|| candidates.first())
+        .cloned()
+        .ok_or_else(|| "the edited block declares no clock period to refine against".to_owned())?;
+    let declarations = block.interface.len() + block.protected.len();
+    rumoca_ir_galec::package::AlgorithmCodePackage::construct(
+        block,
+        vec![None; declarations],
+        &clock,
+    )
+    .map_err(|error| format!("the edited block is not a valid package: {error:?}"))
 }
 
 #[cfg(test)]
@@ -394,6 +506,79 @@ end GalecWasmDemo;
             .rsplit_once('\n')
             .map_or(prefix.len(), |(_, tail)| tail.len()) as u32;
         (line, character)
+    }
+
+    #[test]
+    fn galec_source_root_snapshot_supplies_the_authored_function() {
+        let library = "package Imported function twice input Real x; output Real y; algorithm y := 2*x; end twice; model Broken extends Missing; end Broken; end Imported;";
+        let bytes = rumoca_compile::source_roots::encode_source_root_snapshot(&[(
+            "library/Imported.mo".to_owned(),
+            library.to_owned(),
+        )])
+        .unwrap();
+        let source = DISCRETE_SOURCE.replace("gain * count", "Imported.twice(count)");
+        let documents = workspace("input.mo", &source);
+        let missing = parse(&render_galec(
+            &documents,
+            "GalecWasmDemo",
+            GALEC_PRODUCTION_TARGET,
+        ));
+        assert_eq!(
+            missing["ok"], false,
+            "a missing authored library must not resolve"
+        );
+        let imported = parse(&render_galec_with_source_roots_binary(
+            &documents,
+            "GalecWasmDemo",
+            GALEC_PRODUCTION_TARGET,
+            &bytes,
+        ));
+        assert_eq!(imported["ok"], true, "{imported}");
+        let selected_invalid = parse(&render_galec_with_source_roots_binary(
+            &documents,
+            "Imported.Broken",
+            GALEC_PRODUCTION_TARGET,
+            &bytes,
+        ));
+        assert_eq!(
+            selected_invalid["ok"], false,
+            "reachable invalid sources must remain refused"
+        );
+        assert!(
+            selected_invalid["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("compilation error:")),
+            "the selected invalid class must fail compilation before target projection: {selected_invalid}"
+        );
+
+        assert!(
+            imported["alg"]
+                .as_str()
+                .is_some_and(|text| text.contains("DoStep"))
+        );
+        assert!(
+            imported["c_source"]
+                .as_str()
+                .is_some_and(|text| text.contains("_dostep("))
+        );
+    }
+
+    #[test]
+    fn galec_source_root_snapshot_rejects_corrupt_or_empty_bytes() {
+        for bytes in [&[][..], &[0, 1, 2][..]] {
+            let refused = parse(&render_galec_with_source_roots_binary(
+                &workspace("input.mo", DISCRETE_SOURCE),
+                "GalecWasmDemo",
+                GALEC_TARGET,
+                bytes,
+            ));
+            assert_eq!(refused["ok"], false, "{refused}");
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("invalid source-root cache"))
+            );
+        }
     }
 
     #[test]
@@ -523,6 +708,77 @@ end GalecWasmDemo;
     }
 
     #[test]
+    fn both_c_paths_print_from_the_solve_refinement() {
+        // #483: every wasm C entry point renders DAE -> GALEC -> Solve IR -> C;
+        // the bit-31 fault flag exists only in the Solve-printed bodies.
+        for target in [EMBEDDED_C_GALEC_TARGET, GALEC_PRODUCTION_TARGET] {
+            let value = parse(&render_galec(
+                &workspace("input.mo", DISCRETE_SOURCE),
+                "GalecWasmDemo",
+                target,
+            ));
+            assert!(
+                value["c_source"]
+                    .as_str()
+                    .is_some_and(|source| source.contains(&galec_fault_macro())),
+                "{target}: {value}"
+            );
+        }
+        let alg = parse(&render_galec(
+            &workspace("input.mo", DISCRETE_SOURCE),
+            "GalecWasmDemo",
+            GALEC_TARGET,
+        ))["alg"]
+            .as_str()
+            .expect("alg string")
+            .to_owned();
+        let edited = parse(&render_galec_c_from_alg(
+            &alg,
+            "GalecWasmDemo.alg",
+            "GalecWasmDemo",
+            EMBEDDED_C_GALEC_TARGET,
+        ));
+        assert!(
+            edited["c_source"]
+                .as_str()
+                .is_some_and(|source| source.contains(&galec_fault_macro())),
+            "{edited}"
+        );
+    }
+
+    #[test]
+    fn an_edited_block_the_refinement_refuses_renders_no_c() {
+        // Negative control: GALEC's checker admits `Real ^ Integer`, but the
+        // reference evaluator does not, so Solve refuses it before any file.
+        let alg = parse(&render_galec(
+            &workspace("input.mo", DISCRETE_SOURCE),
+            "GalecWasmDemo",
+            GALEC_TARGET,
+        ))["alg"]
+            .as_str()
+            .expect("alg string")
+            .replace(
+                "self.y := self.gain * real(self.count);",
+                "self.y := self.gain ^ 2;",
+            );
+        assert!(alg.contains("self.gain ^ 2"), "the edit must apply:\n{alg}");
+        let value = parse(&render_galec_c_from_alg(
+            &alg,
+            "GalecWasmDemo.alg",
+            "GalecWasmDemo",
+            EMBEDDED_C_GALEC_TARGET,
+        ));
+        assert_eq!(value["ok"], false, "{value}");
+        assert!(
+            value["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("Solve refinement refused")),
+            "{value}"
+        );
+        assert!(value.get("c_source").is_none(), "{value}");
+    }
+
+    #[test]
     fn edited_alg_text_renders_c_without_modelica_source() {
         let value = parse(&render_galec(
             &workspace("input.mo", DISCRETE_SOURCE),
@@ -642,5 +898,12 @@ end ContinuousDemo;
         let rendered = projection_rejected_error(&[error], &source_map);
         assert!(rendered.contains("[EGT017]"), "{rendered}");
         assert!(rendered.contains("models/A.mo:2:3"), "{rendered}");
+    }
+
+    /// The C fault macro's name. It is spelled in parts because the source
+    /// scan for `RUMOCA_*` environment variables treats a quoted whole name
+    /// as one.
+    fn galec_fault_macro() -> String {
+        ["RUMOCA", "GALEC_FAULT"].join("_")
     }
 }

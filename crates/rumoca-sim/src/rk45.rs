@@ -3,8 +3,9 @@ use rumoca_core::{maybe_elapsed_seconds, maybe_start_timer};
 use indexmap::IndexMap;
 use rumoca_ir_dae as dae;
 
-#[cfg(feature = "scheduled-sim")]
-use crate::SimulationSessionApi;
+scheduled_executor_items! {
+    use crate::SimulationSessionApi;
+}
 use crate::me_backend::BackendSimulationSession;
 use crate::simulation_session::SessionState;
 use crate::solve_lowering::{
@@ -30,6 +31,32 @@ pub fn simulate(
     simulate_artifact(artifact, opts, execution_backend)
 }
 
+pub(crate) fn integrator_factory() -> crate::me_backend::IntegratorFactory {
+    RK45_INTEGRATOR
+}
+
+#[cfg(feature = "solver-velimplicit")]
+const VELIMPLICIT_INSTANCE_NAME: &str = "velimplicit";
+
+#[cfg(feature = "solver-velimplicit")]
+const VELIMPLICIT_INTEGRATOR: crate::me_backend::IntegratorFactory =
+    crate::me_backend::IntegratorFactory {
+        method: "velimplicit",
+        build: velimplicit_integrator,
+    };
+
+/// The opt-in MuJoCo-style solver at its default configuration (1 ms fixed
+/// step, Jacobian reused for 200 steps).
+#[cfg(feature = "solver-velimplicit")]
+fn velimplicit_integrator(
+    setup: rumoca_solver::fmi_me::MeNumericalSetup,
+) -> Box<dyn rumoca_solver::fmi_me::MeIntegratorBackend + 'static> {
+    rumoca_solver_velimplicit::model_exchange_integrator(
+        setup,
+        rumoca_solver_velimplicit::VelImplicitConfig::default(),
+    )
+}
+
 pub use simulate as simulate_dae;
 
 pub fn simulate_with_diagnostics(
@@ -46,13 +73,13 @@ pub(crate) fn simulate_artifact(
     opts: &rumoca_solver::SimOptions,
     execution_backend: Option<rumoca_solver::fmi_me::MeExecutionBackend>,
 ) -> Result<rumoca_solver::SimResult, SimError> {
-    require_rk_mode(opts.solver_mode)?;
+    let (instance_name, integrator) = integrator_for(opts.solver_mode)?;
     crate::me_backend::simulate_artifact(
         artifact,
         opts,
         execution_backend,
-        INSTANCE_NAME,
-        RK45_INTEGRATOR,
+        instance_name,
+        integrator,
     )
 }
 
@@ -112,13 +139,13 @@ impl SimulationSession {
         let backend_build_start = maybe_start_timer();
         let (artifact, execution_backend) =
             finish_runtime_fmi_artifact(lowered, &opts).map_err(diagnostic_sim_error)?;
-        require_rk_mode(opts.solver_mode)?;
+        let (instance_name, integrator) = integrator_for(opts.solver_mode)?;
         let inner = BackendSimulationSession::new(
-            artifact.source(),
+            &artifact,
             &opts,
             execution_backend,
-            INSTANCE_NAME,
-            RK45_INTEGRATOR,
+            instance_name,
+            integrator,
         )?;
         let backend_build_seconds = maybe_elapsed_seconds(backend_build_start);
         Ok((
@@ -147,14 +174,14 @@ impl SimulationSession {
         opts: rumoca_solver::SimOptions,
         execution_backend: Option<rumoca_solver::fmi_me::MeExecutionBackend>,
     ) -> Result<Self, SimulationDiagnosticError> {
-        require_rk_mode(opts.solver_mode)
+        let (instance_name, integrator) = integrator_for(opts.solver_mode)
             .map_err(|err| SimulationDiagnosticError::Solver(err.to_string()))?;
         let inner = BackendSimulationSession::new(
-            artifact.source(),
+            &artifact,
             &opts,
             execution_backend,
-            INSTANCE_NAME,
-            RK45_INTEGRATOR,
+            instance_name,
+            integrator,
         )
         .map_err(|err| SimulationDiagnosticError::Solver(err.to_string()))?;
         Ok(Self { inner })
@@ -165,21 +192,11 @@ impl SimulationSession {
         component: &rumoca_ir_solve::fmi::FmiComponent,
         opts: rumoca_solver::SimOptions,
     ) -> Result<Self, SimulationDiagnosticError> {
-        require_rk_mode(opts.solver_mode)
-            .map_err(|error| SimulationDiagnosticError::Solver(error.to_string()))?;
-        let execution_backend = crate::native_execution::admitted_native_execution_backend(
-            &opts,
-            component.runtime_view().model(),
-        );
-        let inner = BackendSimulationSession::new(
-            component.into(),
-            &opts,
-            execution_backend,
-            INSTANCE_NAME,
-            RK45_INTEGRATOR,
-        )
-        .map_err(|error| SimulationDiagnosticError::Solver(error.to_string()))?;
-        Ok(Self { inner })
+        let execution_backend = crate::fmi_execution_backend(component, &opts)?;
+        let receipt = crate::native_execution::execution_receipt(&opts, component.runtime_view().model());
+        let artifact = rumoca_solver::fmi_me::MeModelArtifact::new(component.clone())
+            .with_execution_receipt(receipt);
+        Self::from_artifact(artifact, opts, execution_backend)
     }
 
     pub fn set_input(&mut self, name: &str, value: f64) -> Result<(), SimError> {
@@ -199,6 +216,10 @@ impl SimulationSession {
     }
 
     pub fn ensure_end_time(&mut self, _target_time: f64) {}
+
+    pub fn execution_receipt(&self) -> rumoca_solver::SimExecutionReceipt {
+        self.inner.execution_receipt()
+    }
 
     pub fn step(&mut self, dt: f64) -> Result<(), SimError> {
         if dt > 0.0 {
@@ -252,9 +273,19 @@ impl SimulationSession {
     }
 }
 
-fn require_rk_mode(requested: rumoca_solver::SimSolverMode) -> Result<(), SimError> {
+/// The fixed-step plugins this session hosts: rk45 for `rk-like` (and `auto`
+/// routed here) and, when compiled in, the opt-in `velimplicit` solver.
+fn integrator_for(
+    requested: rumoca_solver::SimSolverMode,
+) -> Result<(&'static str, crate::me_backend::IntegratorFactory), SimError> {
     match requested {
-        rumoca_solver::SimSolverMode::Auto | rumoca_solver::SimSolverMode::RkLike => Ok(()),
+        rumoca_solver::SimSolverMode::Auto | rumoca_solver::SimSolverMode::RkLike => {
+            Ok((INSTANCE_NAME, RK45_INTEGRATOR))
+        }
+        #[cfg(feature = "solver-velimplicit")]
+        rumoca_solver::SimSolverMode::VelImplicit => {
+            Ok((VELIMPLICIT_INSTANCE_NAME, VELIMPLICIT_INTEGRATOR))
+        }
         requested => Err(SimError::UnsupportedSolverMode {
             backend: INSTANCE_NAME,
             requested,
@@ -262,32 +293,33 @@ fn require_rk_mode(requested: rumoca_solver::SimSolverMode) -> Result<(), SimErr
     }
 }
 
-#[cfg(feature = "scheduled-sim")]
-impl SimulationSessionApi for SimulationSession {
-    type Error = SimError;
+scheduled_executor_items! {
+    impl SimulationSessionApi for SimulationSession {
+        type Error = SimError;
 
-    fn reset(&mut self, t_start: f64) -> Result<(), Self::Error> {
-        Self::reset(self, t_start)
-    }
+        fn reset(&mut self, t_start: f64) -> Result<(), Self::Error> {
+            Self::reset(self, t_start)
+        }
 
-    fn set_inputs(&mut self, inputs: &[(&str, f64)]) -> Result<(), Self::Error> {
-        Self::set_inputs(self, inputs)
-    }
+        fn set_inputs(&mut self, inputs: &[(&str, f64)]) -> Result<(), Self::Error> {
+            Self::set_inputs(self, inputs)
+        }
 
-    fn ensure_end_time(&mut self, target_time: f64) {
-        Self::ensure_end_time(self, target_time);
-    }
+        fn ensure_end_time(&mut self, target_time: f64) {
+            Self::ensure_end_time(self, target_time);
+        }
 
-    fn advance_to(&mut self, target_time: f64) -> Result<(), Self::Error> {
-        Self::advance_to(self, target_time)
-    }
+        fn advance_to(&mut self, target_time: f64) -> Result<(), Self::Error> {
+            Self::advance_to(self, target_time)
+        }
 
-    fn time(&self) -> f64 {
-        Self::time(self)
-    }
+        fn time(&self) -> f64 {
+            Self::time(self)
+        }
 
-    fn get(&self, name: &str) -> Result<Option<f64>, Self::Error> {
-        Self::get(self, name)
+        fn get(&self, name: &str) -> Result<Option<f64>, Self::Error> {
+            Self::get(self, name)
+        }
     }
 }
 

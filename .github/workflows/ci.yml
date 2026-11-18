@@ -6,15 +6,26 @@ on:
     tags: ['v*']
   pull_request:
     branches: ['main']
+  # One bounded recovery of the immutable release; execute this workflow on main.
+  workflow_dispatch:
+    inputs:
+      recovery_release:
+        description: Recover the immutable v0.10.3 release
+        required: true
+        type: choice
+        options: [v0.10.3]
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  # Content identity and workflow identity are deliberately different in recovery.
+  CI_SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && 'd01ad41f0a01e8fe529f4f78358c5c2947d52f0d' || github.sha }}
+  CI_WORKFLOW_SHA: ${{ github.workflow_sha }}
 
 # Prevent duplicate runs
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && 'v0.10.3' || github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 permissions:
@@ -28,7 +39,7 @@ permissions:
 jobs:
   detect-release-tag:
     name: Detect release tag on commit
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
     outputs:
       is_release: ${{ steps.detect.outputs.is_release }}
@@ -36,32 +47,56 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Detect v* tag for current commit
         id: detect
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t tags < <(git tag --points-at "$GITHUB_SHA" 'v*' | sort -V)
+          if [[ '${{ github.event_name }}' == workflow_dispatch ]]; then
+            test '${{ github.ref }}' = refs/heads/main
+            test '${{ inputs.recovery_release }}' = v0.10.3
+            test "$(git rev-parse 'refs/tags/v0.10.3^{commit}')" = "$CI_SOURCE_SHA"
+            test "$(git rev-parse HEAD^{tree})" = 44e7f5a097b4215b03c6213b1014db8d3dc53028
+          fi
+          mapfile -t tags < <(git tag --points-at "$CI_SOURCE_SHA" 'v*' | sort -V)
           if [ "${#tags[@]}" -eq 0 ]; then
             echo "is_release=false" >> "$GITHUB_OUTPUT"
             echo "tag=" >> "$GITHUB_OUTPUT"
-            echo "No v* tag detected on $GITHUB_SHA"
+            echo "No v* tag detected on $CI_SOURCE_SHA"
             exit 0
           fi
 
           tag="${tags[$((${#tags[@]} - 1))]}"
+          if [[ '${{ github.event_name }}' == workflow_dispatch ]]; then tag=v0.10.3; fi
           if [ "${#tags[@]}" -gt 1 ]; then
-            echo "::warning::Multiple v* tags point at $GITHUB_SHA: ${tags[*]}. Using $tag."
+            echo "::warning::Multiple v* tags point at $CI_SOURCE_SHA: ${tags[*]}. Using $tag."
           fi
 
           echo "is_release=true" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Detected release tag: $tag"
+          printf 'source=%s\nworkflow=%s\ntag=%s\ntree=%s\n' \
+            "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$tag" "$(git rev-parse HEAD^{tree})" \
+            > "$RUNNER_TEMP/release-provenance.txt"
+
+      - name: Retain release source and workflow identities
+        if: steps.detect.outputs.is_release == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-provenance
+          path: ${{ runner.temp }}/release-provenance.txt
 
   # ============================================================================
   # Rust Testing
@@ -72,8 +107,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install rustfmt
         run: |
@@ -84,6 +126,17 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Check humanoid benchmark policy and runner controls
+        run: python3 -m unittest discover -s examples/benchmarks/humanoid -p test_benchmark.py -v
+
+      - name: Install Node for CI script tests
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Test CI scripts
+        run: node --test .github/scripts/*.test.mjs
 
       # Architectural invariant, checked without compiling anything: `xtask` must
       # carry NO rumoca-* workspace crate. It parses args, moves files, and shells
@@ -107,9 +160,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
           fetch-depth: 0
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install system dependencies
         uses: ./.github/actions/apt-install
@@ -125,7 +185,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: lint
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
 
       - name: Run lint gate
         run: cargo xtask verify lint
@@ -146,6 +206,7 @@ jobs:
           name: architecture-review-scan
           path: target/review/review-scan.json
           if-no-files-found: ignore
+          retention-days: 7
 
       - name: Check generated parsers are current
         shell: bash
@@ -164,6 +225,7 @@ jobs:
           name: crate-dag
           path: target/crate-dag/workspace-crate-dag.dot
           if-no-files-found: error
+          retention-days: 7
 
   # Reproducible package build via the root crane+fenix flake. Nix store paths
   # are cached privately in GitHub Actions, so pull requests need no external
@@ -174,8 +236,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
@@ -187,6 +256,19 @@ jobs:
         with:
           use-flakehub: false
           diagnostic-endpoint: ''
+
+      # Pull requests read the public cache like the other jobs and need no
+      # credentials. A push to main also logs in, so the publish step below can
+      # put rumoca in the cache for downstream flakes (kite, slam_web, the
+      # humanoid demo) instead of each first build compiling it for 20-40
+      # minutes. skipPush: nothing is published automatically; only the two
+      # store paths named in the publish step, with their closures, are pushed.
+      - name: CogniPilot Nix cache
+        uses: cachix/cachix-action@v17
+        with:
+          name: cognipilot
+          authToken: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CACHIX_AUTH_TOKEN || '' }}
+          skipPush: true
 
       - name: Nix build the package and required MLIR CPU checks
         # Build only the reproducible package and focused MLIR CPU checks.
@@ -210,6 +292,57 @@ jobs:
             .#checks.x86_64-linux.rumoca \
             .#checks.x86_64-linux.mlir-cpu
 
+      - name: Compare humanoid native speed and task fidelity with MuJoCo
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 15
+        run: bash .github/ci/run-humanoid-comparison.sh
+
+      - name: Retain humanoid comparison attempts
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v6
+        with:
+          name: humanoid-comparison
+          path: |
+            target/humanoid-comparison
+            !target/humanoid-comparison/cache/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Record added humanoid comparison time
+        if: always() && github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/humanoid-comparison-start" ]; then
+            elapsed=$(( $(date +%s) - $(cat "$RUNNER_TEMP/humanoid-comparison-start") ))
+            mkdir -p target/humanoid-comparison
+            printf '{"elapsed_seconds":%s}\n' "$elapsed" > target/humanoid-comparison/elapsed.json
+            awk -v seconds="$elapsed" 'BEGIN {printf "\nHumanoid comparison added %.2f minutes (downloads + setup + runs + artifact upload; excludes the existing package build).\n", seconds / 60}' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publish rumoca and its dependency build to the CogniPilot cache
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        # A cache upload problem is reported, not allowed to turn main red.
+        continue-on-error: true
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CACHIX_AUTH_TOKEN}" ]; then
+            echo "::warning::CACHIX_AUTH_TOKEN is not set, so rumoca was not published to the cognipilot cache"
+            exit 0
+          fi
+          ulimit -s 1048576
+          # checks.rumoca above is the same derivation as packages.rumoca, so
+          # nothing is rebuilt here. The dependency build (crane's
+          # buildDepsOnly) is a direct input of it; take it from there rather
+          # than by searching the store.
+          rumoca=$(nix path-info .#rumoca)
+          deps_drv=$(nix-store --query --references "$(nix path-info --derivation .#rumoca)" | grep -E -- '-deps-[^/]+\.drv$')
+          test "$(printf '%s\n' "$deps_drv" | wc -l)" -eq 1
+          deps=$(nix-store --query --outputs "$deps_drv")
+          printf 'Publishing %s\n' "$rumoca" "$deps"
+          cachix push cognipilot "$rumoca" "$deps"
+
   kani:
     name: Kani symbolic event-history contract
     runs-on: ubuntu-24.04
@@ -221,8 +354,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
@@ -247,6 +387,7 @@ jobs:
           name: kani-proof-summary
           path: target/verification/kani-summary.json
           if-no-files-found: warn
+          retention-days: 7
 
   test:
     name: Test (${{ matrix.os }})
@@ -261,9 +402,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
           fetch-depth: 0
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
@@ -320,7 +468,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: native-test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
           # Linux keeps the dependency target dir here (warm third-party deps);
           # all OSes additionally run sccache (next steps) to cache the workspace
           # crate compilations rust-cache drops. Windows/macOS keep rust-cache to
@@ -334,9 +482,15 @@ jobs:
         # Enabling it on Linux too is what stops ubuntu recompiling all of rumoca
         # every run (it previously had NO compiler cache — rust-cache keeps deps
         # but not workspace crates). Relies on the global CARGO_INCREMENTAL=0.
+        # The GHA cache service is an optimization, not a dependency: when it
+        # is unreachable the step is tolerated, the wrapper stays off and the
+        # later steps (MSL, CMM, tests) still run.
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Enable sccache wrapper
+        if: steps.sccache.outcome == 'success'
         shell: bash
         run: |
           echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
@@ -348,7 +502,7 @@ jobs:
         id: msl-cache
         with:
           path: target/msl/ModelicaStandardLibrary-4.1.0
-          key: msl-v4.1.0-release-zip-layout-v2
+          key: msl-v4.1.0-release-zip-layout-v3
 
       - name: Cache CMM
         uses: actions/cache@v5
@@ -365,7 +519,10 @@ jobs:
           mkdir -p target/msl
           touch target/msl/formatter-stability-required
           msl_dir=target/msl/ModelicaStandardLibrary-4.1.0
-          if [[ -f "$msl_dir/Complex.mo" && -f "$msl_dir/Modelica 4.1.0/package.mo" ]]; then
+          # Accept only the release-zip layout: a stale or foreign top-level entry
+          # (for example an unversioned Modelica/ tree) would load a second provider.
+          unexpected_entries=$(ls -A "$msl_dir" 2>/dev/null | grep -vxF -e Complex.mo -e LICENSE -e "Modelica 4.1.0" -e "ModelicaReference 4.1.0" -e "ModelicaServices 4.1.0" -e ObsoleteModelica4.mo -e README.md || true)
+          if [[ -f "$msl_dir/Complex.mo" && -f "$msl_dir/Modelica 4.1.0/package.mo" && -z "$unexpected_entries" ]]; then
             echo "MSL cache is valid at $msl_dir"
             exit 0
           fi
@@ -385,6 +542,26 @@ jobs:
           set -euo pipefail
           cargo xtask repo modelica-deps ensure
           test -f target/cmm/CMM-a642c381/LieGroups/package.mo
+
+      - name: Install Python for mandatory guide CLI and stdio examples
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Resolve owning Git Bash for mandatory guide syntax (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # The later Windows Cargo/Python steps use PowerShell, retaining this native path.
+          test -f "$BASH"
+          printf 'BASH=%s\n' "$(cygpath -w "$BASH")" >> "$GITHUB_ENV"
+
+      # Reached only after required setup succeeds. Optional cache failures
+      # remain tolerated through their existing continue-on-error settings.
+      - name: Mark test prerequisites ready
+        id: test-prerequisites
+        shell: bash
+        run: echo "Test prerequisites ready"
 
       - name: Run example build smoke (Linux monitored)
         if: runner.os == 'Linux'
@@ -411,10 +588,10 @@ jobs:
         run: cargo xtask verify examples
 
       # `!cancelled()` keeps the test step running when the example smoke step
-      # fails, so a smoke regression cannot hide test failures (the job still
-      # fails on the smoke step).
+      # fails, but only after setup succeeds; missing tools are not test failures.
+      # The job still fails on the smoke step.
       - name: Run workspace tests (Linux monitored)
-        if: runner.os == 'Linux' && !cancelled()
+        if: runner.os == 'Linux' && !cancelled() && steps.test-prerequisites.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -436,8 +613,38 @@ jobs:
           # sharding it buys no overall wall-clock, only jobs + runner cost.
           cargo xtask verify workspace
 
+      - name: Prepare GNU static-PIE test executables (Linux)
+        if: runner.os == 'Linux' && !cancelled() && steps.test-prerequisites.outcome == 'success'
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          export TMPDIR="$RUNNER_TEMP"
+          bash .github/scripts/qualify-issue422-static-pie.sh \
+            "$RUNNER_TEMP/issue422-gnu-static-pie" prepare
+
+      - name: Qualify GNU static-PIE memcmp and original U4 (Linux)
+        if: runner.os == 'Linux' && !cancelled() && steps.test-prerequisites.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          export TMPDIR="$RUNNER_TEMP"
+          timeout --kill-after=5s 600s bash .github/scripts/qualify-issue422-static-pie.sh \
+            "$RUNNER_TEMP/issue422-gnu-static-pie" run
+
+      - name: Upload GNU static-PIE qualification (Linux)
+        if: runner.os == 'Linux' && always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: issue422-gnu-static-pie
+          path: ${{ runner.temp }}/issue422-gnu-static-pie
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Run heavy Solve counterexample regressions (Linux)
-        if: runner.os == 'Linux' && !cancelled()
+        if: runner.os == 'Linux' && !cancelled() && steps.test-prerequisites.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -445,7 +652,7 @@ jobs:
             --test suite_heavy_solve -- --nocapture
 
       - name: Run workspace tests
-        if: runner.os != 'Linux' && !cancelled()
+        if: runner.os != 'Linux' && !cancelled() && steps.test-prerequisites.outcome == 'success'
         run: cargo xtask verify workspace
 
       - name: Build all binaries
@@ -469,6 +676,7 @@ jobs:
           name: tensor-compile-scaling-report
           path: target/tensor-scaling/report.json
           if-no-files-found: warn
+          retention-days: 7
 
   template-runtime-tests:
     name: Template Runtime (${{ matrix.backend }})
@@ -501,8 +709,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
@@ -519,7 +734,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: template-runtime
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
           cache-targets: false
 
       - name: Reclaim runner disk before template runtimes
@@ -580,7 +795,7 @@ jobs:
         continue-on-error: true
         with:
           path: target/msl/ModelicaStandardLibrary-4.1.0
-          key: msl-v4.1.0-release-zip-layout-v2
+          key: msl-v4.1.0-release-zip-layout-v3
 
       - name: Ensure MSL (fmi-ls-wasm Fourbar1 check)
         if: matrix.backend == 'wasm'
@@ -588,7 +803,10 @@ jobs:
         run: |
           set -euo pipefail
           msl_dir=target/msl/ModelicaStandardLibrary-4.1.0
-          if [[ -f "$msl_dir/Complex.mo" && -f "$msl_dir/Modelica 4.1.0/package.mo" ]]; then
+          # Accept only the release-zip layout: a stale or foreign top-level entry
+          # (for example an unversioned Modelica/ tree) would load a second provider.
+          unexpected_entries=$(ls -A "$msl_dir" 2>/dev/null | grep -vxF -e Complex.mo -e LICENSE -e "Modelica 4.1.0" -e "ModelicaReference 4.1.0" -e "ModelicaServices 4.1.0" -e ObsoleteModelica4.mo -e README.md || true)
+          if [[ -f "$msl_dir/Complex.mo" && -f "$msl_dir/Modelica 4.1.0/package.mo" && -z "$unexpected_entries" ]]; then
             echo "MSL cache is valid at $msl_dir"
             exit 0
           fi
@@ -659,10 +877,36 @@ jobs:
           if [ "$TEMPLATE_BACKEND" = fmi ]; then
             export PATH="$(dirname "$system_cmake"):$PATH"
           fi
-          cargo xtask verify template-runtimes \
-            --backend "$TEMPLATE_BACKEND" \
-            --require-external-tools
+          runtime_check=(cargo xtask verify template-runtimes
+            --backend "$TEMPLATE_BACKEND" --require-external-tools)
+          if [ "$TEMPLATE_BACKEND" = modelica ]; then
+            export TMPDIR="${RUNNER_TEMP:?}/rumoca-workshop-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}"
+            mkdir "$TMPDIR"
+            "${runtime_check[@]}" 2>&1 | tee "$TMPDIR/template-runtime.log"
+          else
+            "${runtime_check[@]}"
+          fi
           EOF
+
+      - name: Hash retained workshop Modelica evidence
+        if: always() && matrix.backend == 'modelica'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP:?}/rumoca-workshop-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}"
+          if [ -d "$evidence" ]; then
+            cd "$evidence"
+            find . -type f ! -name SHA256SUMS -print0 | sort -z |
+              xargs -0 -r sha256sum > SHA256SUMS
+          fi
+
+      - name: Upload retained workshop Modelica evidence
+        if: always() && matrix.backend == 'modelica'
+        uses: actions/upload-artifact@v6
+        with:
+          name: workshop-modelica-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rumoca-workshop-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
 
   editor-msl-smoke:
     name: Full-MSL LSP/Editor Gate
@@ -674,8 +918,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install Rust nightly with rust-src
         run: |
@@ -696,7 +947,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
           # Cache npm's download store keyed by the committed lockfiles so the
           # `npm ci` in the VS Code + browser smokes reuses packages across runs.
           cache: npm
@@ -729,7 +980,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: editor-msl
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
 
       # The VS Code runtime smoke downloads a full VS Code build via
       # @vscode/test-electron; the xtask resolves its cache to the source
@@ -748,14 +999,17 @@ jobs:
         id: msl-cache-editor
         with:
           path: target/msl/ModelicaStandardLibrary-4.1.0
-          key: msl-v4.1.0-release-zip-layout-v2
+          key: msl-v4.1.0-release-zip-layout-v3
 
       - name: Ensure MSL
         shell: bash
         run: |
           set -euo pipefail
           msl_dir=target/msl/ModelicaStandardLibrary-4.1.0
-          if [[ -f "$msl_dir/Complex.mo" && -f "$msl_dir/Modelica 4.1.0/package.mo" ]]; then
+          # Accept only the release-zip layout: a stale or foreign top-level entry
+          # (for example an unversioned Modelica/ tree) would load a second provider.
+          unexpected_entries=$(ls -A "$msl_dir" 2>/dev/null | grep -vxF -e Complex.mo -e LICENSE -e "Modelica 4.1.0" -e "ModelicaReference 4.1.0" -e "ModelicaServices 4.1.0" -e ObsoleteModelica4.mo -e README.md || true)
+          if [[ -f "$msl_dir/Complex.mo" && -f "$msl_dir/Modelica 4.1.0/package.mo" && -z "$unexpected_entries" ]]; then
             echo "MSL cache is valid at $msl_dir"
             exit 0
           fi
@@ -797,24 +1051,32 @@ jobs:
           name: lsp-msl-benchmark-report
           path: target/lsp-msl-benchmark
           if-no-files-found: warn
+          retention-days: 7
 
   coverage-gate:
     name: Coverage Gate
     runs-on: ubuntu-24.04
     # This job installs cargo-llvm-cov and generates full workspace artifacts
-    # before running the trim/gate steps, so 30 minutes is too tight on cold
-    # GitHub runners. Keep explicit headroom here to avoid job-level
+    # before running the trim/gate steps; a full run takes about 45 minutes on
+    # cold GitHub runners. Keep explicit headroom here to avoid job-level
     # cancellation while tests are still progressing.
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
           fetch-depth: 0
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install system dependencies
         uses: ./.github/actions/apt-install
@@ -833,7 +1095,7 @@ jobs:
         with:
           shared-key: coverage-llvmcov
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov
         # Prebuilt binary via taiki-e (like nextest) instead of `cargo install
@@ -934,8 +1196,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
@@ -985,7 +1254,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: target/nix-cache/msl-artifacts-closure.nar.zst
-          key: msl-artifacts-closure-v1-${{ runner.os }}-${{ github.sha }}
+          key: msl-artifacts-closure-v1-${{ runner.os }}-${{ env.CI_SOURCE_SHA }}
           restore-keys: |
             msl-artifacts-closure-v1-${{ runner.os }}-
 
@@ -1076,8 +1345,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install system dependencies
         uses: ./.github/actions/apt-install
@@ -1095,21 +1371,24 @@ jobs:
           shared-key: msl-gate
           cache-on-failure: true
           cache-targets: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
 
       - name: Cache MSL
         uses: actions/cache@v5
         continue-on-error: true
         with:
           path: target/msl/ModelicaStandardLibrary-4.1.0
-          key: msl-v4.1.0-release-zip-layout-v2
+          key: msl-v4.1.0-release-zip-layout-v3
 
       - name: Ensure MSL
         shell: bash
         run: |
           set -euo pipefail
           msl_dir=target/msl/ModelicaStandardLibrary-4.1.0
-          if [[ -f "$msl_dir/Complex.mo" && -f "$msl_dir/Modelica 4.1.0/package.mo" ]]; then
+          # Accept only the release-zip layout: a stale or foreign top-level entry
+          # (for example an unversioned Modelica/ tree) would load a second provider.
+          unexpected_entries=$(ls -A "$msl_dir" 2>/dev/null | grep -vxF -e Complex.mo -e LICENSE -e "Modelica 4.1.0" -e "ModelicaReference 4.1.0" -e "ModelicaServices 4.1.0" -e ObsoleteModelica4.mo -e README.md || true)
+          if [[ -f "$msl_dir/Complex.mo" && -f "$msl_dir/Modelica 4.1.0/package.mo" && -z "$unexpected_entries" ]]; then
             echo "MSL cache is valid at $msl_dir"
             exit 0
           fi
@@ -1170,8 +1449,7 @@ jobs:
             --sim-parallelism 2 \
             --sim-worker-memory-mb 2048 \
             --sim-total-memory-mb 6144 \
-            --sim-timeout-secs 45 \
-            --model-attempt-timeout-secs 20 \
+            --budget-profile ci \
             --monitor-interval-secs 10
 
       - name: Upload shard results
@@ -1184,6 +1462,7 @@ jobs:
             target/msl/results/sim_trace_comparison.json
             target/msl/results/msl_band_table.json
           if-no-files-found: error
+          retention-days: 7
 
   msl-merge:
     name: MSL Quality Gate (merge + gate)
@@ -1196,8 +1475,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install system dependencies
         uses: ./.github/actions/apt-install
@@ -1215,7 +1501,7 @@ jobs:
           shared-key: msl-gate
           cache-on-failure: true
           cache-targets: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
 
       - name: Download shard results
         uses: actions/download-artifact@v8
@@ -1247,6 +1533,7 @@ jobs:
         run: |
           cargo xtask verify msl-parity \
             --merge-shards target/msl/shards \
+            --budget-profile ci \
             --prebuilt-test-binary "$PWD/result-msl-artifacts/bin/msl_tests"
 
       # The band table is part of the merged evidence, not an optional extra:
@@ -1488,6 +1775,7 @@ jobs:
             target/msl/results/msl_compatibility_report.md
             target/msl/results/msl_compatibility_report.json
           if-no-files-found: error
+          retention-days: 7
 
   msl-pr-status-on-failure:
     name: MSL PR status (upstream failure)
@@ -1500,8 +1788,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: false
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Replace stale MSL statistics with the current failure status
         uses: actions/github-script@v8
@@ -1534,8 +1829,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install system dependencies
         uses: ./.github/actions/apt-install
@@ -1553,21 +1855,24 @@ jobs:
           shared-key: msl-gate
           cache-on-failure: true
           cache-targets: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
 
       - name: Cache MSL
         uses: actions/cache@v5
         continue-on-error: true
         with:
           path: target/msl/ModelicaStandardLibrary-4.1.0
-          key: msl-v4.1.0-release-zip-layout-v2
+          key: msl-v4.1.0-release-zip-layout-v3
 
       - name: Ensure MSL
         shell: bash
         run: |
           set -euo pipefail
           msl_dir=target/msl/ModelicaStandardLibrary-4.1.0
-          if [[ -f "$msl_dir/Complex.mo" && -f "$msl_dir/Modelica 4.1.0/package.mo" ]]; then
+          # Accept only the release-zip layout: a stale or foreign top-level entry
+          # (for example an unversioned Modelica/ tree) would load a second provider.
+          unexpected_entries=$(ls -A "$msl_dir" 2>/dev/null | grep -vxF -e Complex.mo -e LICENSE -e "Modelica 4.1.0" -e "ModelicaReference 4.1.0" -e "ModelicaServices 4.1.0" -e ObsoleteModelica4.mo -e README.md || true)
+          if [[ -f "$msl_dir/Complex.mo" && -f "$msl_dir/Modelica 4.1.0/package.mo" && -z "$unexpected_entries" ]]; then
             echo "MSL cache is valid at $msl_dir"
             exit 0
           fi
@@ -1663,7 +1968,7 @@ jobs:
       # (`--require-selected-targets-success` is deliberately absent) and only
       # runs on main, where wall time is not on the PR critical path.
       - name: Survey ModelicaTest coverage (report only)
-        if: github.ref == 'refs/heads/main'
+        if: github.event_name != 'workflow_dispatch' && github.ref == 'refs/heads/main'
         continue-on-error: true
         shell: bash
         run: |
@@ -1700,6 +2005,7 @@ jobs:
             target/msl/modelicatest-survey/modelica_test_catalog.md
             target/msl/modelicatest-survey/modelica_test_targets_ci.promoted.json
           if-no-files-found: warn
+          retention-days: 7
 
   modelica-models-gate:
     name: modelica_models Compatibility Gate
@@ -1711,8 +2017,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       # Keep this corpus fixed so compiler changes are compared against the
       # same source. Updating the revision is an explicit compatibility-ratchet
@@ -1780,8 +2093,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install system dependencies
         uses: ./.github/actions/apt-install
@@ -1797,7 +2117,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: docs
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
           cache-targets: false
 
       - name: Install mdBook
@@ -1811,6 +2131,7 @@ jobs:
         with:
           name: documentation
           path: target/doc/
+          retention-days: 7
 
   # ============================================================================
   # VS Code Extension
@@ -1821,8 +2142,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install system dependencies
         uses: ./.github/actions/apt-install
@@ -1837,13 +2165,13 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Rust cache (vscode)
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: vscode
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name != 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
           cache-targets: false
 
       - name: Run VS Code extension CI gate
@@ -1858,11 +2186,20 @@ jobs:
     # cannot drift until tag time. Only tag pushes prepare/upload Pages content.
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
@@ -1890,6 +2227,9 @@ jobs:
         #                                          diffsol is excluded, it pulls a
         #                                          non-browser-safe relaxed-SIMD graph)
         #   core     -> @cognipilot/rumoca-core  (no bundled solver — bring your own)
+        env:
+          # Sign in with ChatGPT client id for the hosted site; empty until issued.
+          OPENAI_SIWC_CLIENT_ID: ${{ vars.OPENAI_SIWC_CLIENT_ID }}
         run: |
           nix develop .#ci-wasm --command bash <<'EOF'
           set -euo pipefail
@@ -1897,8 +2237,27 @@ jobs:
           node packages/rumoca/build.mjs --profile release --variant core --optimize
           EOF
 
+      - name: Reclaim completed WASM intermediates before browser examples
+        run: |
+          # Final npm packages and vendor assets are already staged outside target.
+          # The remaining guide checks build native tools and reuse those packages.
+          df -B1 .
+          rm -rf -- target/wasm32-unknown-unknown
+          df -B1 .
+
+      - name: Execute user-guide browser examples
+        run: |
+          nix develop .#docs --command bash <<'EOF'
+          set -euo pipefail
+          npm ci --prefix packages/playground
+          node packages/playground/tests/user_guide_browser.mjs
+          EOF
+
       - name: Prepare GitHub Pages content
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+        env:
+          # Optional public client id must also reach this separate staging step.
+          OPENAI_SIWC_CLIENT_ID: ${{ vars.OPENAI_SIWC_CLIENT_ID }}
         run: |
           # Use the docs shell: it carries the wasm toolchain this step relies on
           # (binaryen, node, wasm-pack) plus mdbook, which the plain wasm shell
@@ -1940,6 +2299,7 @@ jobs:
               -e "s|window.rumocaWasmPkgSubdir = 'release-full-web';|window.rumocaWasmPkgSubdir = '$PKG_SUBDIR';|g" \
               -e "s|window.rumocaWasmPkgSubdir = 'release-full-web-rayon';|window.rumocaWasmPkgSubdir = '$PKG_SUBDIR';|g" \
               -e "s|window.rumocaRepoAssetBase = '../../';|window.rumocaRepoAssetBase = './';|g" \
+              -e "s|openaiSiwcClientId: ''|openaiSiwcClientId: '${OPENAI_SIWC_CLIENT_ID:-}'|g" \
               -e "s|../../assets/brand/rumoca.svg|assets/brand/rumoca.svg|g" \
               packages/playground/index.html > gh-pages/index.html
 
@@ -1962,9 +2322,10 @@ jobs:
         with:
           name: wasm-package
           path: packages/rumoca/dist/
+          retention-days: 7
 
       - name: Upload Pages artifact
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
         uses: actions/upload-pages-artifact@v3
         with:
           path: gh-pages/
@@ -1974,7 +2335,7 @@ jobs:
     # Publish the docs/WASM site only on a release. Gated to the tag-push event
     # (not the co-pushed main branch ref) so a `git push origin main vX.Y.Z`
     # deploys exactly once instead of racing a duplicate from the branch push.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.detect-release-tag.outputs.is_release == 'true'
+    if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && needs.detect-release-tag.outputs.is_release == 'true'
     needs: [detect-release-tag, build-wasm]
     runs-on: ubuntu-24.04
     environment:
@@ -1992,14 +2353,21 @@ jobs:
     name: Playground contract
     # Relocated out of build-wasm so PRs keep the playground/WASM contract test
     # without the heavy release build. Self-contained: builds the FullWeb wasm
-    # bundle and runs the native + Node smoke harnesses (no MSL/browser/GPU).
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    # bundle and runs the native + Node smoke harnesses with pinned guide libraries (no browser/GPU).
+    if: github.event_name == 'pull_request' || (((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')))
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install system dependencies
         uses: ./.github/actions/apt-install
@@ -2016,7 +2384,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Rust cache (playground)
         uses: Swatinem/rust-cache@v2
@@ -2031,13 +2399,57 @@ jobs:
   # ============================================================================
   # Cross-platform Rust binary builds
   # ============================================================================
+  musl-setup-smoke:
+    name: Musl setup (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CI_SOURCE_SHA }}
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: musl-tools pkg-config linux-libc-dev
+      - name: Check out fixed packaging helpers
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CI_WORKFLOW_SHA }}
+          path: .release-workflow
+          persist-credentials: false
+
+      - name: Stage fixed packaging helpers
+        shell: bash
+        run: |
+          test "$(git -C .release-workflow rev-parse HEAD)" = "$CI_WORKFLOW_SHA"
+          mkdir "$RUNNER_TEMP/fixed-packaging"
+          cp .release-workflow/.github/scripts/prepare-{linux-uapi,musl-libudev}.sh "$RUNNER_TEMP/fixed-packaging/"
+          sha256sum "$RUNNER_TEMP/fixed-packaging/"*.sh
+          # Keep main's tree out of the tagged source used by the build.
+          rm -rf -- .release-workflow
+
+      - name: Build pinned static dependency with musl
+        run: bash "$RUNNER_TEMP/fixed-packaging/prepare-musl-libudev.sh"
+
   build-rust-binaries:
     name: Build Rust (${{ matrix.target }})
+    env:
+      CARGO_BUILD_JOBS: 4
+      RUST_TEST_THREADS: 4
+      RAYON_NUM_THREADS: 4
     # Release-only: cross-platform binary artifacts are consumed solely by the
     # tag-time deploy job, so they are deferred off PRs (native build/test
     # coverage on PRs comes from the `test` job). A PR that breaks a cross
     # target is caught at tag time.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -2052,7 +2464,7 @@ jobs:
             target: aarch64-unknown-linux-musl
             rumoca_asset: rumoca-linux-aarch64
             lsp_asset: rumoca-lsp-linux-aarch64
-          - os: macos-15-intel
+          - os: macos-15
             target: x86_64-apple-darwin
             rumoca_asset: rumoca-macos-x86_64
             lsp_asset: rumoca-lsp-macos-x86_64
@@ -2067,8 +2479,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install Rust
         run: |
@@ -2083,7 +2502,26 @@ jobs:
         if: contains(matrix.target, 'musl')
         uses: ./.github/actions/apt-install
         with:
-          packages: musl-tools
+          packages: musl-tools pkg-config linux-libc-dev
+
+      - name: Check out fixed packaging helpers
+        if: contains(matrix.target, 'musl')
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CI_WORKFLOW_SHA }}
+          path: .release-workflow
+          persist-credentials: false
+
+      - name: Stage fixed packaging helpers
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        run: |
+          test "$(git -C .release-workflow rev-parse HEAD)" = "$CI_WORKFLOW_SHA"
+          mkdir "$RUNNER_TEMP/fixed-packaging"
+          cp .release-workflow/.github/scripts/prepare-{linux-uapi,musl-libudev}.sh "$RUNNER_TEMP/fixed-packaging/"
+          sha256sum "$RUNNER_TEMP/fixed-packaging/"*.sh
+          # Keep main's tree out of the tagged source used by the build.
+          rm -rf -- .release-workflow
 
       - name: Configure musl build (Linux musl)
         if: contains(matrix.target, 'musl')
@@ -2098,6 +2536,7 @@ jobs:
           EOF
           echo "CC_${target_env_suffix}=musl-gcc" >> $GITHUB_ENV
           echo "CARGO_TARGET_${target_env_upper}_LINKER=musl-gcc" >> $GITHUB_ENV
+          bash "$RUNNER_TEMP/fixed-packaging/prepare-musl-libudev.sh"
 
       - name: Rust cache (release ${{ matrix.target }})
         uses: Swatinem/rust-cache@v2
@@ -2105,6 +2544,14 @@ jobs:
           prefix-key: release
           key: ${{ matrix.target }}
           cache-on-failure: true
+
+      - name: Prepare Linux musl native regression executables
+        if: contains(matrix.target, 'musl')
+        run: |
+          cargo test --locked --release --target ${{ matrix.target }} \
+            -p rumoca-exec-cranelift --lib --no-run --message-format=json > release-native-cranelift.jsonl
+          cargo test --locked --release --target ${{ matrix.target }} \
+            -p rumoca --test suite_core --no-run --message-format=json > release-native-core.jsonl
 
       - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }} --bin rumoca --bin rumoca-lsp
@@ -2155,6 +2602,52 @@ jobs:
           fi
           ldd "$lsp_bin" || true
           "$lsp_bin" --version
+          for artifact in "$rumoca_bin" "$lsp_bin"; do
+            if readelf -d "$artifact" | grep -F '(NEEDED)' >/dev/null; then
+              echo "::error::$artifact unexpectedly depends on a shared library"
+              exit 1
+            fi
+          done
+
+      - name: Qualify native execution in Linux musl release artifacts
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Test executables were prepared before the final default-feature
+          # build and strip. Their CARGO_BIN_EXE_rumoca points at this artifact.
+          test_executable() {
+            jq -s -er --arg target "$2" '
+              [ .[] | select(.reason == "compiler-artifact")
+                | select(.target.name == $target and .profile.test == true
+                  and (.executable | type) == "string") | .executable ]
+              | if length == 1 then .[0] else error("expected one test executable") end
+            ' "$1"
+          }
+          cranelift_test="$(test_executable release-native-cranelift.jsonl rumoca_exec_cranelift)"
+          core_test="$(test_executable release-native-core.jsonl suite_core)"
+          run_exact_test() {
+            local executable="$1" selector="$2"
+            local roster result status=0
+            roster="$("$executable" "$selector" --exact --list)"
+            test "$(printf '%s\n' "$roster" | grep -Fxc "$selector: test")" -eq 1
+            result="$("$executable" "$selector" --exact --nocapture 2>&1)" || status=$?
+            printf '%s\n' "$result"
+            test "$status" -eq 0
+            printf '%s\n' "$result" | grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;'
+          }
+          sha256sum target/${{ matrix.target }}/release/{rumoca,rumoca-lsp} > release-artifact-sha256.txt
+          for selector in \
+            emit::host_runtime::tests::issue_422_memcmp_relocation_needs_no_process_symbol_export \
+            emit::host_runtime::tests::issue_422_memory_libcalls_relocate_without_process_symbol_export; do
+            run_exact_test "$cranelift_test" "$selector"
+          done
+          for selector in \
+            reported_bug_runtime::issue_422_original_array_function_runs_without_native_fallback \
+            cli_sim_serve_stdio::issue_422_release_cli_runs_original_u4_without_native_fallback; do
+            run_exact_test "$core_test" "$selector"
+          done
+          sha256sum --check release-artifact-sha256.txt
 
       - name: Strip binaries (macOS)
         if: runner.os == 'macOS'
@@ -2167,12 +2660,14 @@ jobs:
         with:
           name: ${{ matrix.rumoca_asset }}
           path: ./target/${{ matrix.target }}/release/rumoca${{ startsWith(matrix.target, 'x86_64-pc-windows-') && '.exe' || '' }}
+          retention-days: 7
 
       - name: Upload LSP binary
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.lsp_asset }}
           path: ./target/${{ matrix.target }}/release/rumoca-lsp${{ startsWith(matrix.target, 'x86_64-pc-windows-') && '.exe' || '' }}
+          retention-days: 7
 
   build-python-wheels:
     name: Build Python (${{ matrix.name }})
@@ -2193,7 +2688,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             nix_system: aarch64-linux
             name: linux-aarch64-gnu
-          - os: macos-15-intel
+          - os: macos-15
             target: x86_64-apple-darwin
             nix_system: x86_64-darwin
             name: macos-x86_64
@@ -2207,14 +2702,29 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
+
+      - name: Ensure Rosetta for the x86_64 wheel on Apple Silicon
+        # GitHub no longer offers Intel macOS runners with a supported Nix
+        # installer, so the x86_64-darwin wheel builds on an Apple Silicon
+        # runner through Rosetta with Nix's x86_64-darwin platform enabled.
+        if: matrix.nix_system == 'x86_64-darwin'
+        run: softwareupdate --install-rosetta --agree-to-license
 
       - name: Install Nix
         if: runner.os != 'Windows'
         uses: DeterminateSystems/nix-installer-action@v22
         with:
           determinate: false
+          extra-conf: ${{ matrix.nix_system == 'x86_64-darwin' && 'extra-platforms = x86_64-darwin' || '' }}
 
       - name: GitHub Actions Nix cache
         if: runner.os != 'Windows'
@@ -2242,11 +2752,15 @@ jobs:
         if: runner.os == 'Windows'
         run: python -m pip install maturin
 
+      # The wheel steps run a plain (non-login) shell inside the Nix dev shell:
+      # a login profile re-prepends the runner's rustup and Homebrew paths,
+      # which shadow the pinned Nix toolchain and Python (on Apple Silicon the
+      # rustup host toolchain has no x86_64-apple-darwin standard library).
       - name: Run Python binding Rust tests
         if: matrix.name == 'linux-x86_64-gnu'
         shell: bash
         run: |
-          nix develop ".#devShells.${{ matrix.nix_system }}.ci-python-wheel" --command bash -lc '
+          nix develop ".#devShells.${{ matrix.nix_system }}.ci-python-wheel" --command bash -c '
             set -euo pipefail
             export PYO3_PYTHON="$(command -v python)"
             cargo test --package rumoca-bind-python --lib
@@ -2255,7 +2769,7 @@ jobs:
       - name: Build wheels (Nix)
         if: runner.os != 'Windows'
         run: |
-          nix develop ".#devShells.${{ matrix.nix_system }}.ci-python-wheel" --command bash -lc '
+          nix develop ".#devShells.${{ matrix.nix_system }}.ci-python-wheel" --command bash -c '
             set -euo pipefail
             target="${{ matrix.target }}"
             # Linux runners ship a very new glibc, so a native build tags the
@@ -2297,17 +2811,21 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          nix develop ".#devShells.${{ matrix.nix_system }}.ci-python-wheel" --command bash -lc '
+          nix develop ".#devShells.${{ matrix.nix_system }}.ci-python-wheel" --command bash -c '
             set -euo pipefail
             python -m venv target/python-wheel-smoke-venv
             . target/python-wheel-smoke-venv/bin/activate
             python -m pip install --upgrade pip
             WHEEL=$(ls dist/*.whl | head -1)
             python -m pip install --force-reinstall "${WHEEL}[notebook,data]"
-            python crates/rumoca-bind-python/tests/smoke_test.py
-            python crates/rumoca-bind-python/tests/api_test.py
-            python crates/rumoca-bind-python/tests/magic_test.py
-            python crates/rumoca-bind-python/tests/export_test.py
+            # The existing supported Linux wheel lane must exercise both live
+            # exports. JAX is unavailable on some wheel-matrix platforms.
+            export_args=()
+            if [[ "${{ matrix.name }}" == "linux-x86_64-gnu" ]]; then
+              python -m pip install jax==0.9.2 casadi==3.7.2 numpy==2.4.3 matplotlib==3.10.8
+              export_args=(--require-guide)
+            fi
+            cargo xtask python test --wheel "$WHEEL" --python "$(command -v python)" "${export_args[@]}"
           '
 
       - name: Smoke test installed wheel (Windows)
@@ -2319,16 +2837,14 @@ jobs:
           python -m pip install --upgrade pip
           WHEEL=$(ls dist/*.whl | head -1)
           python -m pip install --force-reinstall "${WHEEL}[notebook,data]"
-          python crates/rumoca-bind-python/tests/smoke_test.py
-          python crates/rumoca-bind-python/tests/api_test.py
-          python crates/rumoca-bind-python/tests/magic_test.py
-          python crates/rumoca-bind-python/tests/export_test.py
+          cargo xtask python test --wheel "$WHEEL" --python "$(command -v python)"
 
       - name: Upload wheels
         uses: actions/upload-artifact@v6
         with:
           name: wheels-${{ matrix.name }}
           path: dist
+          retention-days: 7
 
   build-python-sdist:
     name: Build Python sdist
@@ -2339,8 +2855,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
+
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
@@ -2366,43 +2889,50 @@ jobs:
         with:
           name: wheels-sdist
           path: crates/rumoca-bind-python/dist
+          retention-days: 7
 
   # ============================================================================
   # Deployment (only on tags, after verification and build completion)
   # ============================================================================
   deploy:
     name: Deploy
-    # Gated to the tag-push event only. A release pushes main and the v* tag
-    # together, which fires two CI runs (branch + tag); deploying on both made
-    # the second run fail on "Release.tag_name already exists". Tag-only means
-    # the release/publish path runs exactly once.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.detect-release-tag.outputs.is_release == 'true'
+    # Publish from a tag push, or the explicitly pinned v0.10.3 recovery on main.
+    # Ordinary main pushes never publish. Recovery keeps content and workflow
+    # identities separate and reuses the full gate set below.
+    if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && needs.detect-release-tag.outputs.is_release == 'true'
     # Gate every publish on a fully green build: the release deploys to all
     # sites only when every test, gate, and build job has passed, so we never
     # publish to one site off a partially red run. A publish step failing is the
     # only thing that can leave a partial deploy.
-    needs: [detect-release-tag, fmt, lint, test, coverage-gate, kani, nix-checks, msl-merge, modelicatest-gate, modelica-models-gate, editor-msl-smoke, template-runtime-tests, docs, vscode, deploy-pages, playground, build-wasm, build-rust-binaries, build-python-wheels, build-python-sdist]
+    needs: [detect-release-tag, musl-setup-smoke, fmt, lint, test, coverage-gate, kani, nix-checks, msl-merge, modelicatest-gate, modelica-models-gate, editor-msl-smoke, template-runtime-tests, docs, vscode, deploy-pages, playground, build-wasm, build-rust-binaries, build-python-wheels, build-python-sdist]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           token: ${{ github.token }}
           persist-credentials: true
           fetch-depth: 0
 
+      - name: Verify source checkout identity
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          printf 'source=%s workflow=%s tree=%s\n' "$CI_SOURCE_SHA" "$CI_WORKFLOW_SHA" "$(git rev-parse HEAD^{tree})"
+
       - name: Verify tag is on main
         run: |
           tag='${{ needs.detect-release-tag.outputs.tag }}'
-          if ! git tag --points-at "${{ github.sha }}" | grep -Fx "$tag" >/dev/null; then
-            echo "::error::Release tag '$tag' does not point at built commit ${{ github.sha }}"
+          if ! git tag --points-at "${{ env.CI_SOURCE_SHA }}" | grep -Fx "$tag" >/dev/null; then
+            echo "::error::Release tag '$tag' does not point at built commit ${{ env.CI_SOURCE_SHA }}"
             exit 1
           fi
           git fetch --no-tags --depth=2147483647 origin main
-          if ! git merge-base --is-ancestor "${{ github.sha }}" origin/main; then
-            echo "::error::Release tag '$tag' commit ${{ github.sha }} is not on origin/main; refusing to release"
+          if ! git merge-base --is-ancestor "${{ env.CI_SOURCE_SHA }}" origin/main; then
+            echo "::error::Release tag '$tag' commit ${{ env.CI_SOURCE_SHA }} is not on origin/main; refusing to release"
             exit 1
           fi
-          echo "Release tag '$tag' points to commit ${{ github.sha }} on origin/main"
+          echo "Release tag '$tag' points to commit ${{ env.CI_SOURCE_SHA }} on origin/main"
 
       - name: Get tag name
         id: tag
@@ -2420,7 +2950,7 @@ jobs:
       - name: Setup Node.js for VSIX packaging
         uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install VS Code extension dependencies
         shell: bash
@@ -2523,9 +3053,7 @@ jobs:
           echo "=== Release assets ==="
           ls -la release-assets/
 
-      # Create GitHub Release. Deploy is gated to the tag-push event (see the
-      # job `if:` above), so this runs exactly once per release and a fresh tag
-      # never collides with an existing release.
+      # Recovery reuses the existing immutable release; it never moves the tag.
       - name: Create GitHub Release
         run: |
           if gh release view ${{ steps.tag.outputs.name }} >/dev/null 2>&1; then
@@ -2555,6 +3083,7 @@ jobs:
         with:
           name: release-assets
           path: release-assets/
+          retention-days: 7
 
       - name: Publish VS Code extensions to marketplaces
         shell: bash

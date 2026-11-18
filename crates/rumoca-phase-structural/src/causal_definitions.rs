@@ -145,6 +145,29 @@ impl<'dae> CausalDefinitions<'dae> {
         &self.order
     }
 
+    /// Every defining expression, scalar boundary definitions included, in
+    /// variable then scalar order: everything a consumer that lowers these
+    /// definitions can read.
+    pub fn defining_expressions(&self) -> Vec<dae::ExprId<'dae>> {
+        let mut keyed = self
+            .definitions
+            .iter()
+            .map(|(variable, expression)| ((*variable, None), *expression))
+            .chain(
+                self.scalar_definitions
+                    .iter()
+                    .map(|((variable, scalar), expression)| {
+                        ((*variable, Some(*scalar)), *expression)
+                    }),
+            )
+            .collect::<Vec<_>>();
+        keyed.sort_unstable_by_key(|(key, _)| *key);
+        keyed
+            .into_iter()
+            .map(|(_, expression)| expression)
+            .collect()
+    }
+
     pub const fn remaining_owner_count(&self) -> usize {
         self.remaining_owners
     }
@@ -299,22 +322,25 @@ fn expression_dependencies<'dae>(
     expression: dae::ExprId<'dae>,
 ) -> ExpressionDependencies {
     let mut dependencies = ExpressionDependencies::default();
-    dae::for_each_expression(view, expression, |_, node| match node.operation() {
-        dae::ExpressionOperation::Coordinate(dae::CoordinateView::Algebraic(variable)) => {
-            dependencies.algebraic.insert(variable.index());
+    rumoca_eval_dae::for_each_selected_value_expression(view, expression, |_, node| {
+        match node.operation() {
+            dae::ExpressionOperation::Coordinate(dae::CoordinateView::Algebraic(variable)) => {
+                dependencies.algebraic.insert(variable.index());
+            }
+            dae::ExpressionOperation::Coordinate(coordinate) => {
+                dependencies.has_continuous_source |=
+                    coordinate_has_continuous_time(view, coordinate);
+            }
+            dae::ExpressionOperation::Call { function, .. } => {
+                dependencies.has_continuous_source |=
+                    !view.function(function).is_some_and(|function| {
+                        function
+                            .external()
+                            .is_none_or(|external| external.purity().is_pure())
+                    });
+            }
+            _ => {}
         }
-        dae::ExpressionOperation::Coordinate(coordinate) => {
-            dependencies.has_continuous_source |= coordinate_has_continuous_time(view, coordinate);
-        }
-        dae::ExpressionOperation::Call { function, .. } => {
-            dependencies.has_continuous_source |=
-                !view.function(function).is_some_and(|function| {
-                    function
-                        .external()
-                        .is_none_or(|external| external.purity().is_pure())
-                });
-        }
-        _ => {}
     });
     dependencies
 }
@@ -515,7 +541,7 @@ fn expression_references<'dae>(
     target: dae::AlgebraicId<'dae>,
 ) -> bool {
     let mut found = false;
-    dae::for_each_expression(view, expression, |_, node| {
+    rumoca_eval_dae::for_each_selected_value_expression(view, expression, |_, node| {
         found |= matches!(
             node.operation(),
             dae::ExpressionOperation::Coordinate(dae::CoordinateView::Algebraic(variable))
@@ -745,6 +771,7 @@ mod tests {
                 domains.structured(
                     StructuredIndexDomain {
                         binders: vec![StructuredIndexBinder {
+                            provenance: rumoca_core::IndexBinderProvenance::Generated,
                             id: 0,
                             display_name: "i".to_owned(),
                             lower: 1,

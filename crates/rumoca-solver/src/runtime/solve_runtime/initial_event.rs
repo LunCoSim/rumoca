@@ -1,3 +1,4 @@
+use super::ScalarExecutionView;
 use crate::{
     EventActionOutcome, EventPreMode, RuntimeEventStop, RuntimeSolveError,
     commit_pre_params_after_event, initial_runtime_event_stop,
@@ -5,7 +6,7 @@ use crate::{
 };
 
 use super::{
-    EventUpdateRowFilter, ProjectedEventUpdateInput, SeededConditionMemory, SolveRuntime,
+    EventUpdateRowFilter, ProjectedEventUpdateInput, SeededConditionMemory,
     support::copy_runtime_values,
 };
 
@@ -109,9 +110,15 @@ fn trace_value_matches(left: f64, right: f64, tol: f64) -> bool {
     (left - right).abs() <= tol.max(1.0e-12) * scale
 }
 
-impl SolveRuntime {
-    pub fn set_initial_event_flag(&self, p: &mut [f64], value: bool) {
-        super::set_initial_event_flag(&self.model, p, value);
+impl ScalarExecutionView<'_> {
+    /// Whether `p` holds `initial()` true.
+    pub(super) fn initial_event_flag(&self, p: &[f64]) -> bool {
+        self.model
+            .problem
+            .solve_layout
+            .initial_event_parameter_index
+            .and_then(|index| p.get(index))
+            .is_some_and(|value| *value > 0.5)
     }
 
     pub fn apply_projected_post_initial_event_update<P>(
@@ -184,6 +191,16 @@ impl SolveRuntime {
             &seeded_event_pre_p
         };
         let initial_event = initial_runtime_event_stop(&self.model.problem, t_start, dynamic_event);
+        // MLS §3.7.2: `delay(u, d) = u(time.start)` up to `time.start + d`, so
+        // while the initialization problem settles a delay follows its source,
+        // and a discrete row reading the delay reads that settled value. Once
+        // the start point is committed below, the same refresh reads the
+        // committed history, so the first event iteration of the transient
+        // analysis sees the initialization value.
+        let mut project_algebraics = |y: &mut [f64], p: &mut [f64], t: f64| {
+            let projected = project_algebraics(y, p, t)?;
+            Ok(self.refresh_initial_delay_identity(t, y, p, tol)? | projected)
+        };
         // Modelica assertions and termination equations are active during
         // initialization even when no clock, relation, or scheduled event
         // happens at `t_start`. The event inventory controls which discrete
@@ -210,29 +227,31 @@ impl SolveRuntime {
                 action,
             });
         }
+        // The initialization problem is solved here (MLS §8.6), and its
+        // solution is `u(time.start)` for every `delay(u, d)` (MLS §3.7.2).
+        // The event iteration that follows belongs to the transient analysis,
+        // so a source change there is an event jump at `t_start` that the
+        // delay transports to `t_start + d`; commit the start point first.
+        self.commit_delay_history(t_start, y, p)?;
         let mut observations = Vec::new();
         if initial_event.is_some() {
             observations.push(InitialEventObservation::snapshot(t_start, y, p));
         }
         self.set_initial_event_flag(p, false);
         let Some(event) = initial_event else {
-            commit_pre_params_after_event(&self.model, y, p, tol);
-            return Ok(ProjectedInitialEventOutcome {
-                final_t: t_start,
-                observations,
-                action,
-            });
+            return self.finish_unscheduled_initial_phase(
+                ProjectedPostInitialEventInput {
+                    y,
+                    p,
+                    t: t_start,
+                    tol,
+                    max_iters,
+                    row_filter: EventUpdateRowFilter::All,
+                },
+                |y, p| project_algebraics(y, p, t_start),
+            );
         };
         let right_t = initial_event_right_limit(event, t_start, t_end);
-        // The accepted initial-event value is the left endpoint of delay
-        // history. A positive-delay query at the synthetic right-limit time
-        // must read that accepted point, not remain in the initialization
-        // identity `delay(u) = u` mode. Commit at the semantic event time
-        // before evaluating the right limit; callers commit the resulting
-        // right-limit point after this boundary returns.
-        if right_t.is_some() {
-            self.commit_delay_history(t_start, y, p)?;
-        }
         // `pre(v)` remains frozen at its initialization value throughout the
         // initial event iteration. The post-event projection is the first
         // right-limit evaluation, so advance every lowered pre slot from the
@@ -284,6 +303,31 @@ impl SolveRuntime {
             final_t: post_t,
             observations,
             action: post_action,
+        })
+    }
+
+    fn finish_unscheduled_initial_phase<P>(
+        &self,
+        input: ProjectedPostInitialEventInput<'_>,
+        project_algebraics: P,
+    ) -> Result<ProjectedInitialEventOutcome, RuntimeSolveError>
+    where
+        P: FnMut(&mut [f64], &mut [f64]) -> Result<bool, RuntimeSolveError>,
+    {
+        commit_pre_params_after_event(&self.model, input.y, input.p, input.tol);
+        let action = self.apply_projected_post_initial_event_update(
+            ProjectedPostInitialEventInput {
+                y: &mut *input.y,
+                p: &mut *input.p,
+                ..input
+            },
+            project_algebraics,
+        )?;
+        commit_pre_params_after_event(&self.model, input.y, input.p, input.tol);
+        Ok(ProjectedInitialEventOutcome {
+            final_t: input.t,
+            observations: Vec::new(),
+            action,
         })
     }
 

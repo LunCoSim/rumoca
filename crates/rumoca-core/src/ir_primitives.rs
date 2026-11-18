@@ -1,6 +1,6 @@
 //! Shared IR primitives used by multiple Rumoca IR crates.
 
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
@@ -1096,6 +1096,19 @@ pub enum BuiltinFunction {
 }
 
 impl BuiltinFunction {
+    /// The arguments whose values the call reads.
+    ///
+    /// MLS §10.1: `size(a, i)` and `ndims(a)` read only the declared
+    /// dimensions of `a`, never its elements, so the array operand is not a
+    /// value read; the dimension index of `size` is.
+    pub fn value_args(self, args: &[Expression]) -> &[Expression] {
+        match self {
+            Self::Size => args.get(1..).unwrap_or_default(),
+            Self::Ndims => &[],
+            _ => args,
+        }
+    }
+
     /// Intrinsics whose spelling may be shadowed and therefore require their
     /// exact predefined Resolve identity.
     pub const PREDEFINED_IDENTITY_REQUIRED: &'static [Self] = &[

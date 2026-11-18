@@ -430,17 +430,41 @@ fn algebraic_row_reads_a_derivative_through_its_defining_equation() {
 }
 
 #[test]
-fn discrete_row_still_rejects_a_derivative_coordinate() {
+fn checked_b1b_row_substitutes_its_matched_derivative_definition() {
+    // This checked DAE row tests Appendix B.1b's residual capability. The
+    // source declaration obligation is tested independently in rumoca-compile;
+    // a declared source discrete Real still needs an actual when owner.
     let model = derivative_alias_model(true, &[]);
-    let error = lower_solve_problem(&model).unwrap_err();
-    assert!(
-        matches!(
-            &error,
-            LowerError::NonComputable { reason, .. }
-                if reason.contains("escaped checked structural substitution")
-        ),
-        "only continuous algebraic and initial rows resolve a derivative: {error:?}"
+    let solve =
+        lower_solve_problem(&model).expect("the matched derivative has an issued definition");
+    solve
+        .validate()
+        .expect("the checked row satisfies Solve storage contracts");
+    assert_eq!(
+        solve
+            .solver_named_report(0..solve.solver_scalar_count())
+            .unwrap(),
+        ["x", "a"]
     );
+    assert_eq!(
+        solve.discrete.update_targets,
+        [solve.layout.binding("d").unwrap()]
+    );
+    assert_eq!(solve.discrete.clock_owners, [None]);
+    let parameters = vec![73.0; solve.solve_layout.compiled_parameter_len];
+    for state in [2.0, -3.0, 0.0] {
+        let mut output = [f64::NAN];
+        rumoca_eval_solve::eval_scalar_program_block(
+            &solve.discrete.rhs,
+            &[state, 19.0],
+            &parameters,
+            0.25,
+            None,
+            &mut output,
+        )
+        .expect("the B.1b right-hand side evaluates using the continuous definition");
+        assert_eq!(output, [-state]);
+    }
 }
 
 #[test]
@@ -467,7 +491,12 @@ fn check_wrapped_derivative_alias(wrappers: &[dae::UnaryOperator]) {
     let model = derivative_alias_model(false, wrappers);
     let solve =
         lower_solve_problem(&model).expect("signed equation wrappers preserve computability");
-    assert_eq!(solve.solve_layout.solver_maps.names, ["x", "a"]);
+    assert_eq!(
+        solve
+            .solver_named_report(0..solve.solver_scalar_count())
+            .unwrap(),
+        ["x", "a"]
+    );
     let derivative = rumoca_eval_solve::to_scalar_program_block(&solve.continuous.derivative_rhs)
         .expect("derivative has a checked execution view");
     let residual = rumoca_eval_solve::to_scalar_program_block(&solve.continuous.residual)
@@ -579,20 +608,15 @@ fn affine_state_equation_preserves_its_runtime_parameter_coefficient() {
     );
 }
 
+/// A fixed zero coefficient leaves `der(x)` read by no equation, so `x` is
+/// not a state (SPEC_0040 STRUCT-T04): the residual `0*der(x) - x` determines
+/// `x` as an algebraic, and no derivative isolator is issued.
 #[test]
-fn zero_affine_derivative_coefficient_fails_before_runtime() {
+fn zero_affine_derivative_coefficient_declares_the_state_algebraic() {
     let source = TestSource::new("parameter Real p=0; Real x; p*der(x)-x=0;");
-    let state_span = source.at(20, 26).span();
     let model = scaled_state_model(source, 0.0);
 
-    let error = lower_solve_problem(&model).unwrap_err();
-    assert!(
-        matches!(
-            &error,
-            LowerError::Structural { reason, span }
-                if reason == "structurally singular system: 0 matched out of 1 equations and 1 unknowns"
-                    && *span == Some(state_span)
-        ),
-        "a fixed zero coefficient cannot match the derivative: {error:?}"
-    );
+    let solve = lower_solve_problem(&model).expect("the zero-coefficient system lowers");
+    assert_eq!(solve.solve_layout.state_scalar_count(), 0);
+    assert_eq!(solve.solve_layout.algebraic_scalar_count(), 1);
 }

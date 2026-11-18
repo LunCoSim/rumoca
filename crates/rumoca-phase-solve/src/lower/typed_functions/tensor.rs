@@ -1,6 +1,7 @@
 //! Tensor-native expression lowering.
 
 use super::*;
+use crate::lower::{LiteralPower, literal_power_plan};
 
 enum BinaryTensorBuiltin {
     Cross,
@@ -8,6 +9,40 @@ enum BinaryTensorBuiltin {
 }
 
 impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
+    /// `base` raised to a literal Integer exponent as the shared plan of the
+    /// canonical integer-power rule.
+    fn repeated_product(
+        &mut self,
+        base: solve::ProgramRegister<'program>,
+        plan: LiteralPower,
+        at: rumoca_core::Span,
+    ) -> Result<solve::ProgramRegister<'program>, solve::SolveProgramConstructionError> {
+        let one = self
+            .builder
+            .constant(solve::SolveValue::real(arithmetic_profile(), 1.0), at)?;
+        if plan.magnitude == 0 {
+            return Ok(one);
+        }
+        let base = if plan.reciprocal {
+            self.builder
+                .binary(solve::SolveBinaryOperator::Divide, one, base, at)?
+        } else {
+            base
+        };
+        let mut values = vec![base];
+        let mut latest = base;
+        for (first, second) in plan.steps() {
+            latest = self.builder.binary(
+                solve::SolveBinaryOperator::Multiply,
+                values[first],
+                values[second],
+                at,
+            )?;
+            values.push(latest);
+        }
+        Ok(latest)
+    }
+
     // SPEC_0021: Exception - exhaustive binary-operator lowering dispatch.
     #[allow(clippy::too_many_lines)]
     pub(super) fn binary(
@@ -18,6 +53,16 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         rhs: dae::ExprId<'dae>,
         at: rumoca_core::Span,
     ) -> Result<LoweredValue<'program, 'dae>, solve::SolveProgramConstructionError> {
+        if operator == dae::BinaryOperator::Power
+            && self
+                .view
+                .expression(lhs)
+                .is_some_and(|node| !node.value_type().is_scalar())
+        {
+            return Err(solve::SolveProgramConstructionError::InvalidTensorAlgebra {
+                provenance: at,
+            });
+        }
         let lhs_lowered = self.expression(lhs)?;
         let rhs_lowered = self.expression(rhs)?;
         // MLS 3.7 §10.6: an element-wise result over a zero-size operand is
@@ -38,6 +83,10 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             .expression(rhs)
             .expect("checked rhs resolves")
             .value_type();
+        if let Some(plan) = literal_power_plan(self.view, operator, lhs, rhs) {
+            let register = self.repeated_product(lhs_value, plan, at)?;
+            return Ok(LoweredValue::scalar(value_type, register));
+        }
         let division = matches!(
             operator,
             dae::BinaryOperator::Divide | dae::BinaryOperator::ElementwiseDivide
@@ -59,6 +108,17 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         // is converted.
         let lhs_integer = self.integer_register(lhs_value, at)?;
         let rhs_integer = self.integer_register(rhs_value, at)?;
+        if power && real_result && rhs_integer {
+            if lhs_integer {
+                lhs_value = self.builder.convert(
+                    solve::SolveConversionOperator::IntegerToReal,
+                    lhs_value,
+                    at,
+                )?;
+            }
+            let register = self.integer_exponent_power(lhs_value, rhs_value, at)?;
+            return Ok(LoweredValue::scalar(value_type, register));
+        }
         let in_real = division
             || power
             || real_result
@@ -137,13 +197,13 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             dae::BinaryOperator::Divide | dae::BinaryOperator::ElementwiseDivide
                 if !lhs_type.is_scalar() && rhs_type.is_scalar() =>
             {
-                let one = self
-                    .builder
-                    .constant(solve::SolveValue::real(arithmetic_profile(), 1.0), at)?;
-                let reciprocal =
-                    self.builder
-                        .binary(solve::SolveBinaryOperator::Divide, one, rhs_value, at)?;
-                self.builder.scale(lhs_value, reciprocal, at)
+                self.builder.broadcast_binary(
+                    solve::SolveBinaryOperator::Divide,
+                    lhs_value,
+                    rhs_value,
+                    false,
+                    at,
+                )
             }
             dae::BinaryOperator::Equal
             | dae::BinaryOperator::NotEqual
@@ -293,20 +353,22 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             return Ok(LoweredValue::empty(value_type));
         }
         if matches!(builtin, dae::PureBuiltin::Zeros | dae::PureBuiltin::Ones) {
-            let value = if builtin == dae::PureBuiltin::Zeros {
-                0.0
-            } else {
-                1.0
-            };
-            let value = self
-                .builder
-                .constant(solve::SolveValue::real(arithmetic_profile(), value), at)?;
-            let dimensions = self
+            let generated = self
                 .view
                 .value_type(value_type)
-                .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
-                .dimensions()
-                .to_vec();
+                .ok_or(solve::SolveProgramConstructionError::WireMismatch)?;
+            let element = i64::from(builtin == dae::PureBuiltin::Ones);
+            // The element has the scalar type of the generated array.
+            let value = match generated.scalar_type() {
+                dae::ScalarType::Real => {
+                    solve::SolveValue::real(arithmetic_profile(), element as f64)
+                }
+                _ => solve::SolveValue::integer(arithmetic_profile(), element).map_err(|_| {
+                    solve::SolveProgramConstructionError::ProfileMismatch { provenance: at }
+                })?,
+            };
+            let dimensions = generated.dimensions().to_vec();
+            let value = self.builder.constant(value, at)?;
             let register = self.builder.fill(value, dimensions, at)?;
             return Ok(LoweredValue::scalar(value_type, register));
         }
@@ -494,9 +556,21 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             dae::PureBuiltin::Abs => self
                 .builder
                 .unary(solve::SolveUnaryOperator::Abs, value, at),
+            // MLS 3.7 §3.7.1 expands `sign(v)` into an if-expression over the
+            // Integer literals -1, 0 and 1, so a Real operand yields an Integer.
             dae::PureBuiltin::Sign => {
-                self.builder
-                    .unary(solve::SolveUnaryOperator::Sign, value, at)
+                let sign = self
+                    .builder
+                    .unary(solve::SolveUnaryOperator::Sign, value, at)?;
+                if self.integer_register(sign, at)? {
+                    Ok(sign)
+                } else {
+                    self.builder.convert(
+                        solve::SolveConversionOperator::RealToIntegerTowardZero,
+                        sign,
+                        at,
+                    )
+                }
             }
             dae::PureBuiltin::Sqrt => {
                 self.builder
@@ -692,10 +766,10 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
     /// Lower one MLS 3.7 §3.7.2 Operator 3.4/3.5/3.6 quotient with a checked
     /// Real result: `ratio = lhs / rhs`, floored (`mod`) or truncated
     /// (`div`/`rem`), then `lhs - quotient * rhs` for the remainder forms —
-    /// the same composition the model-level scalar lowering uses. An Integer
-    /// result takes the exact integer composition of [`Self::integer_quotient`].
-    /// Mixed Integer operands promote through `IntegerToReal`, exactly like the
-    /// binary arithmetic promotion above.
+    /// the same composition the model-level scalar lowering uses. Integer
+    /// results use exact typed quotient operations. Mixed Integer operands
+    /// promote through `IntegerToReal`, exactly
+    /// like the binary arithmetic promotion above.
     fn quotient(
         &mut self,
         value_type: dae::ValueTypeId<'dae>,
@@ -777,47 +851,17 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
     ) -> Result<LoweredValue<'program, 'dae>, solve::SolveProgramConstructionError> {
         let lhs = self.expression(dividend)?.only_register(at)?;
         let rhs = self.expression(divisor)?.only_register(at)?;
-        let quotient =
-            self.builder
-                .binary(solve::SolveBinaryOperator::IntegerQuotient, lhs, rhs, at)?;
-        if builtin == dae::PureBuiltin::Div {
-            return Ok(LoweredValue::scalar(value_type, quotient));
-        }
-        let multiple =
-            self.builder
-                .binary(solve::SolveBinaryOperator::Multiply, quotient, rhs, at)?;
-        let remainder =
-            self.builder
-                .binary(solve::SolveBinaryOperator::Subtract, lhs, multiple, at)?;
-        if builtin == dae::PureBuiltin::Rem {
-            return Ok(LoweredValue::scalar(value_type, remainder));
-        }
-        let zero = solve::SolveValue::integer(arithmetic_profile(), 0).map_err(|_| {
-            solve::SolveProgramConstructionError::ProfileMismatch { provenance: at }
-        })?;
-        let zero = self.builder.constant(zero, at)?;
-        let nonzero =
-            self.builder
-                .compare(solve::SolveCompareOperator::NotEqual, remainder, zero, at)?;
-        let remainder_negative =
-            self.builder
-                .compare(solve::SolveCompareOperator::Less, remainder, zero, at)?;
-        let divisor_negative =
-            self.builder
-                .compare(solve::SolveCompareOperator::Less, rhs, zero, at)?;
-        let signs_differ = self.builder.compare(
-            solve::SolveCompareOperator::NotEqual,
-            remainder_negative,
-            divisor_negative,
-            at,
-        )?;
-        let adjust =
-            self.builder
-                .binary(solve::SolveBinaryOperator::And, nonzero, signs_differ, at)?;
-        let shifted = self
-            .builder
-            .binary(solve::SolveBinaryOperator::Add, remainder, rhs, at)?;
-        let register = self.builder.select(adjust, shifted, remainder, at)?;
+        let operator = match builtin {
+            dae::PureBuiltin::Div => solve::SolveBinaryOperator::IntegerQuotient,
+            dae::PureBuiltin::Mod => solve::SolveBinaryOperator::IntegerModulo,
+            dae::PureBuiltin::Rem => solve::SolveBinaryOperator::IntegerRemainder,
+            _ => {
+                return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
+                    provenance: at,
+                });
+            }
+        };
+        let register = self.builder.binary(operator, lhs, rhs, at)?;
         Ok(LoweredValue::scalar(value_type, register))
     }
 }

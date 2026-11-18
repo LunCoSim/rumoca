@@ -459,8 +459,10 @@ fn discrete_real_connection_keeps_continuous_pass_through_equation() {
 }
 
 #[test]
-fn array_discrete_real_binding_keeps_one_target_shaped_b1b_owner() {
-    let source = TestSource::new("model M discrete Real z[3] = {1.0, 2.0, 3.0}; end M;");
+fn array_when_discrete_real_keeps_one_target_shaped_b1b_owner() {
+    let source = TestSource::new(
+        "model M discrete Real z[3]; equation when true then z = {1.0, 2.0, 3.0}; end when; end M;",
+    );
     let declaration_span = source.span("discrete Real z[3]", 0);
     let binding_span = source.span("{1.0, 2.0, 3.0}", 0);
     let mut model = test_model();
@@ -475,18 +477,35 @@ fn array_discrete_real_binding_keeps_one_target_shaped_b1b_owner() {
     );
     let variable = model.variables.get_mut(&VarName::new("z")).unwrap();
     variable.variability = Variability::Discrete(Default::default());
-    variable.binding = Some(Expression::Array {
-        elements: [1.0, 2.0, 3.0]
-            .into_iter()
-            .map(|value| Expression::Literal {
-                value: Literal::Real(value),
-                span: binding_span,
-            })
-            .collect(),
-        kind: rumoca_core::ArrayConstructor::Array,
-        span: binding_span,
-    });
     variable.source_span = declaration_span;
+    let condition_span = source.span("true", 0);
+    let mut branch = flat::WhenBranch::new(
+        Expression::Literal {
+            value: Literal::Boolean(true),
+            span: condition_span,
+        },
+        condition_span,
+    );
+    branch.add_equation(flat::WhenEquation::assign(
+        VarName::new("z"),
+        Expression::Array {
+            elements: [1.0, 2.0, 3.0]
+                .into_iter()
+                .map(|value| Expression::Literal {
+                    value: Literal::Real(value),
+                    span: binding_span,
+                })
+                .collect(),
+            kind: rumoca_core::ArrayConstructor::Array,
+            span: binding_span,
+        },
+        source.span("z = {1.0, 2.0, 3.0}", 0),
+        "whole-array when assignment",
+    ));
+    model.when_chains.push(flat::WhenChain::new(
+        branch,
+        source.span("when true then z = {1.0, 2.0, 3.0}; end when", 0),
+    ));
 
     let dae = construct(&model, source.map).unwrap();
     dae.inspect(|view| {
@@ -494,7 +513,7 @@ fn array_discrete_real_binding_keeps_one_target_shaped_b1b_owner() {
         let equation = view.discrete_real_equation(0).unwrap();
         assert!(matches!(
             equation.activation(),
-            dae::DiscreteRealActivation::Always
+            dae::DiscreteRealActivation::When { .. }
         ));
         assert_eq!(
             view.expression(equation.residual())
@@ -1298,18 +1317,27 @@ fn b1c_classification_ignores_discrete_guards_inside_a_continuous_value() {
 #[test]
 fn b1c_classification_rejects_mixed_discrete_and_continuous_if_branches() {
     let source = TestSource::new(
-        "model M Boolean m; Real y; equation if true then m = true; else y = 2.0; end if; end M;",
+        "model M Boolean m; Real y; equation if time > 0.5 then m = true; else y = 2.0; end if; end M;",
     );
     let mut model = test_model();
     add_primitive_variable(&mut model, &source, "m", "Boolean m", 8, Vec::new(), true);
     add_primitive_variable(&mut model, &source, "y", "Real y", 9, Vec::new(), false);
-    let owner = source.span("if true then m = true; else y = 2.0; end if", 0);
+    let owner = source.span("if time > 0.5 then m = true; else y = 2.0; end if", 0);
     model.add_equation(flat::Equation::new(
         Expression::If {
             branches: vec![(
-                Expression::Literal {
-                    value: Literal::Boolean(true),
-                    span: source.span("true", 0),
+                Expression::Binary {
+                    op: OpBinary::Gt,
+                    lhs: Box::new(Expression::VarRef {
+                        name: Reference::new("time"),
+                        subscripts: Vec::new(),
+                        span: source.span("time", 0),
+                    }),
+                    rhs: Box::new(Expression::Literal {
+                        value: Literal::Real(0.5),
+                        span: source.span("0.5", 0),
+                    }),
+                    span: source.span("time > 0.5", 0),
                 },
                 Expression::Binary {
                     op: OpBinary::Sub,
@@ -1320,7 +1348,7 @@ fn b1c_classification_rejects_mixed_discrete_and_continuous_if_branches() {
                     }),
                     rhs: Box::new(Expression::Literal {
                         value: Literal::Boolean(true),
-                        span: source.span("true", 1),
+                        span: source.span("true", 0),
                     }),
                     span: owner,
                 },
@@ -1814,10 +1842,13 @@ fn initial_pre_equation_uses_checked_discrete_initial_value_owner() {
     });
 }
 
+/// MLS 3.7 §8.6 lets the initial value of `d` read an input, which the
+/// environment supplies before initialization, so the initial equation is the
+/// coordinate's initial-value definition rather than a numeric row.
 #[test]
-fn coupled_initial_discrete_real_definition_remains_a_numeric_initialization_row() {
+fn initial_discrete_real_definition_from_an_input_is_a_definition() {
     let source = TestSource::new(
-        "model M discrete Real d; input Real u; initial equation d = u; equation d = u; end M;",
+        "model M discrete Real d; input Real u; initial equation d = u; equation when true then d = u; end when; end M;",
     );
     let mut model = test_model();
     let mut target = flat::Variable::empty_with_span(source.span("discrete Real d", 0));
@@ -1875,12 +1906,29 @@ fn coupled_initial_discrete_real_definition_remains_a_numeric_initialization_row
         )
     };
     model.initial_equations.push(equation(0));
-    model.equations.push(equation(1));
+    let condition_span = source.span("true", 0);
+    let mut branch = flat::WhenBranch::new(
+        Expression::Literal {
+            value: Literal::Boolean(true),
+            span: condition_span,
+        },
+        condition_span,
+    );
+    branch.add_equation(flat::WhenEquation::assign(
+        VarName::new("d"),
+        variable_reference(&source, "u", "d = u", 1, Vec::new()),
+        source.span("d = u", 1),
+        "sampled input",
+    ));
+    model.when_chains.push(flat::WhenChain::new(
+        branch,
+        source.span("when true then d = u; end when", 0),
+    ));
 
     let dae = construct(&model, source.map).unwrap();
     dae.inspect(|view| {
-        assert_eq!(view.initial_discrete_value_count(), 0);
-        assert_eq!(view.initialization_owner_count(), 1);
+        assert_eq!(view.initial_discrete_value_count(), 1);
+        assert_eq!(view.initialization_owner_count(), 0);
     });
 }
 
@@ -1971,13 +2019,13 @@ fn malformed_flat_rejects_second_independent_when_owner_for_one_target() {
             .when_chains
             .push(flat::WhenChain::new(branch, source.span(owner, 0)));
     }
-    let second_owner = source.span("when false then m = false; end when", 0);
+    let second_assignment = source.span("m = false", 0);
     let error = construct(&model, source.map).unwrap_err();
 
     assert!(matches!(
         error,
         ToDaeError::DiscreteSolvedFormViolation { detail, span }
-            if span == second_owner && detail.contains("`m`")
+            if span == second_assignment && detail.contains("`m`")
     ));
 }
 

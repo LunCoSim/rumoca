@@ -1,8 +1,9 @@
 use indexmap::IndexMap;
 use rumoca_ir_dae as dae;
 
-#[cfg(feature = "scheduled-sim")]
-use crate::SimulationSessionApi;
+scheduled_executor_items! {
+    use crate::SimulationSessionApi;
+}
 use crate::{SimSolverMode, SimulationDiagnosticError};
 
 #[derive(Debug, Clone)]
@@ -37,7 +38,9 @@ impl SimulationSession {
         match opts.solver_mode {
             SimSolverMode::Auto => new_auto_session(dae_model, opts),
             SimSolverMode::Bdf => new_bdf_session(dae_model, opts),
-            SimSolverMode::RkLike => new_rk_like_session(dae_model, opts),
+            SimSolverMode::RkLike | SimSolverMode::VelImplicit => {
+                new_rk_like_session(dae_model, opts)
+            }
         }
     }
 
@@ -108,6 +111,17 @@ impl SimulationSession {
         }
     }
 
+    /// The engine the session selected for its Solve programs and, when
+    /// compiled execution was refused for an admissible request, why.
+    pub fn execution_receipt(&self) -> rumoca_solver::SimExecutionReceipt {
+        match &self.inner {
+            #[cfg(feature = "solver-diffsol")]
+            SimulationSessionInner::Diffsol(session) => session.execution_receipt(),
+            #[cfg(feature = "solver-rk45")]
+            SimulationSessionInner::RkLike(session) => session.execution_receipt(),
+        }
+    }
+
     pub fn time(&self) -> f64 {
         match &self.inner {
             #[cfg(feature = "solver-diffsol")]
@@ -174,55 +188,56 @@ impl SimulationSession {
     }
 }
 
-#[cfg(feature = "scheduled-sim")]
-impl SimulationSessionApi for SimulationSession {
-    type Error = SimulationDiagnosticError;
+scheduled_executor_items! {
+    impl SimulationSessionApi for SimulationSession {
+        type Error = SimulationDiagnosticError;
 
-    fn reset(&mut self, t_start: f64) -> Result<(), Self::Error> {
-        Self::reset(self, t_start)
-    }
-
-    fn set_inputs(&mut self, inputs: &[(&str, f64)]) -> Result<(), Self::Error> {
-        Self::set_inputs(self, inputs)
-    }
-
-    fn ensure_end_time(&mut self, target_time: f64) {
-        Self::ensure_end_time(self, target_time);
-    }
-
-    fn advance_to(&mut self, target_time: f64) -> Result<(), Self::Error> {
-        Self::advance_to(self, target_time)
-    }
-
-    fn time(&self) -> f64 {
-        Self::time(self)
-    }
-
-    fn get(&self, name: &str) -> Result<Option<f64>, Self::Error> {
-        Self::get(self, name)
-    }
-
-    fn values_for(&self, names: &[String]) -> Result<Option<IndexMap<String, f64>>, Self::Error> {
-        match &self.inner {
-            #[cfg(feature = "solver-diffsol")]
-            SimulationSessionInner::Diffsol(session) => session
-                .values_for(names)
-                .map(Some)
-                .map_err(|err| SimulationDiagnosticError::Solver(err.to_string())),
-            #[cfg(feature = "solver-rk45")]
-            SimulationSessionInner::RkLike(session) => session
-                .values_for(names)
-                .map(Some)
-                .map_err(|err| SimulationDiagnosticError::Solver(err.to_string())),
+        fn reset(&mut self, t_start: f64) -> Result<(), Self::Error> {
+            Self::reset(self, t_start)
         }
-    }
 
-    fn max_schedule_advance_dt(&self) -> Option<f64> {
-        match &self.inner {
-            #[cfg(feature = "solver-diffsol")]
-            SimulationSessionInner::Diffsol(session) => session.max_schedule_advance_dt(),
-            #[cfg(feature = "solver-rk45")]
-            SimulationSessionInner::RkLike(_) => None,
+        fn set_inputs(&mut self, inputs: &[(&str, f64)]) -> Result<(), Self::Error> {
+            Self::set_inputs(self, inputs)
+        }
+
+        fn ensure_end_time(&mut self, target_time: f64) {
+            Self::ensure_end_time(self, target_time);
+        }
+
+        fn advance_to(&mut self, target_time: f64) -> Result<(), Self::Error> {
+            Self::advance_to(self, target_time)
+        }
+
+        fn time(&self) -> f64 {
+            Self::time(self)
+        }
+
+        fn get(&self, name: &str) -> Result<Option<f64>, Self::Error> {
+            Self::get(self, name)
+        }
+
+        fn values_for(&self, names: &[String]) -> Result<Option<IndexMap<String, f64>>, Self::Error> {
+            match &self.inner {
+                #[cfg(feature = "solver-diffsol")]
+                SimulationSessionInner::Diffsol(session) => session
+                    .values_for(names)
+                    .map(Some)
+                    .map_err(|err| SimulationDiagnosticError::Solver(err.to_string())),
+                #[cfg(feature = "solver-rk45")]
+                SimulationSessionInner::RkLike(session) => session
+                    .values_for(names)
+                    .map(Some)
+                    .map_err(|err| SimulationDiagnosticError::Solver(err.to_string())),
+            }
+        }
+
+        fn max_schedule_advance_dt(&self) -> Option<f64> {
+            match &self.inner {
+                #[cfg(feature = "solver-diffsol")]
+                SimulationSessionInner::Diffsol(session) => session.max_schedule_advance_dt(),
+                #[cfg(feature = "solver-rk45")]
+                SimulationSessionInner::RkLike(_) => None,
+            }
         }
     }
 }

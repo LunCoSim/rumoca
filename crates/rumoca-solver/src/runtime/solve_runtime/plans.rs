@@ -34,8 +34,7 @@ pub(super) struct VisibleExpressionGroup {
 #[derive(Clone)]
 pub(super) struct VisibleValuePlan {
     pub(super) entries: Vec<VisibleValuePlanEntry>,
-    pub(super) expression_rows: Vec<usize>,
-    pub(super) expression_groups: Vec<VisibleExpressionGroup>,
+    pub(super) expressions: super::native_specialization::ProgramSelection,
 }
 
 #[derive(Clone, Copy)]
@@ -55,34 +54,31 @@ pub(super) enum RootConditionPlanEntry {
 #[derive(Clone)]
 pub(super) struct RootConditionPlan {
     pub(super) entries: Vec<RootConditionPlanEntry>,
-    pub(super) evaluated_rows: Vec<usize>,
     pub(super) search_rows: Vec<usize>,
+    /// The evaluated (static and searched) and the searched root outputs,
+    /// grouped by owning program with the plan.
+    pub(super) evaluated: super::native_specialization::ProgramSelection,
+    pub(super) search: super::native_specialization::ProgramSelection,
 }
 
-pub(super) fn visible_value_plan(model: &solve::SolveModel) -> Option<VisibleValuePlan> {
-    let rows = &model.visible_value_rows;
-    if rows.output_count() != model.visible_names.len()
+pub(super) fn visible_value_plan(
+    rows: &solve::ScalarProgramBlock,
+    visible_count: usize,
+) -> Option<VisibleValuePlan> {
+    if rows.row_count() != visible_count
+        || rows.output_count() != visible_count
         || !rows.uses_local_contiguous_output_indices()
     {
         return None;
     }
-    if rows.row_count() != model.visible_names.len()
-        || rows
-            .programs()
-            .iter()
-            .any(|row| solve::ScalarProgramBlock::program_output_count(row) != 1)
-    {
-        return Some(VisibleValuePlan {
-            entries: vec![VisibleValuePlanEntry::Expression; model.visible_names.len()],
-            expression_rows: (0..model.visible_names.len()).collect(),
-            expression_groups: Vec::new(),
-        });
-    }
     let mut entries = Vec::with_capacity(rows.row_count());
-    let mut expression_rows = Vec::new();
     let mut expression_groups = Vec::new();
     let mut expression_groups_by_fingerprint = FxHashMap::<u64, Vec<usize>>::default();
     for (row_idx, row) in rows.programs().iter().enumerate() {
+        let output_count = solve::ScalarProgramBlock::program_output_count(row);
+        if output_count != 1 {
+            return None;
+        }
         if let Some(source) = direct_visible_source(row, rows.program_span(row_idx)) {
             entries.push(VisibleValuePlanEntry::Direct(source));
             continue;
@@ -99,7 +95,6 @@ pub(super) fn visible_value_plan(model: &solve::SolveModel) -> Option<VisibleVal
         ) {
             Some(group_idx) => expression_groups[group_idx].output_indices.push(row_idx),
             None => {
-                expression_rows.push(row_idx);
                 let group_index = expression_groups.len();
                 expression_groups.push(VisibleExpressionGroup {
                     row_index: row_idx,
@@ -114,8 +109,21 @@ pub(super) fn visible_value_plan(model: &solve::SolveModel) -> Option<VisibleVal
     }
     Some(VisibleValuePlan {
         entries,
-        expression_rows,
-        expression_groups,
+        expressions: super::native_specialization::ProgramSelection::from_groups(
+            expression_groups
+                .into_iter()
+                .map(|group| {
+                    (
+                        group.row_index,
+                        group
+                            .output_indices
+                            .into_iter()
+                            .map(|output| (output, 0))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ),
     })
 }
 
@@ -126,13 +134,16 @@ pub(super) fn root_condition_plan(model: &solve::SolveModel) -> Option<RootCondi
     }
     let search = solve::RootSearchPlan::derive(&model.problem);
     let mut entries = Vec::with_capacity(search.len());
-    let mut evaluated_rows = Vec::new();
     let mut search_rows = Vec::new();
+    let mut evaluated = Vec::new();
+    let mut search_groups = Vec::new();
     let mut output = 0;
     for (program, row) in roots.programs().iter().enumerate() {
         let span = roots.program_span(program);
         let first = output;
         output += solve::ScalarProgramBlock::program_output_count(row);
+        let mut evaluated_group = Vec::new();
+        let mut search_group = Vec::new();
         for index in first..output {
             let role = *search.roles().get(index)?;
             entries.push(match role {
@@ -144,15 +155,22 @@ pub(super) fn root_condition_plan(model: &solve::SolveModel) -> Option<RootCondi
                     })
                 }
                 solve::RootSearchRole::Static => {
-                    evaluated_rows.push(index);
+                    evaluated_group.push((index, index - first));
                     RootConditionPlanEntry::ContinuousStatic
                 }
                 solve::RootSearchRole::Search => {
-                    evaluated_rows.push(index);
                     search_rows.push(index);
+                    evaluated_group.push((index, index - first));
+                    search_group.push((index, index - first));
                     RootConditionPlanEntry::Dynamic
                 }
             });
+        }
+        if !evaluated_group.is_empty() {
+            evaluated.push((program, evaluated_group));
+        }
+        if !search_group.is_empty() {
+            search_groups.push((program, search_group));
         }
     }
     if output != search.len() {
@@ -161,15 +179,16 @@ pub(super) fn root_condition_plan(model: &solve::SolveModel) -> Option<RootCondi
     tracing::debug!(
         target: "rumoca_solver::root_plan",
         roots = entries.len(),
-        evaluated = evaluated_rows.len(),
+        evaluated = evaluated.iter().map(|(_, group)| group.len()).sum::<usize>(),
         search = search_rows.len(),
         scheduled = model.problem.events.scheduled_root_conditions.len(),
         "root condition execution plan"
     );
     Some(RootConditionPlan {
         entries,
-        evaluated_rows,
         search_rows,
+        evaluated: super::native_specialization::ProgramSelection::from_groups(evaluated),
+        search: super::native_specialization::ProgramSelection::from_groups(search_groups),
     })
 }
 
@@ -292,32 +311,6 @@ pub(super) fn direct_time_root_time(
         .get(root.param_index)
         .copied()
         .ok_or_else(|| missing_direct_visible_input("p", root.param_index, root.span))
-}
-
-pub(super) fn copy_grouped_expression_values(
-    groups: &[VisibleExpressionGroup],
-    values: &mut [f64],
-) -> Result<(), RuntimeSolveError> {
-    for group in groups {
-        let value = values
-            .get(group.row_index)
-            .copied()
-            .ok_or_else(|| visible_plan_output_index_error(group.row_index, values.len()))?;
-        for &output_index in &group.output_indices {
-            let len = values.len();
-            let slot = values
-                .get_mut(output_index)
-                .ok_or_else(|| visible_plan_output_index_error(output_index, len))?;
-            *slot = value;
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn visible_plan_output_index_error(index: usize, len: usize) -> RuntimeSolveError {
-    RuntimeSolveError::solve_ir(format!(
-        "visible value plan output index {index} out of bounds for {len} values"
-    ))
 }
 
 /// Total root-condition count: the model's own conditions plus the roots the

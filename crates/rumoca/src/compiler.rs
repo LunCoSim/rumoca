@@ -45,20 +45,22 @@ use rumoca_compile::codegen::{
     render_dae_template_with_name, render_flat_template_with_name,
 };
 use rumoca_compile::compile::{
-    Dae, DaeCompilationResult as CompileDaeCompilationResult, FlatModel, Session, SessionConfig,
-    SourceRootKind, VariableRole,
+    Dae, DaeCompilationResult as CompileDaeCompilationResult, FlatModel, SemanticDiagnosticsMode,
+    Session, SessionConfig, SourceRootKind, VariableRole,
 };
-use rumoca_compile::parsing::collect_compile_unit_source_files;
+use rumoca_compile::parsing::{StoredDefinition, collect_compile_unit_source_files};
 use rumoca_compile::source_roots::{
-    PackageLayoutError, canonical_path_key, parse_source_root_with_cache, plan_source_root_loads,
-    referenced_unloaded_source_root_paths, render_source_root_status_message,
-    resolve_source_root_cache_dir, source_root_source_set_key,
+    PackageLayoutError, canonical_path_key, parse_source_root_with_cache,
+    render_source_root_status_message, resolve_source_root_cache_dir, source_root_source_set_key,
 };
 use rumoca_core::DiagnosticSeverity;
 use rumoca_phase_resolve::ResolvedTree;
-use rumoca_sim::{lower_solve_artifacts, lower_solve_problem};
+use rumoca_sim::{lower_solve_artifacts, lower_solve_package, lower_solve_problem};
 
 use crate::error::CompilerError;
+
+#[cfg(test)]
+mod tuple_calls_tests;
 
 /// Result of a successful compilation.
 #[derive(Debug)]
@@ -78,7 +80,8 @@ pub struct CompilationResult {
     solve_template_renderer: std::sync::OnceLock<SolveTemplateRenderer>,
     /// Cached solve-template renderer for targets that never read the `dae`
     /// template entry.
-    solve_template_renderer_without_dae: std::sync::OnceLock<SolveTemplateRenderer>,
+    solve_template_renderer_without_dae:
+        std::sync::OnceLock<Result<SolveTemplateRenderer, CompilerError>>,
 }
 
 #[derive(Clone, Copy)]
@@ -130,21 +133,31 @@ pub enum TemplateIr {
 }
 
 fn build_solve_template_renderer(dae_model: &Dae) -> Result<SolveTemplateRenderer, CompilerError> {
-    let problem = lower_solve_problem(dae_model)
+    let package = lower_solve_package(dae_model)
         .map_err(|err| CompilerError::TemplateError(CodegenError::template(err.to_string())))?;
-    let artifacts = lower_solve_artifacts(&problem)
+    let artifacts = lower_solve_artifacts(&package.problem)
         .map_err(|err| CompilerError::TemplateError(CodegenError::template(err.to_string())))?;
-    SolveTemplateRenderer::new_owned_with_dae(problem, artifacts, dae_model)
-        .map_err(CompilerError::TemplateError)
+    SolveTemplateRenderer::new_owned_with_dae_and_calls(
+        package.problem,
+        artifacts,
+        package.pure_calls,
+        dae_model,
+    )
+    .map_err(CompilerError::TemplateError)
 }
 
 fn build_solve_template_renderer_without_dae(
     dae_model: &Dae,
 ) -> Result<SolveTemplateRenderer, CompilerError> {
-    let problem = lower_solve_problem(dae_model)
+    let package = lower_solve_package(dae_model)
         .map_err(|err| CompilerError::TemplateError(CodegenError::template(err.to_string())))?;
-    let artifacts = rumoca_ir_solve::SolveArtifacts::default();
-    SolveTemplateRenderer::new(&problem, &artifacts, "").map_err(CompilerError::TemplateError)
+    SolveTemplateRenderer::new_owned_with_calls(
+        package.problem,
+        rumoca_ir_solve::SolveArtifacts::default(),
+        package.pure_calls,
+        "",
+    )
+    .map_err(CompilerError::TemplateError)
 }
 
 impl CompilationResult {
@@ -231,21 +244,22 @@ impl CompilationResult {
         template: &str,
         model_name: &str,
     ) -> Result<String, CompilerError> {
-        if self.solve_template_renderer_without_dae.get().is_none() {
-            let renderer = build_solve_template_renderer_without_dae(&self.dae)?;
-            let _ = self.solve_template_renderer_without_dae.set(renderer);
-        }
-        let renderer = self
-            .solve_template_renderer_without_dae
-            .get()
-            .ok_or_else(|| {
-                CompilerError::TemplateError(CodegenError::template(
-                    "solve template renderer was not initialized after build",
-                ))
-            })?;
-        renderer
+        self.solve_renderer_without_dae()?
             .render_with_name(template, model_name)
             .map_err(CompilerError::TemplateError)
+    }
+
+    pub(crate) fn require_scalar_target_projection(&self) -> Result<(), CompilerError> {
+        self.solve_renderer_without_dae()?
+            .require_scalar_derivative_programs()
+            .map_err(CompilerError::TemplateError)
+    }
+
+    fn solve_renderer_without_dae(&self) -> Result<&SolveTemplateRenderer, CompilerError> {
+        self.solve_template_renderer_without_dae
+            .get_or_init(|| build_solve_template_renderer_without_dae(&self.dae))
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     pub fn to_ir_json(&self, ir: TemplateIr) -> Result<String, CompilerError> {
@@ -381,42 +395,27 @@ impl Compiler {
         session: &mut Session,
         source: &str,
     ) -> Result<(), CompilerError> {
-        let loaded_source_root_path_keys = HashSet::new();
-        let referenced_source_root_paths = referenced_unloaded_source_root_paths(
-            source,
-            &self.source_root_paths,
-            &loaded_source_root_path_keys,
-        );
-        let referenced_path_keys = referenced_source_root_paths
-            .iter()
-            .map(|path| canonical_path_key(path))
-            .collect::<HashSet<_>>();
-        for source_root_path in &self.source_root_paths {
-            let path_key = canonical_path_key(source_root_path);
-            if referenced_path_keys.contains(&path_key) {
-                continue;
+        let mut completed = HashSet::new();
+        loop {
+            let load_plan =
+                session.required_source_root_load_plan(source, &self.source_root_paths, &completed);
+            for skipped in &load_plan.duplicate_root_skips {
+                self.log_verbose(format!(
+                    "[rumoca] Skipping source root {} (duplicate root '{}' already loaded from {})",
+                    skipped.source_root_path, skipped.root_name, skipped.provider_path
+                ));
             }
-            self.log_verbose(format!(
-                "[rumoca] Skipping unused source root: {}",
-                source_root_path
-            ));
-        }
-
-        let load_plan =
-            plan_source_root_loads(&referenced_source_root_paths, &loaded_source_root_path_keys);
-        for skipped in &load_plan.duplicate_root_skips {
-            self.log_verbose(format!(
-                "[rumoca] Skipping source root {} (duplicate root '{}' already loaded from {})",
-                skipped.source_root_path, skipped.root_name, skipped.provider_path
-            ));
-        }
-
-        for source_root_path in &load_plan.load_paths {
-            self.log_verbose(format!(
-                "[rumoca] Loading source root: {}",
-                source_root_path
-            ));
-            self.load_source_root_into_session(session, source_root_path)?;
+            if load_plan.load_paths.is_empty() {
+                break;
+            }
+            for source_root_path in &load_plan.load_paths {
+                self.log_verbose(format!(
+                    "[rumoca] Loading source root: {}",
+                    source_root_path
+                ));
+                self.load_source_root_into_session(session, source_root_path)?;
+                completed.insert(canonical_path_key(source_root_path));
+            }
         }
 
         Ok(())
@@ -488,12 +487,17 @@ impl Compiler {
         self.compile_str(&source, path)
     }
 
-    /// Compile a Modelica file through the resolved AST stage only.
-    pub fn compile_file_ast(&self, path: &str) -> Result<ResolvedTree, CompilerError> {
+    /// Parse a Modelica file into its syntax tree (SPEC_0007 Stage 1).
+    ///
+    /// The AST stage carries syntax, comments, and spans only, so this reads
+    /// just the named file: no source root is loaded, no model is selected,
+    /// and no name is resolved. The dump therefore stays available for a file
+    /// whose referenced libraries are missing or fail to resolve.
+    pub fn parse_file(&self, path: &str) -> Result<StoredDefinition, CompilerError> {
         let source =
             fs::read_to_string(path).map_err(|e| CompilerError::io_error(path, e.to_string()))?;
 
-        self.compile_str_ast(&source, path)
+        self.parse_str(&source, path)
     }
 
     /// Compile a Modelica file through the flat-model stage only.
@@ -588,23 +592,42 @@ impl Compiler {
         ))
     }
 
-    /// Compile Modelica source code through the resolved AST stage only.
-    pub fn compile_str_ast(
+    /// Parse Modelica source code into its syntax tree (SPEC_0007 Stage 1).
+    ///
+    /// In-memory counterpart to [`Self::parse_file`]: the session stores the
+    /// document exactly as a compile would (extension constructs expanded to
+    /// standard Modelica), and a syntax error is reported with the parser's
+    /// spans instead of a tree.
+    pub fn parse_str(
         &self,
         source: &str,
         file_name: &str,
-    ) -> Result<ResolvedTree, CompilerError> {
+    ) -> Result<StoredDefinition, CompilerError> {
         if self.verbose {
-            eprintln!("[rumoca] Compiling source through AST: {}", file_name);
-            eprintln!("[rumoca] Phase 1-2: Parsing and resolving...");
+            eprintln!("[rumoca] Parsing source: {}", file_name);
+            eprintln!("[rumoca] Phase 1: Parsing (no source roots, no resolution)...");
         }
 
         let mut session = Session::new(SessionConfig::default());
-        self.load_required_source_roots(&mut session, source)?;
-        self.load_local_compile_unit(&mut session, source, file_name)?;
+        let parse_error = session.update_document(file_name, source);
+        if let Some(message) = parse_error {
+            let Some((diagnostics, source_map)) =
+                session.document_parse_diagnostics_with_source_map(file_name)
+            else {
+                return Err(CompilerError::ParseError(message));
+            };
+            return Err(CompilerError::SourceDiagnosticsError {
+                summary: format!("failed to parse `{file_name}`"),
+                diagnostics,
+                source_map: Box::new(source_map),
+            });
+        }
         session
-            .resolved()
-            .map_err(|err| CompilerError::ResolveError(err.to_string()))
+            .get_document(file_name)
+            .and_then(|document| document.parsed().cloned())
+            .ok_or_else(|| {
+                CompilerError::ParseError(format!("no syntax tree stored for `{file_name}`"))
+            })
     }
 
     /// Compile Modelica source code through the flat-model stage only.
@@ -734,25 +757,19 @@ fn loaded_source_root_document_uri(
 /// Print every warning-severity diagnostic the compiled model carries.
 ///
 /// A compile that succeeds still has things the language requires a tool to
-/// say — MLS 3.7 §12.3 deprecates an external function that declares no
+/// say: MLS 3.7 §12.3 deprecates an external function that declares no
 /// purity, and MLS 3.6 §12.3 stated the report as a requirement. Those
 /// diagnostics exist in the session, but until they are printed the only
 /// consumers are the editor and the API, so a `rumoca compile` run reports
 /// nothing and the deprecation reaches nobody. Warnings never change the exit
 /// status: they are reports, not rejections.
 ///
-/// Cost, measured and not yet paid down: this asks the session for the model's
-/// diagnostics, and that query re-walks the interface, body, and model stages
-/// behind their own caches, which the compile above did not fill in the same
-/// shape. On one MSL model (`…OpAmps.OpAmpCircuits.Add`, three runs each, same
-/// binary) the report adds 0.64 s to a plain compile (11.81 → 12.45 s), 0.52 s
-/// to `--emit flat-json` (11.90 → 12.42 s), and 2.10 s to `--emit dae-json`
-/// (11.48 → 13.58 s). Paying nothing needs either a stage-limited diagnostics
-/// query or warnings carried out of the compile that already ran, both of which
-/// are new session plumbing in `rumoca-compile`; that is filed rather than
-/// hidden here.
+/// The report is the model's target-scoped (save) diagnostics: they read the
+/// strict target resolution the compile retained and the stage queries it
+/// filled, so reporting resolves nothing again and covers exactly the classes
+/// the model reaches.
 fn report_compile_warnings(session: &mut Session, model_name: &str) {
-    let diagnostics = session.compile_model_diagnostics(model_name);
+    let diagnostics = session.semantic_diagnostics_query(model_name, SemanticDiagnosticsMode::Save);
     let source_map = diagnostics.source_map;
     for diagnostic in diagnostics
         .diagnostics
@@ -1257,6 +1274,30 @@ mod tests {
         );
     }
 
+    /// SPEC_0040 DAE-C22: a call argument a declared output dimension of the
+    /// callee reads fixes the result shape at translation, so it is reported
+    /// once, at the call, naming the parameter that can no longer be set.
+    #[test]
+    fn a_keyed_function_argument_parameter_is_reported_at_its_call() {
+        let source = "function ramp\n  input Integer n;\n  output Real y[n];\nalgorithm\n  \
+                      y := zeros(n);\n  for i in 1:n loop\n    y[i] := i;\n  end for;\nend ramp;\n\
+                      model Keyed\n  parameter Integer n = 3;\n  Real y;\nequation\n  \
+                      y = sum(ramp(n));\nend Keyed;\n";
+        let compiler = Compiler::new().model("Keyed");
+        let mut session = loaded_session(&compiler, source, "Keyed.mo");
+        let warnings = rendered_warnings(&mut session, "Keyed")
+            .into_iter()
+            .filter(|warning| warning.contains("WD001"))
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // The label is the `ramp(n)` call: zero-based line 13.
+        assert!(
+            warnings[0].contains("parameter n cannot be set")
+                && warnings[0].contains("Keyed.mo:13"),
+            "{warnings:?}"
+        );
+    }
+
     fn rendered_warnings(session: &mut Session, model_name: &str) -> Vec<String> {
         let diagnostics = session.compile_model_diagnostics(model_name);
         let source_map = diagnostics.source_map;
@@ -1284,13 +1325,20 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let root = temp.path().join("lib");
         let model_file = write_source_root_library(&root);
-        let root_str = root.to_string_lossy().to_string();
         let model_name = "Pkg.Sub.Root";
+        let by_name_source = format!("model Probe\n  {model_name} r;\nend Probe;\n");
+        let probe_file = root.join("Probe.mo");
+        fs::write(&probe_file, &by_name_source).expect("write probe");
+        let probe_name = probe_file.to_string_lossy().to_string();
+        let root_str = root.to_string_lossy().to_string();
         let compiler = Compiler::new().model(model_name).source_root(&root_str);
 
         let file_source = fs::read_to_string(&model_file).expect("read model");
         let file_name = model_file.to_string_lossy().to_string();
         let mut by_file = loaded_session(&compiler, &file_source, &file_name);
+        let mut by_name = loaded_session(&compiler, &by_name_source, &probe_name);
+        assert_eq!(by_file.document_uris(), by_name.document_uris());
+        assert_eq!(by_file.document_uris().len(), 6);
 
         // Every library file stays the source root's parsed document with no
         // live text overlay: none was re-read and re-parsed as a workspace
@@ -1298,8 +1346,10 @@ mod tests {
         for file in [
             "Pkg/package.mo",
             "Pkg/Ext.mo",
+            "Pkg/Sub/package.mo",
             "Pkg/Sub/Helper.mo",
             "Pkg/Sub/Root.mo",
+            "Probe.mo",
         ] {
             // Documents are keyed by the path the source-root walk produced
             // under the root as given: native separators, no canonicalization
@@ -1310,27 +1360,41 @@ mod tests {
                 .fold(root.clone(), |path, component| path.join(component))
                 .to_string_lossy()
                 .to_string();
-            assert!(
-                by_file.is_source_root_backed_document(&uri),
-                "{uri} must remain a source-root document"
+            assert_eq!(
+                by_file
+                    .get_document(&uri)
+                    .expect("library document")
+                    .parsed(),
+                by_name
+                    .get_document(&uri)
+                    .expect("library document")
+                    .parsed()
             );
-            let document = by_file.get_document(&uri).expect("library document");
-            assert!(
-                document.content.is_empty(),
-                "{uri} must not be re-parsed as a workspace document"
-            );
+            for session in [&by_file, &by_name] {
+                assert!(
+                    session.is_source_root_backed_document(&uri),
+                    "{uri} must remain a source-root document"
+                );
+                let document = session.get_document(&uri).expect("library document");
+                assert!(
+                    document.content.is_empty(),
+                    "{uri} must not be re-parsed as a workspace document"
+                );
+                assert_eq!(
+                    session.document_source_text(&uri).expect("source").as_ref(),
+                    fs::read_to_string(&uri).expect("read source")
+                );
+            }
         }
 
-        let by_name_source = format!("model Probe\n  {model_name} r;\nend Probe;\n");
-        let mut by_name = loaded_session(&compiler, &by_name_source, "Probe.mo");
         assert_eq!(
             rendered_warnings(&mut by_file, model_name),
             rendered_warnings(&mut by_name, model_name),
             "a model file inside a loaded source root reports the by-name diagnostics"
         );
 
-        // The by-name compile also carries the probe document in its source
-        // map; the compiled model itself must be identical.
+        // SPEC_0001: declaration ids belong to a compilation unit. Both paths
+        // use the same source inventory, so the complete storage must match.
         let dae_storage = |json: String| {
             let value: serde_json::Value = serde_json::from_str(&json).expect("DAE JSON");
             value["storage"].clone()
@@ -1341,7 +1405,7 @@ mod tests {
             .to_json()
             .expect("json");
         let from_name = compiler
-            .compile_str(&by_name_source, "Probe.mo")
+            .compile_str(&by_name_source, &probe_name)
             .expect("compile by name")
             .to_json()
             .expect("json");
@@ -1795,3 +1859,6 @@ mod tests {
         assert!(msg.contains("shared"), "actual message: {msg}");
     }
 }
+
+#[cfg(test)]
+mod source_root_tests;

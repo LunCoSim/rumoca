@@ -309,7 +309,7 @@ fn collapse_index_refs_collapses_indexed_field_access_to_known_var() {
         },
     ));
 
-    collapse_index_refs_to_known_varrefs(&mut model);
+    collapse_index_refs_to_known_varrefs(&mut model).expect("known occurrence projection");
 
     assert!(matches!(
         &model.equations[0].residual,
@@ -338,7 +338,7 @@ fn collapse_index_refs_collapses_indexed_var_ref_to_known_scalar_var() {
         },
     ));
 
-    collapse_index_refs_to_known_varrefs(&mut model);
+    collapse_index_refs_to_known_varrefs(&mut model).expect("known occurrence projection");
 
     assert!(matches!(
         &model.equations[0].residual,
@@ -1113,6 +1113,7 @@ fn substitutes_package_constant_in_structured_template_and_preserves_binder() {
     model.add_structured_equation(flat::StructuredEquationFamily {
         domain: rumoca_core::StructuredIndexDomain {
             binders: vec![rumoca_core::StructuredIndexBinder {
+                provenance: rumoca_core::IndexBinderProvenance::Generated,
                 id: 0,
                 display_name: "i".to_string(),
                 lower: 1,
@@ -1129,7 +1130,7 @@ fn substitutes_package_constant_in_structured_template_and_preserves_binder() {
             body: vec![table_index],
             scalar_view: rumoca_core::ComprehensionScalarView::BinderSubstitution,
         }),
-        interiors_materialized: true,
+        interiors: flat::FamilyInteriors::Materialized,
     });
     let mut ctx = Context::new();
     ctx.constant_values.insert(

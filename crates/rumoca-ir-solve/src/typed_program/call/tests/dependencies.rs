@@ -1,5 +1,94 @@
+mod coordinate_precision;
+mod regions;
+
 use super::*;
+use crate::SolveBinaryOperator;
 use std::collections::BTreeSet;
+
+#[test]
+fn aggregate_presence_forwarded_to_a_scalar_call_keeps_scalar_coordinates() {
+    // One complete assigned payload has one scalar Boolean presence flag.
+    // Its payload rank must not become that Boolean's dependency rank.
+    for dimensions in [vec![], vec![3], vec![3, 17]] {
+        let payload = real_shape(dimensions);
+        let boolean = SolveValueType::scalar(SolveScalarType::Boolean);
+        let table = SolvePureCallTable::construct(profile(), |table| {
+            let child = add_passthrough_owner(table, identity(950), &boolean, span(950))?;
+            table.add_owner(
+                identity(951),
+                vec![payload.clone(), payload.clone()],
+                vec![SolvePureCallOutput::result(boolean.clone())],
+                span(951),
+                |builder, inputs, outputs| {
+                    let value = builder.load(inputs[0], span(952))?;
+                    let assigned = builder.present_assigned_state(value, span(953))?;
+                    let present = builder.assigned_state_is_present(assigned, span(954))?;
+                    let result = builder.call(child, &[present], span(955))?;
+                    builder.store(outputs[0], result[0], span(956))
+                },
+            )?;
+            Ok(())
+        })
+        .expect("a scalar presence predicate has a valid scalar call interface");
+        for checked in [
+            table.clone(),
+            serde_json::from_value(serde_json::to_value(&table).unwrap()).unwrap(),
+        ] {
+            let coordinates = output_coordinates(checked.owners()[1].call_site(), false);
+            assert_eq!(
+                coordinates,
+                vec![(0..payload.scalar_count() as usize).collect()],
+                "presence must conservatively depend on the used payload only"
+            );
+        }
+    }
+}
+
+#[test]
+fn selected_presence_forwarded_to_a_scalar_call_keeps_only_selected_coordinates() {
+    for slice in [false, true] {
+        let table = selected_presence_table(slice);
+        for checked in [
+            table.clone(),
+            serde_json::from_value(serde_json::to_value(&table).unwrap()).unwrap(),
+        ] {
+            let expected = if slice { vec![19, 20, 21] } else { vec![19] };
+            assert_eq!(
+                output_coordinates(checked.owners()[1].call_site(), false),
+                vec![expected.into_iter().collect()],
+                "presence must not widen a selection or include the unused input"
+            );
+        }
+    }
+}
+
+fn selected_presence_table(slice: bool) -> SolvePureCallTable {
+    let payload = real_shape(vec![3, 17]);
+    let boolean = SolveValueType::scalar(SolveScalarType::Boolean);
+    SolvePureCallTable::construct(profile(), |table| {
+        let child = add_passthrough_owner(table, identity(960), &boolean, span(960))?;
+        table.add_owner(
+            identity(961),
+            vec![payload.clone(), payload],
+            vec![SolvePureCallOutput::result(boolean.clone())],
+            span(961),
+            |builder, inputs, outputs| {
+                let value = builder.load(inputs[0], span(962))?;
+                let selected = if slice {
+                    builder.project_slice(value, vec![1, 2], vec![1, 3], span(963))?
+                } else {
+                    builder.project_element(value, vec![1, 2], span(963))?
+                };
+                let assigned = builder.present_assigned_state(selected, span(964))?;
+                let present = builder.assigned_state_is_present(assigned, span(965))?;
+                let result = builder.call(child, &[present], span(966))?;
+                builder.store(outputs[0], result[0], span(967))
+            },
+        )?;
+        Ok(())
+    })
+    .expect("selected presence has a scalar call interface")
+}
 
 fn output_coordinates(site: SolvePureCallSite, directional: bool) -> Vec<BTreeSet<usize>> {
     use crate::{LinearOp, StructuralPattern, TensorInputKind};
@@ -76,7 +165,7 @@ fn input_leaves(outputs: &[Box<[crate::SolveCallDependency]>]) -> Vec<Box<[usize
         .map(|dependencies| {
             dependencies
                 .iter()
-                .map(crate::SolveCallDependency::input_index)
+                .flat_map(crate::SolveCallDependency::inputs)
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect()
@@ -397,29 +486,13 @@ fn typed_leaf_dependency_metadata_does_not_scale_with_tensor_extent() {
 }
 
 #[test]
-fn owner_replay_rejects_changed_primal_and_directional_site_summaries() {
+fn replayed_owner_tables_derive_the_same_dependency_summaries_as_issued_ones() {
     let table = separated_outputs(3);
+    let restored: SolvePureCallTable =
+        serde_json::from_value(serde_json::to_value(&table).unwrap()).unwrap();
     let site = table.owners()[1].call_site();
-    let original = serde_json::to_value(&site).unwrap();
-    for path in ["/dependencies/0", "/directional/dependencies/0"] {
-        let mut missing = original.clone();
-        *missing.pointer_mut(path).unwrap() = serde_json::json!([]);
-        let mut wrong_input = original.clone();
-        wrong_input.pointer_mut(path).unwrap()[0]["input"] = serde_json::json!(99);
-        let mut wrong_coordinate = original.clone();
-        wrong_coordinate.pointer_mut(path).unwrap()[0]["coordinates"]["subscripts"][0]["coeffs"]
-            [0] = serde_json::json!(0);
-        for forged in [missing, wrong_input, wrong_coordinate] {
-            let forged: SolvePureCallSite = serde_json::from_value(forged).unwrap();
-            assert!(!table.matches_site(&forged));
-            if path.starts_with("/directional") {
-                assert!(!table.matches_directional_site(forged.directional().unwrap()));
-            }
-        }
-    }
-    let mut missing = original;
-    missing.as_object_mut().unwrap().remove("dependencies");
-    assert!(serde_json::from_value::<SolvePureCallSite>(missing).is_err());
+    assert!(restored.matches_site(&site));
+    assert!(restored.matches_directional_site(site.directional().unwrap()));
 }
 
 #[test]
@@ -504,4 +577,126 @@ fn a_replaced_local_store_does_not_retain_the_old_value_dependency() {
         input_leaves(table.owners()[0].call_site().output_dependencies()),
         &[vec![1].into_boxed_slice()]
     );
+}
+
+/// `d[i] = (g[i + 2] - g[i]) / 2` over `i in 1:4`, written as one typed map.
+fn stencil_map() -> SolvePureCallTable {
+    let input = real_shape(vec![6]);
+    let output = real_shape(vec![4]);
+    SolvePureCallTable::construct(profile(), |table| {
+        table.add_owner(
+            identity(1),
+            vec![input],
+            vec![SolvePureCallOutput::result(output.clone())],
+            span(0),
+            |builder, inputs, outputs| {
+                let g = builder.load(inputs[0], span(1))?;
+                let domain = rumoca_core::StructuredIndexDomain {
+                    binders: vec![rumoca_core::StructuredIndexBinder {
+                        provenance: rumoca_core::IndexBinderProvenance::Generated,
+                        id: 0,
+                        display_name: "i".to_string(),
+                        lower: 1,
+                        upper: 4,
+                        step: 1,
+                    }],
+                };
+                let d = builder.map(
+                    domain,
+                    &[g],
+                    real_shape(Vec::new()),
+                    span(2),
+                    |builder, captures, binders, output| {
+                        let g = builder.load(captures[0], span(3))?;
+                        let i = builder.load(binders[0], span(4))?;
+                        let two = SolveValue::integer(profile(), 2).unwrap();
+                        let two = builder.constant(two, span(5))?;
+                        let ahead = builder.binary(SolveBinaryOperator::Add, i, two, span(6))?;
+                        let high = builder.project_element_dynamic(g, &[ahead], span(7))?;
+                        let low = builder.project_element_dynamic(g, &[i], span(8))?;
+                        let difference =
+                            builder.binary(SolveBinaryOperator::Subtract, high, low, span(9))?;
+                        let half = builder.constant(SolveValue::real(profile(), 2.0), span(10))?;
+                        let value = builder.binary(
+                            SolveBinaryOperator::Divide,
+                            difference,
+                            half,
+                            span(11),
+                        )?;
+                        builder.store(output, value, span(12))
+                    },
+                )?;
+                builder.store(outputs[0], d, span(13))
+            },
+        )?;
+        Ok(())
+    })
+    .unwrap()
+}
+
+/// A map reads only the elements its body addresses, so each output depends
+/// on its two stencil points, in the value and in the directional form.
+#[test]
+fn a_stencil_map_depends_on_exactly_its_points() {
+    let table = stencil_map();
+    let site = table.owners()[0].call_site();
+    let expected = (0..4)
+        .map(|i| BTreeSet::from([i, i + 2]))
+        .collect::<Vec<_>>();
+    assert_eq!(output_coordinates(site.clone(), false), expected);
+    // Directional inputs are the value then its tangent; outputs likewise.
+    let directional = output_coordinates(site, true);
+    assert_eq!(&directional[..4], &expected[..]);
+    for (i, tangent) in directional[4..].iter().enumerate() {
+        assert_eq!(tangent, &BTreeSet::from([i, i + 2, i + 6, i + 8]));
+    }
+}
+
+const WIDE_LEAVES: usize = 64;
+
+/// One owner over `WIDE_LEAVES` scalar inputs: the first result sums every
+/// input, the second copies the last.
+fn wide_sum_table() -> SolvePureCallTable {
+    let scalar = SolveValueType::scalar(SolveScalarType::real(profile()));
+    SolvePureCallTable::construct(profile(), |table| {
+        table.add_owner(
+            identity(1),
+            vec![scalar.clone(); WIDE_LEAVES],
+            vec![
+                SolvePureCallOutput::result(scalar.clone()),
+                SolvePureCallOutput::result(scalar.clone()),
+            ],
+            span(0),
+            |builder, inputs, outputs| {
+                let mut sum = builder.load(inputs[0], span(1))?;
+                for &input in &inputs[1..] {
+                    let next = builder.load(input, span(2))?;
+                    sum = builder.binary(SolveBinaryOperator::Add, sum, next, span(3))?;
+                }
+                let last = builder.load(inputs[WIDE_LEAVES - 1], span(4))?;
+                builder.store(outputs[0], sum, span(5))?;
+                builder.store(outputs[1], last, span(6))
+            },
+        )?;
+        Ok(())
+    })
+    .unwrap()
+}
+
+#[test]
+fn an_output_reading_every_leaf_of_a_wide_interface_summarizes_one_run() {
+    let table = wide_sum_table();
+    let site = table.owners()[0].call_site();
+    let summaries = site.output_dependencies();
+    assert_eq!(summaries[0].len(), 1);
+    assert_eq!(summaries[0][0].inputs(), 0..WIDE_LEAVES);
+    assert_eq!(summaries[1].len(), 1);
+    assert_eq!(summaries[1][0].inputs(), WIDE_LEAVES - 1..WIDE_LEAVES);
+}
+
+#[test]
+fn structural_dependencies_of_a_run_summary_cover_every_leaf_of_the_run() {
+    let actual = output_coordinates(wide_sum_table().owners()[0].call_site(), false);
+    assert_eq!(actual[0], (0..WIDE_LEAVES).collect::<BTreeSet<_>>());
+    assert_eq!(actual[1], BTreeSet::from([WIDE_LEAVES - 1]));
 }

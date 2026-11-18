@@ -38,6 +38,14 @@ fn var(name: &str) -> rumoca_core::Expression {
     }
 }
 
+fn generated_var(name: &str) -> rumoca_core::Expression {
+    rumoca_core::Expression::VarRef {
+        name: rumoca_core::Reference::generated(name),
+        subscripts: vec![],
+        span: test_span(),
+    }
+}
+
 fn indexed_var(name: &str, index: i64) -> rumoca_core::Expression {
     rumoca_core::Expression::VarRef {
         name: rumoca_core::Reference::new(name),
@@ -121,6 +129,8 @@ fn empty_param_context<'a>(
         known_bools,
         known_enums,
         array_dims,
+        known_values: no_known_values(),
+        resources: None,
         functions,
         var_context: None,
     }
@@ -178,6 +188,8 @@ fn eval_integer_div_operator_requires_exact_quotient() {
         known_bools: &known_bools,
         known_enums: &known_enums,
         array_dims: &array_dims,
+        known_values: no_known_values(),
+        resources: None,
         functions: &functions,
         var_context: None,
     };
@@ -280,6 +292,52 @@ fn infer_scalar_user_function_broadcasts_array_argument_dims() {
         ),
         Some(vec![6])
     );
+}
+
+#[test]
+fn infer_scalar_user_function_does_not_broadcast_dimensions_its_formal_consumes() {
+    let mut functions = FxHashMap::default();
+    let mut function = rumoca_core::Function::new("Tables.lookup", test_span());
+    function.add_input(
+        function_param("table", TestScalar::Real, vec![1, 2]).with_shape_expr(vec![
+            rumoca_core::Subscript::index(1, test_span()),
+            rumoca_core::Subscript::index(2, test_span()),
+        ]),
+    );
+    function.add_input(function_param("u", TestScalar::Real, Vec::new()));
+    function.add_output(function_param("y", TestScalar::Real, Vec::new()));
+    functions.insert("Tables.lookup".to_string(), function);
+
+    let known_ints = FxHashMap::default();
+    let known_reals = FxHashMap::default();
+    let known_bools = FxHashMap::default();
+    let known_enums = FxHashMap::default();
+    let mut array_dims = FxHashMap::default();
+    array_dims.insert("clutch.mu_pos".to_string(), vec![1, 2]);
+    array_dims.insert("clutch.samples".to_string(), vec![4]);
+    let infer = |expr: &rumoca_core::Expression| {
+        infer_array_dimensions_full_with_functions(
+            expr,
+            &ParamEvalContext::new(
+                &known_ints,
+                &known_reals,
+                &known_bools,
+                &known_enums,
+                &array_dims,
+                &functions,
+                Some("clutch.mu0"),
+            ),
+        )
+    };
+
+    let scalar_use = function_call("Tables.lookup", vec![var("mu_pos"), real(0.0)]);
+    assert_eq!(
+        infer(&scalar_use),
+        None,
+        "the matrix formal consumes the table dimensions"
+    );
+    let sampled = function_call("Tables.lookup", vec![var("mu_pos"), var("samples")]);
+    assert_eq!(infer(&sampled), Some(vec![4]));
 }
 
 #[test]
@@ -391,6 +449,8 @@ fn eval_integer_div_builtin_remains_truncating() {
         known_bools: &known_bools,
         known_enums: &known_enums,
         array_dims: &array_dims,
+        known_values: no_known_values(),
+        resources: None,
         functions: &functions,
         var_context: None,
     };
@@ -704,6 +764,8 @@ fn eval_integer_if_uses_canonicalized_enum_condition() {
         known_bools: &FxHashMap::default(),
         known_enums: &known_enums,
         array_dims: &FxHashMap::default(),
+        known_values: no_known_values(),
+        resources: None,
         functions: &FxHashMap::default(),
         var_context: Some("pipe.nFMDistributed"),
     };
@@ -760,6 +822,8 @@ fn eval_integer_if_resolves_unqualified_enum_condition_with_var_context() {
         known_bools: &FxHashMap::default(),
         known_enums: &known_enums,
         array_dims: &FxHashMap::default(),
+        known_values: no_known_values(),
+        resources: None,
         functions: &FxHashMap::default(),
         var_context: Some("Bessel.na"),
     };
@@ -780,6 +844,8 @@ fn eval_integer_prefers_scoped_unqualified_name_over_global_name() {
         known_bools: &FxHashMap::default(),
         known_enums: &FxHashMap::default(),
         array_dims: &FxHashMap::default(),
+        known_values: no_known_values(),
+        resources: None,
         functions: &FxHashMap::default(),
         var_context: Some("machine.rotor.converter.orientation"),
     };
@@ -847,6 +913,8 @@ fn eval_integer_if_handles_integer_builtin_with_scoped_enum_conditions() {
         known_bools: &FxHashMap::default(),
         known_enums: &known_enums,
         array_dims: &FxHashMap::default(),
+        known_values: no_known_values(),
+        resources: None,
         functions: &FxHashMap::default(),
         var_context: Some("Bessel.na"),
     };
@@ -916,6 +984,8 @@ fn eval_integer_field_access_does_not_recover_an_overqualified_record_path() {
         known_bools: &FxHashMap::default(),
         known_enums: &FxHashMap::default(),
         array_dims: &FxHashMap::default(),
+        known_values: no_known_values(),
+        resources: None,
         functions: &FxHashMap::default(),
         var_context: Some("stack.cell[1,1].cell.cellData.nRC"),
     };
@@ -940,6 +1010,8 @@ fn eval_integer_if_returns_common_value_when_condition_unknown() {
         known_bools: &FxHashMap::default(),
         known_enums: &FxHashMap::default(),
         array_dims: &FxHashMap::default(),
+        known_values: no_known_values(),
+        resources: None,
         functions: &FxHashMap::default(),
         var_context: None,
     };
@@ -984,6 +1056,8 @@ fn scoped_lookup_keeps_a_dot_inside_a_subscript_within_one_path_segment() {
         known_bools: &FxHashMap::default(),
         known_enums: &FxHashMap::default(),
         array_dims: &FxHashMap::default(),
+        known_values: no_known_values(),
+        resources: None,
         functions: &FxHashMap::default(),
         var_context: Some("pkg.arr[data.medium].y"),
     };
@@ -1038,8 +1112,9 @@ fn infer_array_dims_from_comprehension_range_and_body() {
     known_ints.insert("n".to_string(), 4);
 
     let expr = rumoca_core::Expression::ArrayComprehension {
-        expr: Box::new(var("i")),
+        expr: Box::new(generated_var("i")),
         indices: vec![rumoca_core::ComprehensionIndex {
+            binder: rumoca_core::IndexBinderProvenance::Generated,
             name: "i".to_string(),
             range: rumoca_core::Expression::Range {
                 start: Box::new(int(1)),
@@ -1071,8 +1146,9 @@ fn infer_array_dims_with_context_resolves_scoped_if_matrix_columns() {
 
     let table_column = var("table");
     let generated_column = rumoca_core::Expression::ArrayComprehension {
-        expr: Box::new(var("i")),
+        expr: Box::new(generated_var("i")),
         indices: vec![rumoca_core::ComprehensionIndex {
+            binder: rumoca_core::IndexBinderProvenance::Generated,
             name: "i".to_string(),
             range: rumoca_core::Expression::Range {
                 start: Box::new(int(1)),
@@ -1144,8 +1220,9 @@ fn infer_array_dims_with_context_preserves_vector_column_rows() {
     array_dims.insert("booleanTable.table".to_string(), vec![7]);
 
     let generated_column = rumoca_core::Expression::ArrayComprehension {
-        expr: Box::new(var("i")),
+        expr: Box::new(generated_var("i")),
         indices: vec![rumoca_core::ComprehensionIndex {
+            binder: rumoca_core::IndexBinderProvenance::Generated,
             name: "i".to_string(),
             range: rumoca_core::Expression::Range {
                 start: Box::new(int(1)),
@@ -1196,9 +1273,10 @@ fn infer_array_dims_with_context_resolves_boolean_table_binding() {
     let generated_column = rumoca_core::Expression::ArrayComprehension {
         expr: Box::new(call(
             rumoca_core::BuiltinFunction::Mod,
-            vec![var("i"), real(2.0)],
+            vec![generated_var("i"), real(2.0)],
         )),
         indices: vec![rumoca_core::ComprehensionIndex {
+            binder: rumoca_core::IndexBinderProvenance::Generated,
             name: "i".to_string(),
             range: rumoca_core::Expression::Range {
                 start: Box::new(int(1)),
@@ -1259,11 +1337,12 @@ fn infer_array_dims_with_context_resolves_boolean_table_binding() {
 fn infer_array_dims_from_nested_comprehension_body_shape() {
     let expr = rumoca_core::Expression::ArrayComprehension {
         expr: Box::new(rumoca_core::Expression::Array {
-            elements: vec![var("i"), var("i")],
+            elements: vec![generated_var("i"), generated_var("i")],
             kind: rumoca_core::ArrayConstructor::Array,
             span: rumoca_core::Span::DUMMY,
         }),
         indices: vec![rumoca_core::ComprehensionIndex {
+            binder: rumoca_core::IndexBinderProvenance::Generated,
             name: "i".to_string(),
             range: rumoca_core::Expression::Range {
                 start: Box::new(int(1)),
@@ -1297,7 +1376,10 @@ fn infer_array_dims_from_nested_comprehension_body_shape() {
         unreachable!()
     };
     let varying = rumoca_core::Expression::ArrayComprehension {
-        expr: Box::new(call(rumoca_core::BuiltinFunction::Zeros, vec![var("i")])),
+        expr: Box::new(call(
+            rumoca_core::BuiltinFunction::Zeros,
+            vec![generated_var("i")],
+        )),
         indices,
         filter: None,
         span: rumoca_core::Span::DUMMY,
@@ -1384,6 +1466,7 @@ fn comprehension_index_does_not_shadow_a_resolved_component_identity() {
     let expr = rumoca_core::Expression::ArrayComprehension {
         expr: Box::new(component),
         indices: vec![rumoca_core::ComprehensionIndex {
+            binder: rumoca_core::IndexBinderProvenance::Generated,
             name: "i".to_owned(),
             range: rumoca_core::Expression::Range {
                 start: Box::new(int(1)),
@@ -1417,12 +1500,13 @@ fn comprehension_index_selects_a_scalar_without_a_compile_time_value() {
             name: rumoca_core::Reference::new("data")
                 .with_instance_id(rumoca_core::InstanceId::new(18)),
             subscripts: vec![rumoca_core::Subscript::Expr {
-                expr: Box::new(var("i")),
+                expr: Box::new(generated_var("i")),
                 span: rumoca_core::Span::DUMMY,
             }],
             span: rumoca_core::Span::DUMMY,
         }),
         indices: vec![rumoca_core::ComprehensionIndex {
+            binder: rumoca_core::IndexBinderProvenance::Generated,
             name: "i".to_owned(),
             range: rumoca_core::Expression::Range {
                 start: Box::new(int(1)),
@@ -1452,8 +1536,9 @@ fn comprehension_index_selects_a_scalar_without_a_compile_time_value() {
 #[test]
 fn infer_array_dims_from_comprehension_returns_none_with_filter() {
     let expr = rumoca_core::Expression::ArrayComprehension {
-        expr: Box::new(var("i")),
+        expr: Box::new(generated_var("i")),
         indices: vec![rumoca_core::ComprehensionIndex {
+            binder: rumoca_core::IndexBinderProvenance::Generated,
             name: "i".to_string(),
             range: rumoca_core::Expression::Range {
                 start: Box::new(int(1)),
@@ -1464,7 +1549,7 @@ fn infer_array_dims_from_comprehension_returns_none_with_filter() {
         }],
         filter: Some(Box::new(rumoca_core::Expression::Binary {
             op: rumoca_core::OpBinary::Gt,
-            lhs: Box::new(var("i")),
+            lhs: Box::new(generated_var("i")),
             rhs: Box::new(int(1)),
             span: rumoca_core::Span::DUMMY,
         })),

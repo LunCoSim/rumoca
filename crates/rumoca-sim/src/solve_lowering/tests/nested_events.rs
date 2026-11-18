@@ -341,23 +341,16 @@ end ExternalCounter;
             ..Default::default()
         };
         let component = crate::prepare_fmi_component(&model, &options).unwrap();
-        let declaration_inputs = serde_json::to_value(component.construction_inputs()).unwrap();
-        let wire = rumoca_phase_solve::fmi::runtime_fmi_component_wire(&component).unwrap();
+        let root = component.runtime_view().retain_assertion_root();
+        let wire = crate::retained_fmi_component_wire(&root).unwrap();
         let encoded = serde_json::to_string(&wire).unwrap();
+        drop(root);
         drop(component);
         let mut deserializer = serde_json::Deserializer::from_str(&encoded);
-        let component =
-            rumoca_phase_solve::fmi::deserialize_fmi_component(&mut deserializer).unwrap();
+        let component = crate::deserialize_fmi_component(&mut deserializer).unwrap();
+        let root = component.runtime_view().retain_assertion_root();
         assert_eq!(
-            serde_json::to_value(component.construction_inputs()).unwrap(),
-            declaration_inputs,
-            "runtime persistence preserves admitted declaration facts"
-        );
-        assert_eq!(
-            serde_json::to_string(
-                &rumoca_phase_solve::fmi::runtime_fmi_component_wire(&component).unwrap()
-            )
-            .unwrap(),
+            serde_json::to_string(&crate::retained_fmi_component_wire(&root).unwrap()).unwrap(),
             encoded,
             "checked runtime replay has a canonical construction wire"
         );

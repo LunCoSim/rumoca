@@ -105,6 +105,7 @@ fn seed_reads_fit(program: &[crate::LinearOp], active: &[usize]) -> bool {
 fn seed_operation_fits(operation: &crate::LinearOp, active: &[usize]) -> bool {
     use crate::LinearOp as L;
     match operation {
+        L::PureCallObservation { .. } => false,
         L::LoadSeed { index, .. } => active.binary_search(index).is_ok(),
         L::LoadIndexedSeed { base, count, .. } => seed_range_fits(active, *base, *count),
         L::TensorLoad {
@@ -115,7 +116,9 @@ fn seed_operation_fits(operation: &crate::LinearOp, active: &[usize]) -> bool {
         } => *lanes != 2 || seed_start.is_none_or(|start| seed_range_fits(active, start, *count)),
         L::FunctionFold { program, .. }
         | L::GuardedFunctionFold { program, .. }
-        | L::StoreOutputFunctionFold { program, .. } => seed_reads_fit(&program.update, active),
+        | L::StoreOutputFunctionFold { program, .. } => program
+            .regions()
+            .all(|region| seed_reads_fit(region, active)),
         L::FunctionConditional { program, .. } => {
             seed_reads_fit(&program.fallback, active)
                 && program.arms.iter().all(|arm| {

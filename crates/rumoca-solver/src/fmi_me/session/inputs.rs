@@ -1,7 +1,8 @@
 //! Input transactions belong to the common master (SPEC_0044 ME-HOST-001/ME-BUF-001).
 
-use super::{MeSessionError, MeSessionLoss, MeSimulationSession, host_state::RecordedInput};
-use crate::fmi_me::{MeTime, MeValueRef};
+use super::host_state::{RecordedInput, close_excursion, update_discrete_states_to_completion};
+use super::{MeSessionError, MeSessionLoss, MeSimulationSession};
+use crate::fmi_me::{MeEventCause, MeTime, MeValueRef};
 
 impl MeSimulationSession<'_, '_> {
     /// Apply one declared input through the same transaction as a batch.
@@ -23,16 +24,24 @@ impl MeSimulationSession<'_, '_> {
         let mut current = vec![0.0; references.len()];
         self.host
             .kernel
-            .borrow()
+            .borrow()?
             .get_float64(&references, &mut current)?;
         if current
             .iter()
             .zip(&values)
             .all(|(before, after)| before.to_bits() == after.to_bits())
         {
-            self.record_inputs(inputs);
-            return Ok(());
+            return self.record_inputs(inputs);
         }
+        // A changed input is a discontinuity at the caller's coordinate: a
+        // deferred live yield (issue #513) becomes a real step boundary first,
+        // but only for a batch the component admits; a refused one changes nothing.
+        self.host
+            .kernel
+            .borrow()?
+            .check_float64_inputs(&references, &values)?;
+        self.truncate_deferred_at_observation()?;
+        self.clear_snapped_yield();
         self.write_inputs(&references, &values)?;
         let correlated = self.correlate_inputs(inputs);
         self.host
@@ -40,7 +49,7 @@ impl MeSimulationSession<'_, '_> {
     }
 
     fn input_references(&self, inputs: &[(&str, f64)]) -> Result<Vec<MeValueRef>, MeSessionError> {
-        let kernel = self.host.kernel.borrow();
+        let kernel = self.host.kernel.borrow()?;
         inputs
             .iter()
             .map(|(name, _)| {
@@ -63,18 +72,44 @@ impl MeSimulationSession<'_, '_> {
         references: &[MeValueRef],
         values: &[f64],
     ) -> Result<(), MeSessionError> {
-        let mut kernel = self.host.kernel.borrow_mut();
-        kernel.set_time(MeTime::at(self.host.time))?;
-        kernel.set_continuous_states(&self.host.states)?;
-        Ok(kernel.set_float64(references, values)?)
+        self.write_input_transaction(|kernel| kernel.set_float64(references, values))
     }
 
-    fn record_inputs(&mut self, inputs: &[(&str, f64)]) {
+    pub(super) fn write_input_transaction(
+        &mut self,
+        write: impl FnOnce(
+            &mut crate::fmi_me::kernel::AcceptedInputWrite<'_>,
+        ) -> Result<(), crate::fmi_me::MeError>,
+    ) -> Result<(), MeSessionError> {
+        let entry = self
+            .host
+            .event_entry(MeEventCause::InputEvent, self.host.time);
+        let result = {
+            let mut kernel = self.host.kernel.borrow_mut()?;
+            match kernel.with_input_rollback(|scope| {
+                scope.position(MeTime::at(self.host.time), &self.host.states, entry)?;
+                write(scope)
+            }) {
+                Ok(()) => Ok(()),
+                Err((error, restoration)) => {
+                    close_excursion(self.host.time, restoration, Err(error.into()))
+                }
+            }
+        };
+        if matches!(result, Err(MeSessionError::AcceptedPointLost { .. })) {
+            self.host
+                .guard_mutation(MeSessionLoss::InputApplication, result)
+        } else {
+            result
+        }
+    }
+
+    fn record_inputs(&mut self, inputs: &[(&str, f64)]) -> Result<(), MeSessionError> {
+        let kernel = self.host.kernel.borrow()?;
         for &(name, value) in inputs {
             if let Some(current) = self.host.inputs.get_mut(name) {
                 current.value = value;
             } else {
-                let kernel = self.host.kernel.borrow();
                 let output_index = kernel
                     .model_description()
                     .output_names
@@ -90,14 +125,21 @@ impl MeSimulationSession<'_, '_> {
                 );
             }
         }
+        Ok(())
     }
 
     fn correlate_inputs(&mut self, inputs: &[(&str, f64)]) -> Result<(), MeSessionError> {
-        self.host
-            .kernel
-            .borrow()
-            .get_continuous_states(&mut self.host.states)?;
-        self.record_inputs(inputs);
-        self.restart_plugin_history()
+        self.record_inputs(inputs)?;
+        self.correlate_input_write()
+    }
+
+    pub(super) fn correlate_input_write(&mut self) -> Result<(), MeSessionError> {
+        let discrete = update_discrete_states_to_completion(
+            &mut *self.host.kernel.borrow_mut()?,
+            self.host.time,
+        )?;
+        // A setter does not request a trace row. The next explicit observation
+        // or advance owns publication, including repeated batches at one time.
+        self.complete_event_mode(discrete, self.host.time, false)
     }
 }

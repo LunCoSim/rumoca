@@ -1,7 +1,9 @@
 use super::*;
+use crate::construction::terminal_print::terminal_print_message;
 
 pub(super) fn validate_model_algorithm(
     algorithm: &flat::Algorithm,
+    flat: &flat::Model,
     roles: &HashMap<VarName, PlannedRole>,
     states: &HashSet<VarName>,
     model_values: &ShapeEnvironment,
@@ -11,6 +13,7 @@ pub(super) fn validate_model_algorithm(
     require_span(algorithm.span, "model algorithm")?;
     validate_algorithm_statements(
         &algorithm.statements,
+        flat,
         roles,
         states,
         model_values,
@@ -188,6 +191,11 @@ fn reject_sequential_if(
 /// value the `when` body itself writes again, lacks a checked owner for the
 /// condition. A value only the `when` body writes is read the way the
 /// equation form of the same `when` reads it, through event iteration.
+///
+/// A statement after the `when` reads a value its body writes the same way:
+/// when no later statement writes it, the value after the `when` is the
+/// value after the algorithm, which is the variable's current value. A value
+/// a later statement writes again has no such owner where it is read.
 fn reject_sequential_when(
     blocks: &[rumoca_core::StatementBlock],
     written: &mut HashSet<VarName>,
@@ -202,7 +210,7 @@ fn reject_sequential_when(
     }
     let unavailable = later_writes
         .iter()
-        .chain(incoming.intersection(&body_writes))
+        .chain(&overlapping_names(&incoming, &body_writes))
         .chain(&incoming_unrepresented)
         .cloned()
         .collect::<HashSet<_>>();
@@ -221,7 +229,9 @@ fn reject_sequential_when(
                 later_writes,
             },
         )?;
-        unsupported.extend(branch.difference(&incoming).cloned());
+        let mut block_writes = HashSet::new();
+        collect_algorithm_writes(&block.stmts, &mut block_writes);
+        unsupported.extend(overlapping_names(&block_writes, later_writes));
         exits.push(branch);
         unsupported_exits.push(unsupported);
     }
@@ -229,8 +239,41 @@ fn reject_sequential_when(
     Ok(())
 }
 
+/// Whether two variable names share storage: they are equal, or one names a
+/// field (or element) of the record (or array) the other names, as a whole
+/// record write `r := R(1, 2)` writes `r.a` and `r.b`.
+pub(in crate::construction) fn names_overlap(lhs: &VarName, rhs: &VarName) -> bool {
+    let (lhs, rhs) = (lhs.as_str(), rhs.as_str());
+    lhs == rhs || is_component_of(lhs, rhs) || is_component_of(rhs, lhs)
+}
+
+fn is_component_of(name: &str, whole: &str) -> bool {
+    name.strip_prefix(whole)
+        .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('['))
+}
+
+/// The storage two name sets share, as the more specific name of each
+/// overlapping pair.
+fn overlapping_names(lhs: &HashSet<VarName>, rhs: &HashSet<VarName>) -> HashSet<VarName> {
+    let mut shared = HashSet::new();
+    for left in lhs {
+        for right in rhs.iter().filter(|right| names_overlap(left, right)) {
+            let specific = if left.as_str().len() >= right.as_str().len() {
+                left
+            } else {
+                right
+            };
+            shared.insert(specific.clone());
+        }
+    }
+    shared
+}
+
 /// Every variable a statement sequence may write, at any nesting depth.
-fn collect_algorithm_writes(statements: &[rumoca_core::Statement], writes: &mut HashSet<VarName>) {
+pub(in crate::construction) fn collect_algorithm_writes(
+    statements: &[rumoca_core::Statement],
+    writes: &mut HashSet<VarName>,
+) {
     for statement in statements {
         match statement {
             rumoca_core::Statement::Assignment { comp, .. } => {
@@ -312,7 +355,7 @@ fn reject_reads_of_written(
     expression.collect_var_refs(&mut references);
     let Some(target) = references
         .into_iter()
-        .find(|target| written.contains(target))
+        .find(|target| written.iter().any(|name| names_overlap(name, target)))
     else {
         return Ok(());
     };
@@ -331,6 +374,7 @@ fn reject_reads_of_written(
 #[allow(clippy::too_many_lines)]
 fn validate_algorithm_statements(
     statements: &[rumoca_core::Statement],
+    flat: &flat::Model,
     roles: &HashMap<VarName, PlannedRole>,
     states: &HashSet<VarName>,
     model_values: &ShapeEnvironment,
@@ -366,7 +410,7 @@ fn validate_algorithm_statements(
                 ) || (matches!(target_role, Some(PlannedRole::Aggregate))
                     && is_direct_record_call_assignment(comp, value))
                 {
-                    validate_expression(value, roles, states)?;
+                    validate_model_algorithm_expression(value, roles, states, model_values)?;
                 } else if structured_assignment_pairs(&target, value, roles).is_none() {
                     return Err(ToDaeError::unsupported_algorithm(
                         "model",
@@ -394,6 +438,7 @@ fn validate_algorithm_statements(
                     )?;
                     validate_algorithm_statements(
                         &block.stmts,
+                        flat,
                         roles,
                         states,
                         model_values,
@@ -404,6 +449,7 @@ fn validate_algorithm_statements(
                 if let Some(statements) = else_block {
                     validate_algorithm_statements(
                         statements,
+                        flat,
                         roles,
                         states,
                         model_values,
@@ -437,6 +483,7 @@ fn validate_algorithm_statements(
                 }
                 validate_algorithm_statements(
                     equations,
+                    flat,
                     &loop_roles,
                     states,
                     model_values,
@@ -463,6 +510,7 @@ fn validate_algorithm_statements(
                     )?;
                     validate_algorithm_statements(
                         &block.stmts,
+                        flat,
                         roles,
                         states,
                         model_values,
@@ -477,16 +525,10 @@ fn validate_algorithm_statements(
                 outputs,
                 span,
             } => {
-                require_span(*span, "algorithm function-call assignment")?;
-                if comp.parts().is_empty() || comp.parts().iter().any(|part| !part.subs.is_empty())
+                validate_function_call_callee(comp, *span)?;
+                if (outputs.is_empty() || outputs.iter().all(Option::is_none))
+                    && terminal_print_message(flat, comp, args).is_none()
                 {
-                    return Err(ToDaeError::unsupported_algorithm(
-                        "model",
-                        "function-call assignment requires one resolved, unsubscripted function",
-                        *span,
-                    ));
-                }
-                if outputs.is_empty() || outputs.iter().all(Option::is_none) {
                     return Err(ToDaeError::unsupported_algorithm(
                         "model",
                         "function-call assignment must retain at least one output",
@@ -494,7 +536,7 @@ fn validate_algorithm_statements(
                     ));
                 }
                 for argument in args {
-                    validate_expression(argument, roles, states)?;
+                    validate_model_algorithm_expression(argument, roles, states, model_values)?;
                 }
                 for output in outputs.iter().flatten() {
                     validate_function_call_output(output, roles)?;
@@ -507,10 +549,10 @@ fn validate_algorithm_statements(
                 span,
             } => {
                 require_span(*span, "algorithm assertion")?;
-                validate_expression(condition, roles, states)?;
-                validate_expression(message, roles, states)?;
+                validate_model_algorithm_expression(condition, roles, states, model_values)?;
+                validate_model_algorithm_expression(message, roles, states, model_values)?;
                 if let Some(level) = level {
-                    validate_expression(level, roles, states)?;
+                    validate_model_algorithm_expression(level, roles, states, model_values)?;
                 }
             }
             _ => {
@@ -540,6 +582,21 @@ fn is_direct_record_call_assignment(
                 ..
             }
         )
+}
+
+pub(super) fn validate_function_call_callee(
+    comp: &rumoca_core::Reference,
+    span: Span,
+) -> Result<(), ToDaeError> {
+    require_span(span, "algorithm function-call assignment")?;
+    if comp.parts().is_empty() || comp.parts().iter().any(|part| !part.subs.is_empty()) {
+        return Err(ToDaeError::unsupported_algorithm(
+            "model",
+            "function-call assignment requires one resolved, unsubscripted function",
+            span,
+        ));
+    }
+    Ok(())
 }
 
 fn validate_function_call_output(

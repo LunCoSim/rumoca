@@ -175,6 +175,7 @@ fn convert_for_index(
     };
 
     Ok(rumoca_ir_ast::ForIndex {
+        binder: None,
         ident: index.ident.clone(),
         range,
     })

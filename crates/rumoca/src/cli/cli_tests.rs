@@ -712,6 +712,50 @@ fn compile_target_flat_modelica_uses_flat_template_context() {
 /// discards the `EL0xx`/`ES0xx`/`EX0xx` identity the LSP already publishes, so
 /// both `sim` surfaces render it as `[CODE] message`.
 #[test]
+fn compile_to_value_dumps_the_parser_tree_before_resolution_and_flat_after() {
+    // The AST dump is the parser's tree of the source alone, so a base class
+    // nothing provides does not stop it; the Flat dump still resolves the
+    // model's closure and names the missing class.
+    let source = "model Unresolved\n  extends Missing.Base;\n  Real x(start = 1);\n\
+                  equation\n  der(x) = -x;\nend Unresolved;\n";
+    let compile_args = |emit: &str| {
+        let cli = Cli::try_parse_from(["rumoca", "compile", "Unresolved.mo", "--emit", emit])
+            .expect("parse compile --emit");
+        let Commands::Compile(args) = cli.command else {
+            panic!("expected the compile command");
+        };
+        args
+    };
+
+    let ast = compile_to_value(&compile_args("ast-json"), source)
+        .expect("the AST dump needs no name resolution");
+    assert!(
+        ast["classes"]["Unresolved"].is_object(),
+        "the dump is the parsed stored definition, got {ast}"
+    );
+
+    let error = compile_to_value(&compile_args("flat-mo"), source)
+        .expect_err("the Flat dump resolves the closure");
+    assert!(
+        error.to_string().contains("Missing.Base"),
+        "the Flat failure names the missing base class: {error}"
+    );
+
+    let plain = "model Plain\n  Real x(start = 1);\nequation\n  der(x) = -x;\nend Plain;\n";
+    let cli = Cli::try_parse_from(["rumoca", "compile", "Plain.mo", "--emit", "flat-mo"])
+        .expect("parse compile --emit flat-mo");
+    let Commands::Compile(args) = cli.command else {
+        panic!("expected the compile command");
+    };
+    let flat = compile_to_value(&args, plain).expect("flat-mo renders");
+    assert_eq!(flat["format"], "modelica");
+    assert!(
+        flat["source"].as_str().unwrap_or("").contains("der(x)"),
+        "the Modelica render keeps the equation, got {flat}"
+    );
+}
+
+#[test]
 fn simulate_to_value_failure_carries_its_spec_0008_code() {
     // A model with nothing to solve compiles but declines deterministically in
     // solve lowering, so this pins the rendering without depending on solver
@@ -781,5 +825,83 @@ fn the_solver_flag_offers_exactly_the_solvers_the_tree_runs() {
     for mode in SimulateSolverMode::value_variants() {
         let label = mode.as_label();
         assert_eq!(rumoca_core::canonical_solver_name(label), Ok(label));
+    }
+}
+
+#[test]
+fn cli_parses_trajectory_objective_flags() {
+    let cli = Cli::try_parse_from([
+        "rumoca",
+        "sim",
+        "Fit.mo",
+        "--model",
+        "Fit",
+        "--inspect",
+        "objective-gradient",
+        "--integral",
+        "x",
+        "--integral",
+        "y",
+        "--terminal",
+        "x",
+        "--fit-data",
+        "measured.csv",
+        "--wrt",
+        "a,b",
+        "--grad-mode",
+        "adjoint",
+        "--checkpoint-budget",
+        "4096",
+    ])
+    .expect("parse trajectory objective flags");
+    match cli.command {
+        Commands::Sim(args) => {
+            assert_eq!(args.inspect, Some(InspectKind::ObjectiveGradient));
+            assert_eq!(args.integral, ["x", "y"]);
+            assert_eq!(args.terminal, ["x"]);
+            assert_eq!(args.fit_data.as_deref(), Some(Path::new("measured.csv")));
+            assert_eq!(args.wrt, ["a", "b"]);
+            assert_eq!(args.grad_mode, GradMode::Adjoint);
+            assert_eq!(args.checkpoint_budget, Some(4096));
+        }
+        other => panic!("expected sim command, got {other:?}"),
+    }
+}
+
+#[test]
+fn cli_rejects_a_steady_objective_beside_a_trajectory_term() {
+    for flag in ["--integral", "--terminal", "--fit-data"] {
+        let error = Cli::try_parse_from([
+            "rumoca",
+            "sim",
+            "Fit.mo",
+            "--inspect",
+            "objective-gradient",
+            "--objective",
+            "x",
+            flag,
+            "x",
+        ])
+        .expect_err("a steady and a trajectory objective conflict");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{flag}"
+        );
+    }
+}
+
+#[test]
+fn cli_parses_the_new_inspection_kinds() {
+    for (name, kind) in [
+        ("trajectory-sensitivity", InspectKind::TrajectorySensitivity),
+        ("linearize", InspectKind::Linearize),
+    ] {
+        let cli = Cli::try_parse_from(["rumoca", "sim", "M.mo", "--inspect", name])
+            .unwrap_or_else(|error| panic!("parse --inspect {name}: {error}"));
+        match cli.command {
+            Commands::Sim(args) => assert_eq!(args.inspect, Some(kind)),
+            other => panic!("expected sim command, got {other:?}"),
+        }
     }
 }

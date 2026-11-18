@@ -13,7 +13,17 @@ mod galec_branch_element_drop;
 mod galec_call_boundary;
 mod galec_emission_policy;
 mod galec_enumeration_status;
+mod galec_equation_pre;
 mod galec_equivalence;
+mod galec_integer_sign;
+mod galec_parameter_ranges;
+mod galec_periodic_real;
+mod galec_signed_zero;
+mod galec_single_element_index;
+mod galec_slice_value_bounds;
+mod galec_solve_c_faults;
+mod galec_solve_c_inline_fp;
+mod galec_solve_refinement;
 mod galec_store_order;
 
 #[cfg(feature = "fmu-packaging")]

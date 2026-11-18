@@ -1,6 +1,8 @@
 //! Shared registration of nested calls and their assertion ownership.
 
-use super::{AssertionSlot, PureCallRegistry, RegisteredAssertion, RegisteredCall};
+use super::{
+    AssertionSlot, CallLoweringError, CalleeInterface, PureCallRegistry, RegisteredAssertion,
+};
 use crate::lower::call_scoped_actions::CallAssertionProjection;
 use rumoca_ir_dae as dae;
 use rumoca_ir_solve as solve;
@@ -14,6 +16,8 @@ pub(super) struct RegisteredExpressionAssertion<'dae, Scope> {
     pub(super) assertion: RegisteredAssertion<'dae>,
     pub(super) projection: CallAssertionProjection,
     pub(super) scope: Scope,
+    pub(super) source_result_count: usize,
+    pub(super) slot_start: usize,
 }
 
 /// Whether a call targets a native `ModelicaStandardTables` interpolation
@@ -30,7 +34,7 @@ fn is_native_table_operator<'dae>(
 }
 
 type RegisteredExpressionCalls<'dae, Scope> = (
-    HashMap<dae::ExprId<'dae>, RegisteredCall<'dae>>,
+    HashMap<dae::ExprId<'dae>, CalleeInterface<'dae>>,
     HashMap<dae::ExprId<'dae>, Range<usize>>,
     Vec<RegisteredExpressionAssertion<'dae, Scope>>,
     std::sync::Arc<[AssertionSlot]>,
@@ -43,7 +47,7 @@ impl<'dae> PureCallRegistry<'dae> {
         &mut self,
         view: dae::DaeView<'dae>,
         expressions: impl IntoIterator<Item = (dae::ExprId<'dae>, Scope)>,
-    ) -> Result<RegisteredExpressionCalls<'dae, Scope>, solve::SolveProgramConstructionError> {
+    ) -> Result<RegisteredExpressionCalls<'dae, Scope>, CallLoweringError> {
         let mut roots = Vec::new();
         let mut seen = HashMap::new();
         let mut conflicts = HashSet::new();
@@ -76,7 +80,7 @@ impl<'dae> PureCallRegistry<'dae> {
                 .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
                 .operation()
             else {
-                return Err(solve::SolveProgramConstructionError::WireMismatch);
+                return Err(solve::SolveProgramConstructionError::WireMismatch.into());
             };
             if conflicts.contains(&owner) || seen.get(&owner) != Some(scope) {
                 return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
@@ -85,7 +89,8 @@ impl<'dae> PureCallRegistry<'dae> {
                         .expect("checked call projection resolves")
                         .provenance()
                         .span(),
-                });
+                }
+                .into());
             }
         }
         let mut callees = HashMap::new();
@@ -93,7 +98,7 @@ impl<'dae> PureCallRegistry<'dae> {
         let mut slots = Vec::new();
         let mut assertions = Vec::new();
         for (owner, projection, scope) in roots {
-            let registered = self.register_root(view, projection)?;
+            let registered = self.register_root(view, projection)?.callee;
             let start = slots.len();
             slots.extend(registered.assertion_slots.iter().cloned());
             let end = slots.len();
@@ -106,6 +111,8 @@ impl<'dae> PureCallRegistry<'dae> {
                         output_offset,
                     },
                     scope,
+                    source_result_count: registered.result_leaf_count,
+                    slot_start: start,
                 },
             ));
             callees.insert(owner, registered);

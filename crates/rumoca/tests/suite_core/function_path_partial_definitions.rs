@@ -205,3 +205,80 @@ fn a_value_no_later_statement_uses_stays_branch_local() {
         );
     }
 }
+
+fn eval_error(model: &str, source: &str) -> Option<String> {
+    let compiled = Compiler::new()
+        .model(model)
+        .compile_str(source, &format!("{model}.mo"))
+        .unwrap_or_else(|error| panic!("{model} compiles: {error:?}"));
+    rumoca_sim::eval_dae_at(&compiled.dae, &SimOptions::default(), &[], 0.0)
+        .unwrap_or_else(|error| panic!("{model} evaluates: {error:?}"))
+        .report
+        .error
+}
+
+#[test]
+fn the_evaluation_probe_reports_a_read_of_a_value_the_executed_path_never_wrote() {
+    let error = eval_error("Scalars", &SCALARS.replace("CALL", "f(-0.5 - time)"))
+        .expect("u <= 0 reads t without a value");
+    assert!(error.contains("`t` is used without a value"), "{error}");
+    let defined = eval_error("Scalars", &SCALARS.replace("CALL", "f(2 - time)"));
+    assert_eq!(defined, None, "u > 0 writes t before its use");
+}
+
+/// A read inside a loop, inside a nested conditional, or after a loop that may
+/// write the value is not owned by the top-level assertion: a typed refusal.
+#[test]
+fn reads_of_a_partial_value_below_the_top_level_are_refused() {
+    let source = |body: &str| {
+        format!(
+            "model M\n  function f\n    input Boolean c;\n    input Boolean d;\n    output Real y;\n  protected\n    Real t;\n  algorithm\n{body}  end f;\n  Real y = f(false, true);\nend M;\n"
+        )
+    };
+    for (label, body) in [
+        (
+            "loop",
+            "    if c then t := 1; end if;\n    y := 0;\n    for i in 1:3 loop y := y + t; end for;\n",
+        ),
+        (
+            "nested conditional",
+            "    if c then t := 1; end if;\n    y := 0;\n    if d then y := t; end if;\n",
+        ),
+        (
+            "after loop",
+            "    for i in 1:3 loop if c then t := 1; end if; end for;\n    y := t;\n",
+        ),
+    ] {
+        let error = Compiler::new()
+            .model("M")
+            .compile_str(&source(body), "M.mo")
+            .err()
+            .unwrap_or_else(|| panic!("{label} read of a partial value is refused"));
+        assert!(
+            format!("{error:?}").contains("only some branches"),
+            "{label}: {error:?}"
+        );
+    }
+}
+
+/// The product decides who raises an unassigned-value check: the stateless
+/// native schedule has no solver or event iteration, so the check owns an
+/// event action and no relation root; a simulation localizes it with a root.
+#[test]
+fn an_unassigned_value_check_owns_a_root_only_where_a_solver_localizes_it() {
+    let source = SCALARS.replace("CALL", "f(2 - time)");
+    let compiled = Compiler::new()
+        .model("Scalars")
+        .compile_str(&source, "Scalars.mo")
+        .expect("Scalars compiles");
+    let native = rumoca_phase_solve::lower_solve_package(&compiled.dae).expect("native lowers");
+    assert!(!native.problem.events.actions.is_empty());
+    assert!(
+        native.problem.events.root_conditions.is_empty(),
+        "the native product carries no relation root"
+    );
+    let simulated =
+        rumoca_sim::lower_for_simulation_with_overrides(&compiled.dae, &SimOptions::default())
+            .expect("simulation lowers");
+    assert!(!simulated.problem.events.root_conditions.is_empty());
+}

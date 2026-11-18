@@ -9,6 +9,40 @@ use rumoca_ir_ast as ast;
 use rumoca_ir_flat as flat;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+/// The declaration of every enumeration type of the tree, keyed by the exact
+/// type identity Flat carries for it (MLS §4.9.5). A class that declares
+/// literals is the one owner of its literal order; a type without a Flat
+/// identity is not an enumeration any variable of the model can have.
+pub(crate) fn collect_enumeration_declarations(
+    tree: &ast::ClassTree,
+    flat: &flat::Model,
+) -> indexmap::IndexMap<rumoca_core::TypeId, rumoca_core::EnumerationDeclaration> {
+    let mut declarations = indexmap::IndexMap::new();
+    for (def_id, qualified_name) in &tree.def_map {
+        let Some(class_def) = tree.get_class_by_def_id(*def_id) else {
+            continue;
+        };
+        if class_def.enum_literals.is_empty() {
+            continue;
+        }
+        let Some(type_id) = flat.type_ids_by_def_id.get(def_id) else {
+            continue;
+        };
+        declarations.insert(
+            *type_id,
+            rumoca_core::EnumerationDeclaration {
+                name: qualified_name.clone(),
+                literals: class_def
+                    .enum_literals
+                    .iter()
+                    .map(|literal| literal.ident.text.to_string())
+                    .collect(),
+            },
+        );
+    }
+    declarations
+}
+
 /// Canonicalize enum literal references in the final flat model.
 pub(crate) fn canonicalize_flat_enum_literals(
     flat: &mut flat::Model,
@@ -343,7 +377,9 @@ fn canonicalize_when_equations(
 ) {
     for equation in equations.iter_mut() {
         match equation {
-            flat::WhenEquation::Assign { value, .. } | flat::WhenEquation::Reinit { value, .. } => {
+            flat::WhenEquation::Assign { value, .. }
+            | flat::WhenEquation::AssignElement { value, .. }
+            | flat::WhenEquation::Reinit { value, .. } => {
                 canonicalize_expr(value, enum_literals, variable_names);
             }
             flat::WhenEquation::Assert {
@@ -695,6 +731,7 @@ mod tests {
             .push(flat::StructuredEquationFamily {
                 domain: rumoca_core::StructuredIndexDomain {
                     binders: vec![rumoca_core::StructuredIndexBinder {
+                        provenance: rumoca_core::IndexBinderProvenance::Generated,
                         id: 0,
                         display_name: "i".to_string(),
                         lower: 1,
@@ -718,7 +755,7 @@ mod tests {
                     }],
                     scalar_view: rumoca_core::ComprehensionScalarView::BinderSubstitution,
                 }),
-                interiors_materialized: true,
+                interiors: flat::FamilyInteriors::Materialized,
             });
         let mut known_enums = FxHashMap::default();
         known_enums.insert("enumParam".to_string(), "TypesPkg.Logic.Unset".to_string());

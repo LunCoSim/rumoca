@@ -2,7 +2,7 @@
 //! a flat model: binding collection, record-alias supplementation, and the
 //! multi-pass fixpoint that drives the per-kind evaluation passes.
 
-use super::param_binding::ParamBinding;
+use super::param_binding::{ParamBinding, is_string_variable};
 use super::*;
 
 fn insert_record_alias(
@@ -20,10 +20,13 @@ impl Context {
     pub(crate) fn new() -> Self {
         Self {
             declared_dimensions: std::sync::Arc::default(),
+            declared_constants: std::cell::OnceCell::new(),
             parameter_values: rustc_hash::FxHashMap::default(),
             real_parameter_values: rustc_hash::FxHashMap::default(),
             boolean_parameter_values: rustc_hash::FxHashMap::default(),
             enum_parameter_values: rustc_hash::FxHashMap::default(),
+            aggregate_parameter_values: rustc_hash::FxHashMap::default(),
+            resource_roots: rumoca_eval_flat::translation_reads::ResourceRoots::new(),
             constant_values: rustc_hash::FxHashMap::default(),
             constant_values_by_def_id: rustc_hash::FxHashMap::default(),
             constant_values_by_scope: rustc_hash::FxHashMap::default(),
@@ -62,6 +65,8 @@ impl Context {
             materialize_structured_families: true,
             param_variability_families:
                 crate::param_variability::ParameterVariabilityFamilies::default(),
+            continuous_algebraic_targets:
+                crate::continuous_algebraic::ContinuousAlgebraicTargets::default(),
         }
     }
 
@@ -209,6 +214,8 @@ impl Context {
                     binding,
                     may_be_record_alias,
                     binding_from_modification: var.binding_from_modification,
+                    aggregate: !var.dims.is_empty() || is_string_variable(flat, var),
+                    enumeration: flat.enumeration_types.contains(&var.type_id),
                 })
             })
             .collect()
@@ -250,6 +257,8 @@ impl Context {
                     binding,
                     may_be_record_alias: !var.is_primitive,
                     binding_from_modification: var.binding_from_modification,
+                    aggregate: false,
+                    enumeration: false,
                 })
             })
             .collect()
@@ -262,15 +271,22 @@ impl Context {
         var_bindings: &[ParamBinding<'_>],
     ) {
         const MAX_PASSES: usize = 10;
+        let scalar_params = params
+            .iter()
+            .copied()
+            .filter(|param| !param.aggregate)
+            .collect::<Vec<_>>();
         for _pass in 0..MAX_PASSES {
             let enum_progress = self.eval_enum_param_bindings(params);
-            let real_progress = self.eval_real_params(params);
-            let int_progress = self.eval_integer_param_bindings(params);
-            let bool_progress = self.eval_boolean_params(params);
+            let aggregate_progress = self.eval_aggregate_param_bindings(params);
+            let real_progress = self.eval_real_params(&scalar_params);
+            let int_progress = self.eval_integer_param_bindings(&scalar_params);
+            let bool_progress = self.eval_boolean_params(&scalar_params);
             let dim_progress = self.eval_array_dimensions(var_bindings);
             let varref_dim_progress = self.propagate_varref_dimensions(var_bindings);
             let alias_progress = self.propagate_through_aliases(params);
             if !enum_progress
+                && !aggregate_progress
                 && !real_progress
                 && !int_progress
                 && !bool_progress

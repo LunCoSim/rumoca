@@ -26,7 +26,12 @@ fn sparse_row_scaling_preserves_finite_maxima_and_zero_or_nonfinite_fallbacks() 
     let variables = [1e12, 7.0, 11.0, 0.0];
     let fallback = [4.0, 5.0, 6.0, 7.0];
     for structure in [None, Some(&pattern)] {
-        let result = jacobian_row_scales(&matrix, &variables, &fallback, structure);
+        let result = jacobian_row_scales(
+            &BlockJacobian::dense(matrix.clone()),
+            &variables,
+            &fallback,
+            structure,
+        );
         assert!((result[0] - 2000.0).abs() < 1e-12);
         assert_eq!(&result[1..], &[5.0, 6.0, 7.0]);
     }
@@ -71,10 +76,6 @@ impl ImplicitProjectionModel for NominalScaledProjectionModel {
         &self.plan
     }
 
-    fn target_name_for_row(&self, _row_idx: usize) -> Option<&str> {
-        Some("small")
-    }
-
     fn variable_scale_for_y_index(&self, _y_index: usize) -> f64 {
         self.variable_scale
     }
@@ -84,12 +85,13 @@ impl ImplicitProjectionModel for NominalScaledProjectionModel {
 fn nominal_scaled_projection_corrects_small_physical_residual() {
     let model = NominalScaledProjectionModel {
         plan: solve::AlgebraicProjectionPlan {
-            blocks: vec![solve::AlgebraicProjectionBlock {
+            blocks: (vec![solve::AlgebraicProjectionBlock {
                 rows: vec![0],
                 y_indices: vec![0],
                 tearing: None,
                 alternate_charts: Vec::new(),
-            }],
+            }])
+            .into(),
         },
         coefficient: 1.0,
         rhs: 0.0,
@@ -110,12 +112,13 @@ fn nominal_scaled_projection_corrects_small_physical_residual() {
 fn projection_row_scale_includes_jacobian_coefficient() {
     let model = NominalScaledProjectionModel {
         plan: solve::AlgebraicProjectionPlan {
-            blocks: vec![solve::AlgebraicProjectionBlock {
+            blocks: (vec![solve::AlgebraicProjectionBlock {
                 rows: vec![0],
                 y_indices: vec![0],
                 tearing: None,
                 alternate_charts: Vec::new(),
-            }],
+            }])
+            .into(),
         },
         coefficient: 1.0e-12,
         rhs: 1.0e-3,
@@ -142,7 +145,7 @@ fn projection_scale_expands_to_the_current_coordinate_magnitude() {
     };
     let model = NominalScaledProjectionModel {
         plan: solve::AlgebraicProjectionPlan {
-            blocks: vec![block.clone()],
+            blocks: (vec![block.clone()]).into(),
         },
         coefficient: 1.0e-5,
         rhs: 50.0,
@@ -150,8 +153,13 @@ fn projection_scale_expands_to_the_current_coordinate_magnitude() {
     };
     let jacobian = DMatrix::from_element(1, 1, 1.0e-5);
 
-    let (row_scales, variable_scales) =
-        algebraic_block_scales(&model, &[5.0e6], &block, &jacobian, None);
+    let (row_scales, variable_scales) = algebraic_block_scales(
+        &model,
+        &[5.0e6],
+        &block,
+        &BlockJacobian::dense(jacobian.clone()),
+        None,
+    );
 
     assert_eq!(variable_scales, vec![5.0e6]);
     assert!((row_scales[0] - 50.0).abs() <= 1.0e-12);
@@ -160,7 +168,9 @@ fn projection_scale_expands_to_the_current_coordinate_magnitude() {
 #[test]
 fn scaled_newton_system_normalizes_mixed_magnitude_columns() {
     let jacobian = DMatrix::from_diagonal(&DVector::from_vec(vec![1.0e-12, 1.0e12]));
+    let jacobian = BlockJacobian::dense(jacobian);
     let delta = scaled_newton_delta(ScaledNewtonSystem {
+        revision: None,
         jacobian: &jacobian,
         residual: &[-1.0, -1.0],
         row_scales: &[1.0, 1.0],
@@ -276,10 +286,6 @@ impl ImplicitProjectionModel for TinyConstantDivisorInitialModel {
     fn algebraic_projection_plan(&self) -> &solve::AlgebraicProjectionPlan {
         &self.plan
     }
-
-    fn target_name_for_row(&self, _row_idx: usize) -> Option<&str> {
-        None
-    }
 }
 
 impl AlgebraicProjectionModel for TinyConstantDivisorInitialModel {
@@ -288,6 +294,7 @@ impl AlgebraicProjectionModel for TinyConstantDivisorInitialModel {
         y: &[f64],
         p: &[f64],
         t: f64,
+        _rows: Option<&[usize]>,
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
         self.eval_residual(y, p, t, out)
@@ -344,7 +351,7 @@ fn initial_singleton_assignment_writes_sub_tolerance_constant_divisor() {
     let model = TinyConstantDivisorInitialModel {
         divisor: 2.220_446_049_250_313e-14,
         plan: solve::AlgebraicProjectionPlan {
-            blocks: vec![
+            blocks: (vec![
                 solve::AlgebraicProjectionBlock {
                     rows: vec![0],
                     y_indices: vec![0],
@@ -357,7 +364,8 @@ fn initial_singleton_assignment_writes_sub_tolerance_constant_divisor() {
                     tearing: None,
                     alternate_charts: Vec::new(),
                 },
-            ],
+            ])
+            .into(),
         },
     };
     let mut y = vec![0.0, 0.0];

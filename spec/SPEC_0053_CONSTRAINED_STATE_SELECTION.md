@@ -11,8 +11,8 @@ construct their value, derivative, and FMI mappings together.
 
 This proposal extends SPEC_0007 / STRUCT-T07. Source signature analysis and
 coupled formal derivatives, candidate coordinate maps, and an initial static
-coordinate-selection profile are implemented under STRUCT-T07. Dynamic basis
-changes remain proposed. The existing implementation retains
+coordinate-selection and limited chart-switching profiles are implemented under
+STRUCT-T07. General dynamic basis changes remain proposed. The existing implementation retains
 lower-order constraints in `ContinuousSolveSystem::manifold_residual` and
 `manifold_projection_plan` (`rumoca-ir-solve/src/model.rs`), while
 `SolveRuntime` evaluates derivatives of every retained state coordinate.
@@ -28,6 +28,7 @@ lower-order constraints in `ContinuousSolveSystem::manifold_residual` and
 | Preserve every source equation, assertion, initialization condition, and visible variable when changing differential roles | structural reconstruction | Coordinate choice cannot change the source solution set |
 | Prove dependency closure for the selected derivative outputs; dependent derivatives execute only when needed by that closure or an observation | Solve planning | Removing outputs must not discard needed equations or compute avoidable derivatives |
 | Classify each holonomic manifold constraint as definitional (a conserved first integral: its lower-order form is implied by the ODE, so one differentiation reconstructs a matched state derivative) or redundant (a loop closure: over-determining at the position level, closed only by differentiating to acceleration, which introduces a multiplier), carry that classification on the prepared manifold, and retain the source coordinates when every manifold constraint is definitional but reduce to an independent basis when any constraint is redundant or the selection integrates an undifferentiated `prefer` value and ranks above the source coordinates | structural reduction classifies; Solve state selection decides | A first integral has no globally injective reduced chart, so a fixed reduced basis folds when a coordinate passes through zero, while a retained loop closure leaves a redundant acceleration residual the solver cannot integrate cheaply; the per-constraint differentiation order separates the two where no whole-model predicate can |
+| Decide reduction once, before the per-state reducer runs, when the structurally singular source holds a redundant loop closure: a holonomic constraint whose differentiation proof closes only at second order and whose residual defines no state directly. The source then reduces straight to its formal independent basis when the formal construction succeeds with a dimension below its state count and no inert state needs demotion first; otherwise the reducer decides as above. This decision and the reducer's first round share one structural analysis of the source | Solve state selection, from structural reduction's source facts | Direct demotion removes only states a residual defines explicitly, so such a closure always survives into the reducer's manifold, classifies redundant, and selects the reduced basis; deciding it from the source avoids re-deriving the system once per demoted state |
 
 `StateSelect.always` is a requirement for every continuous Real value, whatever
 its source role: MLS 3.7 §4.9.7.1 says "Do use it as a state" and §3.7.3 "It is
@@ -43,7 +44,7 @@ and wheel angles at position level and the wheel speeds `der_theta` at rate
 level, the system's seven-dimensional state. A value the equations determine
 (`y = sin(time)`) has no independent slot and is refused.
 
-The manifold classification is structural, taken from `prepare_for_solve`'s differentiation proof rather than from a whole-model predicate. A constraint whose reconstruction closes after a single differentiation is definitional (for example a unit-quaternion norm `Q*Q = 1`, whose derivative `2*Q*der(Q) = 0` follows identically from the kinematic rate equations); one that closes only at acceleration level, differentiation `maximum_order` two, is a redundant loop closure that introduces a multiplier. The structural phase tags each retained manifold row and `PreparedDae::manifold_requires_reduction` reports whether any row is redundant, so state selection reads the decision without re-deriving structure. `Rotational3DEffects.GyroscopicEffects`, a tree of quaternion bodies, carries only definitional norms and retains its source basis; `Loops.Fourbar1` and the `Constraints` loops each close a kinematic loop at acceleration level and reduce.
+The manifold classification is structural, taken from `prepare_for_solve`'s differentiation proof rather than from a whole-model predicate. A constraint whose reconstruction closes after a single differentiation is definitional (for example a unit-quaternion norm `Q*Q = 1`, whose derivative `2*Q*der(Q) = 0` follows identically from the kinematic rate equations); one that closes only at acceleration level, differentiation `maximum_order` two, is a redundant loop closure that introduces a multiplier. The structural phase tags each retained manifold row and `PreparedDae::manifold_requires_reduction` reports whether any row is redundant, so state selection reads the decision without re-deriving structure. `Rotational3DEffects.GyroscopicEffects`, a tree of quaternion bodies, carries only definitional norms and retains its source basis; `Loops.Fourbar1` and the `Constraints` loops each close a kinematic loop at acceleration level and reduce. `Loops.EngineV6`, `Fourbar1`, and `RollingWheel` decide early; `Fourbar2` and the `Constraints` loops, whose closures define states directly, use the reducer.
 
 ### 1a. Differential structure analysis
 
@@ -120,22 +121,19 @@ identity establishes the local chain rule, not numerical accuracy by itself.
 | Treat rank loss, inconsistent constraints, and failed reconstruction as typed failures; changing basis cannot change the model's integration dimension | runtime | A singular model is not a license to discard equations |
 | Solve the original initialization problem before mapping its result to independent coordinates; add no new fixed initial values | initialization | MLS initial obligations survive state selection |
 
-### 2a. Changing coordinate bases (proposed, not yet implemented)
+### 2a. Limited chart switching; general basis changes proposed
 
-The `CircleChart.mo` fixture has `der(q)=v`, `der(v)=lambda*q`, and
-`q*q=1`. Its initialized solution is a full circular rotation. The current
-static `q[2], der(q[2])` coordinates fold at a quarter turn: both signs of
-`q[1]` reconstruct the same selected state. A completed three-second run
-selects the wrong branch even though every algebraic residual is small.
-`GyroscopicEffects` exhibits the same geometric limitation through two
-selected position components. This is an open correctness counterexample,
-not evidence that a different fixed coordinate preference is sufficient.
-A reduced loop-closure chart folds the same way when its constraint slope
-vanishes on the manifold (`Constraints.UniversalConstraint` reconstructs the
-middle Cardan angle of a free body, whose slope vanishes where the last angle
-reaches `-pi/2`). The
-construction, certificate, and switching contract for those charts are the
-STRUCT-T07 constraint-fold chart rows in
+The norm and constraint-fold switching profiles of STRUCT-T07 are implemented.
+`reduced_state_charts::circle_chart_runtime_chart_swap_completes_the_revolution_on_the_physical_branch`
+checks a full `CircleChart` revolution against the analytic physical branch.
+Its static `q[2], der(q[2])` chart folds at a quarter turn; the issued alternate
+charts avoid the mirror solution. This limited result does not establish
+general dynamic basis changes or resolve every reconstruction failure.
+`GyroscopicEffects` retains its source basis; its historical reconstruction
+failure requires separate current evidence, not inference from CircleChart.
+A reduced loop-closure chart also folds when its constraint slope vanishes
+(`Constraints.UniversalConstraint` at a middle Cardan angle fold). Its checked
+construction and switching contract is STRUCT-T07 in
 [SPEC_0040](SPEC_0040_IR_STAGE_CONTRACT_CATALOG.md#3-structural-lowering-transformation-catalog-spec_0007-structural-lowering-scope).
 
 | Rule | Owner/Where | Brief Justification |
@@ -166,7 +164,7 @@ STRUCT-T07 constraint-fold chart rows in
 | Exercise singular and changing bases, time/parameter dependence, `StateSelect`, and `reinit` | compiler and FMI suites | The reduced rotation fixture is not the general contract |
 | Compare value and AD callbacks after perturbed reconstruction guesses, not only at exact constrained points | numerical tests | Constraint roundoff can reintroduce cancellation |
 | Retain the analytical `RateCancellation.mo` cases and the saved RevoluteConstraint failure; require a normal-budget original-model OMC comparison | focused validation | A successful alternate trajectory cannot dismiss the original failure |
-| Close the `CircleChart.mo` three-second branch counterexample and complete a full revolution against its analytical solution and OMC; preserve the captured GyroscopicEffects reconstruction failure | compiler and FMI suites | Short successful runs can hide incorrect branch continuation |
+| Retain the CircleChart full-turn analytical witness; an OMC comparison of the full turn remains required; track GyroscopicEffects reconstruction independently (historical failure not reproduced on main, 0–5 s) | compiler and FMI suites | Short successful runs can hide incorrect branch continuation |
 | Require Tier 1 and a complete Tier 2 sweep preserving previously high models before breadth resumes | SPEC_0033 verification | Local derivative evidence is not cohort coverage |
 
 ## Rationale

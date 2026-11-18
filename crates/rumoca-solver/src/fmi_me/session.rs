@@ -12,11 +12,15 @@
 //! carries the same borrow. A second host, a reset, or a mutation behind a live
 //! session is therefore a compile error rather than a runtime hazard
 
+mod deferred_crossing;
 mod error;
 mod host_state;
 mod inputs;
+#[cfg(feature = "native-wasm")]
+mod native_inputs;
 mod observations;
 mod options;
+mod recovery;
 
 use std::{
     cell::{Cell, RefCell},
@@ -26,6 +30,7 @@ use std::{
 
 use indexmap::IndexMap;
 
+use super::instance::MeKernelCell;
 use host_state::{InitializationOutcome, MeHostState, run_fmi_initialization};
 
 pub use error::{MePluginArity, MeSessionError, MeSessionLoss};
@@ -56,20 +61,24 @@ use crate::{
 /// One instantiated FMI 3 ME component retained across runs.
 ///
 /// Instantiation performs the eager compiles a component's runtime owns, so a
-/// prepared simulation keeps exactly one instance and rewinds it
-/// (`fmi3Reset` + `fmi3SetFMUState`) per run instead of re-instantiating.
+/// prepared simulation keeps exactly one instance and restores its original
+/// defaults per run. Native reset returns the same storage to preparation;
+/// continuation snapshots are a separate operation.
 ///
 /// It exposes no derivative handle and no host of its own: the only way to use
 /// the instance is [`Self::lease`], which takes `&mut self`.
 pub struct MeRetainedComponent {
-    kernel: Rc<RefCell<SolveMeKernel>>,
-    pristine: super::MeFmuState,
+    kernel: Rc<MeKernelCell>,
     state_count: usize,
+    leases: u64,
 }
 
 impl MeRetainedComponent {
-    /// `fmi3InstantiateModelExchange` plus the pristine snapshot every run
-    /// rewinds to.
+    /// Copy only newly committed diagnostics at an explicitly requested reporting boundary.
+    pub fn diagnostics_since(&self, first: usize) -> (Vec<crate::SimDiagnostic>, usize) {
+        self.kernel.diagnostics_since(first)
+    }
+    /// `fmi3InstantiateModelExchange` plus the original-default reset owner.
     pub fn instantiate(
         source: MeModelSource<'_>,
         config: &MeInstanceConfig,
@@ -77,14 +86,66 @@ impl MeRetainedComponent {
     ) -> Result<Self, MeSessionError> {
         let kernel =
             SolveMeKernel::instantiate_with_execution_backend(source, config, execution_backend)?;
-        let kernel = Rc::new(RefCell::new(kernel));
-        let pristine = kernel.borrow().fmu_state();
-        let state_count = kernel.borrow().model_description().continuous_state_count;
+        Ok(Self::from_kernel(kernel))
+    }
+
+    /// Prepare the same native resource without inventing initialization time.
+    #[cfg(feature = "native-wasm")]
+    pub fn prepare_retained_native_wasm(
+        source: MeModelSource<'_>,
+        code: &rumoca_exec_wasm::PreparedNativeWasmCode,
+    ) -> Result<Self, super::MeError> {
+        let pending = super::MePendingNativeComponent::instantiate(source, code)?;
+        let state_count = pending.continuous_state_count();
         Ok(Self {
-            kernel,
-            pristine,
+            kernel: Rc::new(MeKernelCell::prepared(pending)),
             state_count,
+            leases: 0,
         })
+    }
+
+    /// Actual FMI EnterInitializationMode activates the same resource once.
+    #[cfg(feature = "native-wasm")]
+    pub fn enter_initialization_mode(
+        &mut self,
+        config: &MeInstanceConfig,
+    ) -> Result<(), super::MeError> {
+        self.kernel.enter_initialization_mode(config)
+    }
+
+    fn from_kernel(kernel: SolveMeKernel) -> Self {
+        let state_count = kernel.continuous_state_count();
+        Self {
+            kernel: Rc::new(MeKernelCell::new(kernel)),
+            state_count,
+            leases: 0,
+        }
+    }
+
+    /// Consume the actual native Initialization Mode kernel into the common host owner.
+    /// This admits no new engine and preserves its source reset receipt.
+    #[cfg(feature = "native-wasm")]
+    pub fn from_initializing_native_kernel(
+        kernel: SolveMeKernel,
+    ) -> Result<Self, (Box<SolveMeKernel>, super::MeError)> {
+        if !kernel.has_native_resource()
+            || kernel.initialization_state() != super::lifecycle::MeState::InitializationMode
+        {
+            return Err((
+                Box::new(kernel),
+                super::MeError::Contract {
+                    reason: "native host handoff requires its actual Initialization Mode kernel"
+                        .to_owned(),
+                },
+            ));
+        }
+        Ok(Self::from_kernel(kernel))
+    }
+
+    /// FMI Reset restores the original instance source without inventing startTime.
+    pub fn reset(&mut self) -> Result<(), MeSessionError> {
+        self.kernel.reset()?;
+        Ok(())
     }
 
     #[must_use]
@@ -92,8 +153,35 @@ impl MeRetainedComponent {
         self.state_count
     }
 
-    /// Lease the sole FMI instance for one run: rewind to the pristine
-    /// snapshot and run FMI initialization.
+    /// Read options from the actual Initialization Mode request, without a guest copy.
+    pub fn initialization_options(&self) -> Result<MeSessionOptions, MeSessionError> {
+        let config = self.kernel.initialization_configuration()?;
+        let kernel = self.kernel.borrow()?;
+        super::driver::fmi_session_options(kernel.root_location(), &config)
+    }
+
+    pub fn terminate(&mut self) -> Result<(), MeSessionError> {
+        self.kernel.terminate()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "native-wasm")]
+    pub fn native_value_count(
+        &self,
+        references: &[u32],
+        kind: rumoca_ir_solve::SolveVariableValueKind,
+    ) -> Result<usize, super::MeError> {
+        self.kernel.native_value_count(references, kind)
+    }
+
+    /// Runs this component has been leased for, each one an initialization.
+    #[must_use]
+    pub const fn lease_count(&self) -> u64 {
+        self.leases
+    }
+
+    /// Lease the sole FMI instance: complete an actual initialization handoff
+    /// or restore source defaults and initialize the next run.
     ///
     /// The exclusive `&mut self` borrow travels into the returned host and into
     /// every session built from it, so no second host can exist and the
@@ -103,9 +191,9 @@ impl MeRetainedComponent {
         &mut self,
         options: MeSessionOptions,
     ) -> Result<MeComponentHost<'_>, MeSessionError> {
+        self.leases += 1;
         self.kernel
-            .borrow_mut()
-            .reset_to_fmu_state(&self.pristine)?;
+            .prepare_lease(options.start_time(), options.stop_time())?;
         self.host_over_component(options)
     }
 
@@ -118,9 +206,12 @@ impl MeRetainedComponent {
         self,
         options: MeSessionOptions,
     ) -> Result<MeComponentHost<'static>, MeSessionError> {
-        let host = build_host_state(self.kernel, self.pristine, options)?;
+        self.kernel
+            .prepare_host(options.start_time(), options.stop_time())?;
+        let host = build_host_state(Rc::clone(&self.kernel), options)?;
         Ok(MeComponentHost {
             host,
+            owned_component: Some(self),
             lease: PhantomData,
         })
     }
@@ -129,9 +220,10 @@ impl MeRetainedComponent {
         &self,
         options: MeSessionOptions,
     ) -> Result<MeComponentHost<'_>, MeSessionError> {
-        let host = build_host_state(Rc::clone(&self.kernel), self.pristine.clone(), options)?;
+        let host = build_host_state(Rc::clone(&self.kernel), options)?;
         Ok(MeComponentHost {
             host,
+            owned_component: None,
             lease: PhantomData,
         })
     }
@@ -143,31 +235,41 @@ impl MeRetainedComponent {
 /// instance: `MeRetainedComponent::lease(&mut self)` is what proves only one
 /// lease — and therefore only one controller — exists at a time.
 fn build_host_state(
-    kernel: Rc<RefCell<SolveMeKernel>>,
-    pristine: super::MeFmuState,
+    kernel: Rc<MeKernelCell>,
     options: MeSessionOptions,
 ) -> Result<MeHostState, MeSessionError> {
-    let (state_count, indicator_count, names, meta, input_names, max_step_duration_reference) = {
-        let borrowed = kernel.borrow();
-        let description = borrowed.model_description();
+    let input_names = kernel.with_model(|model| {
+        model.problem.solve_layout.input_scalar_names().iter().collect()
+    }).ok_or_else(|| MeSessionError::Contract {
+        reason: "the ME session has no checked input layout".into(),
+    })?;
+    let (state_count, indicator_count, names, meta, max_step_duration_reference) = {
+        let borrowed = kernel.borrow()?;
+        let (names, meta) = if options.records_trace() {
+            let description = borrowed.model_description();
+            (
+                description.output_names.to_vec(),
+                description.output_meta.to_vec(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         (
-            description.continuous_state_count,
-            description.event_indicator_count,
-            description.output_names.to_vec(),
-            description.output_meta.to_vec(),
-            description.input_names.to_vec(),
+            borrowed.continuous_state_count(),
+            borrowed.event_indicator_count(),
+            names,
+            meta,
             borrowed.max_step_duration_value_reference(),
         )
     };
-    let output_labels = names
-        .iter()
-        .map(|name| rumoca_core::VarName::intern(name))
-        .collect();
     let capacity = trace_capacity(&options);
     let mut trace = MeTraceRecorder::new(names, meta, state_count, capacity)?;
-    let outcome =
-        run_fmi_initialization(&mut kernel.borrow_mut(), &options, options.records_trace())?;
-    let root_location = *kernel.borrow().root_location();
+    let outcome = run_fmi_initialization(
+        &mut *kernel.borrow_mut()?,
+        &options,
+        options.records_trace(),
+    )?;
+    let root_location = *kernel.borrow()?.root_location();
     let policy = build_policy(&options, &outcome, state_count, &root_location)?;
     if let Some(values) = &outcome.initial_values {
         trace.record_slice(
@@ -179,7 +281,7 @@ fn build_host_state(
     let terminated = outcome.termination.is_some();
     let mut states = outcome.states;
     states.resize(state_count, 0.0);
-    let derivatives = MeDerivativeController::over_kernel(Rc::clone(&kernel));
+    let derivatives = MeDerivativeController::over_kernel(Rc::clone(&kernel))?;
     Ok(MeHostState {
         kernel,
         max_step_duration_reference,
@@ -197,11 +299,10 @@ fn build_host_state(
         state_count,
         indicator_count,
         input_names,
-        output_labels,
         inputs: IndexMap::new(),
-        pristine,
         event_streak_time: None,
         event_streak_count: 0,
+        sliding: rumoca_ir_solve::fmi::SlidingModes::new(indicator_count),
         usability: Cell::new(None),
         options,
     })
@@ -225,7 +326,7 @@ fn build_policy(
         options.relative_tolerance(),
         outcome.nominals.clone(),
         state_count,
-        root_location.refinement_iteration_cap(),
+        *root_location,
     )
     .map(Some)
 }
@@ -233,6 +334,7 @@ fn build_policy(
 /// An instantiated, initialized FMI 3 ME component awaiting its plugin.
 pub struct MeComponentHost<'lease> {
     host: MeHostState,
+    owned_component: Option<MeRetainedComponent>,
     lease: PhantomData<&'lease ()>,
 }
 
@@ -278,11 +380,11 @@ impl MeComponentHost<'_> {
         self.host.termination.as_ref()
     }
 
-    pub fn output_names(&self) -> Vec<String> {
+    pub fn output_names(&self) -> Result<Vec<String>, MeSessionError> {
         self.host.output_names()
     }
 
-    pub fn output_meta(&self) -> Vec<SimVariableMeta> {
+    pub fn output_meta(&self) -> Result<Vec<SimVariableMeta>, MeSessionError> {
         self.host.output_meta()
     }
 
@@ -325,8 +427,11 @@ impl MeComponentHost<'_> {
         };
         let mut session = MeSimulationSession {
             host: self.host,
+            owned_component: self.owned_component,
             backend,
             scan_workspace: RefCell::new(RootScanWorkspace::default()),
+            deferred: None,
+            snapped_yield: None,
             lease: PhantomData,
         };
         session.start_plugin()?;
@@ -334,20 +439,78 @@ impl MeComponentHost<'_> {
     }
 }
 
+/// Live yields never bound a deferring session's step (issue #513); this fixed
+/// horizon does, together with stop, events and the maximum step duration.
+const LIVE_OBSERVATION_HORIZON_S: f64 = 1.0e6;
+
+/// One natural step accepted and scanned but not yet committed, holding the
+/// live yield it serves from its continuous extension (issue #513).
+struct DeferredCrossing {
+    step: MeAcceptedStep,
+    located: Option<MeRootApplication>,
+    observed_time: f64,
+    observed_states: Vec<f64>,
+}
+
 /// The one FMI 3 ME master algorithm.
 pub struct MeSimulationSession<'lease, 'plugin> {
     host: MeHostState,
+    owned_component: Option<MeRetainedComponent>,
     backend: Box<dyn MeIntegratorBackend + 'plugin>,
     scan_workspace: RefCell<RootScanWorkspace>,
+    /// A live yield served from inside a natural step that is not yet committed
+    /// (issue #513): observation cadence must not change the trajectory.
+    deferred: Option<DeferredCrossing>,
+    /// The exact yield a deferring session reported when its committed point
+    /// ended within roundoff of it (issue #513): the caller sees its own time.
+    snapped_yield: Option<f64>,
     lease: PhantomData<&'lease ()>,
 }
 
 impl MeSimulationSession<'_, '_> {
+    /// This observes the existing log; it evaluates no source effect or warning site.
+    pub fn diagnostics_since(&self, first: usize) -> (Vec<crate::SimDiagnostic>, usize) {
+        self.host.kernel.diagnostics_since(first)
+    }
     // -- public incremental surface ----------------------------------------
 
+    /// The session's coordinate as its caller sees it: a deferred live yield
+    /// (issue #513) stands before the accepted point of the step that holds it.
     #[must_use]
     pub fn time(&self) -> f64 {
-        self.host.time
+        match (&self.deferred, self.snapped_yield) {
+            (Some(deferred), _) => deferred.observed_time,
+            (None, Some(snapped)) => snapped,
+            (None, None) => self.host.time,
+        }
+    }
+
+    /// The horizon held by this actual driver, rather than a caller's copy.
+    #[must_use]
+    pub fn stop_time(&self) -> Option<f64> {
+        self.host.options.stop_time()
+    }
+
+    pub fn terminate(&mut self) -> Result<(), MeSessionError> {
+        self.require_live()?;
+        // Terminate where the caller stands: a deferred live yield (issue #513)
+        // becomes the accepted point first, exactly as for an input change.
+        self.truncate_deferred_at_observation()?;
+        self.snapped_yield = None;
+        if self.host.terminated {
+            return Ok(());
+        }
+        self.host.terminate_component(None)
+    }
+
+    #[cfg(feature = "native-wasm")]
+    pub fn native_value_count(
+        &self,
+        references: &[u32],
+        kind: rumoca_ir_solve::SolveVariableValueKind,
+    ) -> Result<usize, MeSessionError> {
+        self.require_live()?;
+        Ok(self.host.kernel.native_value_count(references, kind)?)
     }
 
     #[must_use]
@@ -365,15 +528,15 @@ impl MeSimulationSession<'_, '_> {
         self.host.terminated
     }
 
-    pub fn output_names(&self) -> Vec<String> {
+    pub fn output_names(&self) -> Result<Vec<String>, MeSessionError> {
         self.host.output_names()
     }
 
-    pub fn input_names(&self) -> Vec<String> {
-        self.host.input_names.clone()
+    pub fn input_names(&self) -> &[String] {
+        &self.host.input_names
     }
 
-    pub fn output_meta(&self) -> Vec<SimVariableMeta> {
+    pub fn output_meta(&self) -> Result<Vec<SimVariableMeta>, MeSessionError> {
         self.host.output_meta()
     }
 
@@ -382,7 +545,7 @@ impl MeSimulationSession<'_, '_> {
     /// Outputs, inputs and constants remain in their own inventories.
     pub fn parameter_values(&self) -> Result<IndexMap<String, f64>, MeSessionError> {
         self.require_live()?;
-        Ok(self.host.kernel.borrow().parameter_values()?)
+        Ok(self.host.kernel.borrow()?.parameter_values()?)
     }
 
     /// Whether `name` is a declared **input** of this component.
@@ -391,7 +554,16 @@ impl MeSimulationSession<'_, '_> {
     /// inventory, not from the mere existence of a value reference.
     #[must_use]
     pub fn has_input(&self, name: &str) -> bool {
-        self.host.input_names.iter().any(|input| input == name)
+        self.host
+            .kernel
+            .with_model(|model| {
+                model
+                    .problem
+                    .solve_layout
+                    .input_parameter_index(name)
+                    .is_some()
+            })
+            .unwrap_or(false)
     }
 
     /// Restart the session at `start_time` from the pristine component state.
@@ -405,17 +577,17 @@ impl MeSimulationSession<'_, '_> {
         // leaves an ordinary live session; everything after it does move the
         // component and the host caches together.
         let options = self.host.options.restarted_at(start_time)?;
+        self.deferred = None;
+        self.snapped_yield = None;
         let restarted = self.restart_session(options);
         self.host.guard_mutation(MeSessionLoss::Restart, restarted)
     }
 
     /// Discard every cache and rebuild the whole lifecycle.
     fn restart_session(&mut self, options: MeSessionOptions) -> Result<(), MeSessionError> {
-        let pristine = self.host.pristine.clone();
         self.host
             .kernel
-            .borrow_mut()
-            .restart_from_fmu_state(&pristine, options.start_time())?;
+            .restart(options.start_time(), options.stop_time())?;
         self.host.trace.clear();
         self.host.inputs.clear();
         self.host.termination = None;
@@ -425,15 +597,16 @@ impl MeSimulationSession<'_, '_> {
         self.host.retained_interval = None;
         self.host.event_streak_time = None;
         self.host.event_streak_count = 0;
+        self.host.sliding.reset();
         self.host.budget = TimeoutBudget::new(options.max_wall_seconds());
         self.host.options = options;
 
         let outcome = run_fmi_initialization(
-            &mut self.host.kernel.borrow_mut(),
+            &mut *self.host.kernel.borrow_mut()?,
             &self.host.options,
             self.host.options.records_trace(),
         )?;
-        let root_location = *self.host.kernel.borrow().root_location();
+        let root_location = *self.host.kernel.borrow()?.root_location();
         self.host.policy = build_policy(
             &self.host.options,
             &outcome,
@@ -466,15 +639,20 @@ impl MeSimulationSession<'_, '_> {
                 reason: format!("advance_to requires a finite yield boundary, got {yield_time}"),
             });
         }
-        let roundoff = accepted_step_roundoff(self.host.time, 0.0);
-        if yield_time - self.host.time < -roundoff {
+        let now = self.time();
+        let roundoff = accepted_step_roundoff(now, 0.0);
+        if yield_time - now < -roundoff {
             return Err(MeSessionError::Contract {
                 reason: format!(
-                    "advance_to({yield_time}) would move the session backward from t={}",
-                    self.host.time
+                    "advance_to({yield_time}) would move the session backward from t={now}"
                 ),
             });
         }
+        self.snapped_yield = None;
+        if let Some(outcome) = self.serve_deferred(yield_time, cursor)? {
+            return Ok(outcome);
+        }
+        let defer = self.defers_yields(cursor);
         loop {
             if self.host.terminated {
                 return Ok(MeAdvanceOutcome::Terminated);
@@ -484,14 +662,136 @@ impl MeSimulationSession<'_, '_> {
             }
             self.host.budget.check()?;
             let resolved = self.resolve_without_advance(yield_time, cursor)?;
-            match resolved {
-                LoopStep::Finished(outcome) => return Ok(outcome),
-                LoopStep::Continue => {}
-                LoopStep::Advance => {
-                    self.advance_one_accepted_step(yield_time, cursor)?;
-                }
+            if let LoopStep::Finished(outcome) = resolved {
+                self.snap_to_yield(defer, outcome, yield_time);
+                return Ok(outcome);
+            }
+            let deferred = matches!(resolved, LoopStep::Advance)
+                && self.advance_one_accepted_step(yield_time, cursor)?;
+            if deferred {
+                return Ok(MeAdvanceOutcome::Yielded);
             }
         }
+    }
+
+    /// A deferring session's natural step can end within roundoff of the
+    /// yield; the caller still stands exactly on the yield it asked for.
+    fn snap_to_yield(&mut self, defer: bool, outcome: MeAdvanceOutcome, yield_time: f64) {
+        if defer
+            && matches!(outcome, MeAdvanceOutcome::Yielded)
+            && self.host.time.to_bits() != yield_time.to_bits()
+        {
+            self.snapped_yield = Some(yield_time);
+        }
+    }
+
+    /// A live session with nothing scheduled (no stop time, no output cursor)
+    /// treats a yield as an observation, not a step boundary (issue #513).
+    /// A native component's typed value references read and write the
+    /// component's own coordinate, so it keeps every yield a step boundary.
+    fn defers_yields(&self, cursor: &MeOutputCursor) -> bool {
+        self.host.options.stop_time().is_none()
+            && cursor.peek().is_none()
+            && self
+                .host
+                .kernel
+                .borrow()
+                .is_ok_and(|kernel| !kernel.has_native_resource())
+    }
+
+    /// Serve `yield_time` from a deferred natural step when it lies inside it
+    /// (before its end and before any located root); otherwise commit that step
+    /// exactly as an undeferred one and let the master loop continue.
+    ///
+    /// Serving is an advance like any other, so the wall budget is checked
+    /// first. Soft observations a newly supplied cursor requests up to the
+    /// yield are materialized from the same retained extension, so adding an
+    /// output schedule never cuts the natural step; an observation behind the
+    /// caller's coordinate is refused before anything moves.
+    fn serve_deferred(
+        &mut self,
+        yield_time: f64,
+        cursor: &mut MeOutputCursor,
+    ) -> Result<Option<MeAdvanceOutcome>, MeSessionError> {
+        let Some(observed_time) = self.deferred.as_ref().map(|d| d.observed_time) else {
+            return Ok(None);
+        };
+        self.host.budget.check()?;
+        let roundoff = accepted_step_roundoff(observed_time, 0.0);
+        if let Some(observation) = cursor.peek()
+            && observation - observed_time < -roundoff
+        {
+            return Err(MeSessionError::Contract {
+                reason: format!(
+                    "the output schedule requests t={observation} behind t={observed_time}"
+                ),
+            });
+        }
+        let serves = self
+            .deferred
+            .as_ref()
+            .is_some_and(|deferred| deferred.serves(yield_time));
+        if serves {
+            self.materialize_nominals_before(yield_time, cursor)?;
+            let mut states = try_filled(self.host.state_count, 0.0, "deferred live observation")?;
+            self.sample_states(yield_time, &mut states)?;
+            if cursor
+                .peek()
+                .is_some_and(|observation| observation - yield_time <= roundoff)
+            {
+                self.host
+                    .record_off_point(TraceObservationRole::Nominal, yield_time, &states)?;
+                cursor.advance();
+            }
+            let deferred = self.deferred.as_mut().expect("checked above");
+            deferred.observed_time = yield_time;
+            deferred.observed_states = states;
+            return Ok(Some(MeAdvanceOutcome::Yielded));
+        }
+        let deferred = self.deferred.take().expect("checked above");
+        let finished = self.finish_accepted_step(&deferred.step, deferred.located, cursor);
+        self.host
+            .guard_mutation(MeSessionLoss::NumericalStep, finished)?;
+        Ok(None)
+    }
+
+    pub(super) fn clear_snapped_yield(&mut self) {
+        self.snapped_yield = None;
+    }
+
+    /// An input change at a deferred observation is a real discontinuity:
+    /// truncate the natural step there, exactly as a located root is applied.
+    pub(super) fn truncate_deferred_at_observation(&mut self) -> Result<(), MeSessionError> {
+        let Some(deferred) = self.deferred.take() else {
+            return Ok(());
+        };
+        let truncated = self.truncate_at(deferred.observed_time, &deferred.observed_states);
+        self.host
+            .guard_mutation(MeSessionLoss::NumericalStep, truncated)
+    }
+
+    fn truncate_at(&mut self, time: f64, states: &[f64]) -> Result<(), MeSessionError> {
+        self.host.adopt_projected_point(time, states)?;
+        let point = self.host.checked_point()?;
+        self.run_with_derivatives(|backend| backend.truncate_reset(&point))?;
+        self.host.retained_interval = None;
+        let completed = self.host.completed_integrator_step()?;
+        self.host.refresh_retained_indicators()?;
+        if completed.terminate_simulation {
+            self.host.terminate_at_current_point(
+                "the component requested termination at a truncated live observation",
+            )?;
+            return Ok(());
+        }
+        if completed.enter_event_mode {
+            let cause = if completed.basis_change {
+                MeEventCause::BasisChange
+            } else {
+                MeEventCause::StateEvent
+            };
+            self.process_event_boundary(cause, time)?;
+        }
+        Ok(())
     }
 
     /// Drive the whole defined experiment through the same incremental session.
@@ -717,9 +1017,17 @@ impl MeSimulationSession<'_, '_> {
         &mut self,
         yield_time: f64,
         cursor: &mut MeOutputCursor,
-    ) -> Result<(), MeSessionError> {
-        let request = self.build_advance_request(yield_time, cursor)?;
-        let stepped = self.take_one_numerical_step(request, cursor);
+    ) -> Result<bool, MeSessionError> {
+        let defer = self.defers_yields(cursor);
+        // A deferring session bounds the step by its own fixed horizon, never by
+        // the caller's yield, so the step sequence is independent of cadence.
+        let bound = if defer {
+            self.host.time + LIVE_OBSERVATION_HORIZON_S
+        } else {
+            yield_time
+        };
+        let request = self.build_advance_request(bound, cursor)?;
+        let stepped = self.take_one_numerical_step(request, defer.then_some(yield_time), cursor);
         self.host
             .guard_mutation(MeSessionLoss::NumericalStep, stepped)
     }
@@ -739,13 +1047,36 @@ impl MeSimulationSession<'_, '_> {
     fn take_one_numerical_step(
         &mut self,
         request: MeAdvanceRequest,
+        deferred_yield: Option<f64>,
         cursor: &mut MeOutputCursor,
-    ) -> Result<(), MeSessionError> {
+    ) -> Result<bool, MeSessionError> {
         let event_boundary = self.host.next_event_time;
         let candidate =
             self.run_with_derivatives_until(event_boundary, |backend| backend.advance(&request))?;
         let proposal = MeStepProposal::bind(request, candidate, self.host.state_count)?;
-        self.consume_accepted_step(proposal, cursor)
+        let (step, located) = self.accept_and_scan(proposal)?;
+        if let Some(yield_time) = deferred_yield {
+            let crossing = DeferredCrossing {
+                observed_time: yield_time,
+                observed_states: Vec::new(),
+                step,
+                located,
+            };
+            if crossing.serves(yield_time) {
+                let mut states =
+                    try_filled(self.host.state_count, 0.0, "deferred live observation")?;
+                self.sample_states(yield_time, &mut states)?;
+                self.deferred = Some(DeferredCrossing {
+                    observed_states: states,
+                    ..crossing
+                });
+                return Ok(true);
+            }
+            self.finish_accepted_step(&crossing.step, crossing.located, cursor)?;
+            return Ok(false);
+        }
+        self.finish_accepted_step(&step, located, cursor)?;
+        Ok(false)
     }
 
     /// Prove every coordinate of one request before anything moves.
@@ -788,13 +1119,13 @@ impl MeSimulationSession<'_, '_> {
     /// Endpoint validation is unconditional: a model with no event indicators
     /// still owes the accepted-step sampler contract,
     /// and only the validated [`MeSampledStep`] can be scanned at all
-    fn consume_accepted_step(
+    fn accept_and_scan(
         &mut self,
         proposal: MeStepProposal,
-        cursor: &mut MeOutputCursor,
-    ) -> Result<(), MeSessionError> {
+    ) -> Result<(MeAcceptedStep, Option<MeRootApplication>), MeSessionError> {
         let step = self.accept_proposal(proposal)?;
         crate::runtime::hotpath_stats::inc_solver_step();
+        self.host.sliding.begin_interval();
         debug_assert!(
             step.order() > 0,
             "a checked accepted step always carries a positive declared order"
@@ -807,13 +1138,47 @@ impl MeSimulationSession<'_, '_> {
         let retained = std::mem::take(&mut self.host.retained_indicators);
         let located = self.scan_with_retained(&step, &retained);
         self.host.retained_indicators = retained;
-        match located? {
-            Some(application) if !self.coincides_with_time_event(&step, &application) => {
+        Ok((step, located?))
+    }
+
+    /// Commit one accepted, scanned interval: apply its located root, or
+    /// complete its endpoint.
+    fn finish_accepted_step(
+        &mut self,
+        step: &MeAcceptedStep,
+        located: Option<MeRootApplication>,
+        cursor: &mut MeOutputCursor,
+    ) -> Result<(), MeSessionError> {
+        match located {
+            Some(application) if !self.coincides_with_time_event(step, &application)? => {
                 crate::runtime::hotpath_stats::inc_root_hit();
-                self.apply_located_root(&step, &application, cursor)
+                self.record_sliding_modes(&application)?;
+                self.apply_located_root(step, &application, cursor)
             }
-            _ => self.commit_accepted_endpoint(&step, cursor),
+            _ => self.commit_accepted_endpoint(step, cursor),
         }
+    }
+
+    /// Record a state event in the plan's sliding-mode history (SPEC_0044
+    /// ME-EVENT-005), and count one applied without refinement.
+    fn record_sliding_modes(
+        &mut self,
+        application: &MeRootApplication,
+    ) -> Result<(), MeSessionError> {
+        let policy = self.host.policy()?;
+        let plan = policy.root_location();
+        let gap = plan.sliding_gap(policy.scan_resolution());
+        let streak = plan.sliding_streak();
+        if application.sliding() {
+            crate::runtime::fallbacks::note_sliding_mode(application.changed_indicators());
+        }
+        self.host.sliding.record_event(
+            application.application().time(),
+            application.changed_indicators(),
+            gap,
+            streak,
+        );
+        Ok(())
     }
 
     /// Whether a located root is the scheduled time event this step reaches,
@@ -823,24 +1188,24 @@ impl MeSimulationSession<'_, '_> {
         &self,
         step: &MeAcceptedStep,
         application: &MeRootApplication,
-    ) -> bool {
+    ) -> Result<bool, MeSessionError> {
         let Some(event_time) = self.host.reached_cached_event_time(step.accepted().time()) else {
-            return false;
+            return Ok(false);
         };
         let start = step.previous().time();
-        self.host
+        Ok(self
+            .host
             .kernel
-            .borrow()
+            .borrow()?
             .root_location()
             .coincides_with_time_event(
                 application.application().time(),
                 event_time,
                 start,
                 step.accepted().time() - start,
-            )
+            ))
     }
 
-    /// The scan's view of the component and the plugin's continuous extension.
     fn scan_target(&self) -> SessionScanTarget<'_> {
         SessionScanTarget {
             kernel: &self.host.kernel,
@@ -890,6 +1255,7 @@ impl MeSimulationSession<'_, '_> {
                 policy,
                 step,
                 retained,
+                &self.host.sliding,
                 &mut self.scan_workspace.borrow_mut(),
             )
         })
@@ -989,7 +1355,7 @@ impl MeSimulationSession<'_, '_> {
         }
         let mut states = try_filled(self.host.state_count, 0.0, "event-left sample")?;
         self.sample_states(coordinate, &mut states)?;
-        let component = self.host.kernel.borrow().fmu_state();
+        let component = self.host.kernel.borrow()?.fmu_state()?;
         Ok(Some(PendingEventLeft {
             coordinate,
             states,
@@ -1116,16 +1482,30 @@ impl MeSimulationSession<'_, '_> {
         // rather than moving the component behind the host's back
         self.host.adopt_time(event_time)?;
         let discrete = self.host.run_event_mode(cause, event_time)?;
+        self.complete_event_mode(discrete, event_time, true)
+    }
+
+    fn complete_event_mode(
+        &mut self,
+        discrete: super::MeDiscreteStates,
+        event_time: f64,
+        publish_observation: bool,
+    ) -> Result<(), MeSessionError> {
         if let Some(termination) = discrete.terminate_simulation {
             // FMI: `terminateSimulation` ends the iteration immediately and
             // transitions to Terminated without another numerical request, even
             // when `discreteStatesNeedUpdate` is also true. The settled row is
             // read here, while Event Mode still makes the getters legal.
-            self.host.record_settled(event_time)?;
+            if publish_observation {
+                self.host.record_settled(event_time)?;
+            }
             self.host.terminate_component(Some(termination))?;
             return Ok(());
         }
-        self.host.kernel.borrow_mut().enter_continuous_time_mode()?;
+        self.host
+            .kernel
+            .borrow_mut()?
+            .enter_continuous_time_mode()?;
         self.refresh_after_event(
             discrete.values_of_continuous_states_changed,
             discrete.nominals_of_continuous_states_changed,
@@ -1135,7 +1515,7 @@ impl MeSimulationSession<'_, '_> {
         // row, at the end of the chain. Publishing per iteration would mint a
         // second settled row at one coordinate, which SPEC_0050 does not
         // authorize as a replacement.
-        if !continues_at(discrete.next_event_time, event_time) {
+        if publish_observation && !continues_at(discrete.next_event_time, event_time) {
             self.host.record_settled(event_time)?;
         }
         self.host.next_event_time = discrete.next_event_time;
@@ -1184,7 +1564,7 @@ impl MeSimulationSession<'_, '_> {
             let mut states = try_filled(self.host.state_count, 0.0, "refreshed continuous states")?;
             self.host
                 .kernel
-                .borrow()
+                .borrow()?
                 .get_continuous_states(&mut states)?;
             Some(states)
         } else {
@@ -1255,7 +1635,12 @@ impl MeSimulationSession<'_, '_> {
     /// ME-BUF-001 makes this and [`Self::verification_session_point`] one fact;
     /// an ablation asserts they agree after every failure
     pub(super) fn verification_component_point(&self) -> (u64, Vec<u64>) {
-        let (_, time, states, _) = self.host.kernel.borrow().verification_observable_state();
+        let (_, time, states, _) = self
+            .host
+            .kernel
+            .borrow()
+            .expect("verification requires an active session")
+            .verification_observable_state();
         (time, states)
     }
 
@@ -1263,8 +1648,19 @@ impl MeSimulationSession<'_, '_> {
     /// Terminated.  This is deliberately a boolean: the private lifecycle type
     /// does not become part of the session API merely to support an ablation.
     pub(super) fn verification_component_is_terminated(&self) -> bool {
-        self.host.kernel.borrow().verification_observable_state().0
+        self.host
+            .kernel
+            .borrow()
+            .expect("verification requires an active session")
+            .verification_observable_state()
+            .0
             == super::lifecycle::MeState::Terminated
+    }
+
+    /// Expire the wall budget now without sleeping: a zero-length deadline is
+    /// already reached at every later check.
+    pub(super) fn verification_expire_budget(&mut self) {
+        self.host.budget = TimeoutBudget::new(Some(f64::MIN_POSITIVE));
     }
 
     /// Whether the retained derivative capability is currently reachable.
@@ -1283,6 +1679,7 @@ impl MeSimulationSession<'_, '_> {
         self.host
             .kernel
             .borrow_mut()
+            .expect("verification requires an active session")
             .terminate()
             .expect("fmi3Terminate is legal once");
     }
@@ -1372,7 +1769,7 @@ enum LoopStep {
 /// loss it implies are the caller's single obligation on every exit (returned
 /// or unwound) rather than a per-coordinate one.
 struct SessionScanTarget<'a> {
-    kernel: &'a Rc<RefCell<SolveMeKernel>>,
+    kernel: &'a Rc<MeKernelCell>,
     derivatives: &'a MeDerivativeController,
     backend: &'a dyn MeIntegratorBackend,
     budget: &'a TimeoutBudget,
@@ -1402,7 +1799,7 @@ impl RootScanTarget for SessionScanTarget<'_> {
         states: &[f64],
         indicators: &mut Vec<f64>,
     ) -> Result<(), MeSessionError> {
-        let mut kernel = self.kernel.borrow_mut();
+        let mut kernel = self.kernel.borrow_mut()?;
         kernel.set_time(MeTime::new(time, self.event_boundary))?;
         kernel.set_continuous_states(states)?;
         indicators.clear();
@@ -1551,3 +1948,31 @@ mod tests {
         ));
     }
 }
+
+#[cfg(feature = "native-wasm")]
+macro_rules! retained_native_accessors {
+    ($set:ident, $get:ident, $value:ty) => {
+        impl MeRetainedComponent {
+            pub fn $set(
+                &mut self,
+                references: &[u32],
+                values: &[$value],
+            ) -> Result<(), super::MeError> {
+                self.kernel.$set(references, values)
+            }
+            pub fn $get(
+                &self,
+                references: &[u32],
+                values: &mut [$value],
+            ) -> Result<(), super::MeError> {
+                self.kernel.$get(references, values)
+            }
+        }
+    };
+}
+#[cfg(feature = "native-wasm")]
+retained_native_accessors!(set_native_integer, get_native_integer, i64);
+#[cfg(feature = "native-wasm")]
+retained_native_accessors!(set_boolean, get_boolean, bool);
+#[cfg(feature = "native-wasm")]
+retained_native_accessors!(set_native_float64, get_native_float64, f64);

@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 
 use super::{DeferredParameterSource, EvalContext, Function, Value};
+use crate::translation_reads::ResourceRoots;
 
 /// Values and definitions available to constant expression evaluation.
 ///
@@ -11,6 +12,23 @@ use super::{DeferredParameterSource, EvalContext, Function, Value};
 pub trait EvalEnvironment {
     /// Look up a value using the inventory's current lexical scope.
     fn get_value(&self, name: &str) -> Option<Cow<'_, Value>>;
+    /// Whether a declaration has a lexical binding, even without a settled value.
+    fn declaration_is_lexical(&self, _id: rumoca_core::DefId) -> bool {
+        false
+    }
+    /// Read a lexical source iterator by its Resolve-issued declaration identity.
+    fn get_declaration_value(&self, _id: rumoca_core::DefId) -> Option<Cow<'_, Value>> {
+        None
+    }
+    fn get_reference_value(&self, reference: &rumoca_core::Reference) -> Option<Cow<'_, Value>> {
+        if let Some(id) = reference.target_def_id()
+            && self.declaration_is_lexical(id)
+        {
+            self.get_declaration_value(id)
+        } else {
+            self.get_value(reference.as_str())
+        }
+    }
     /// Look up an explicitly registered enumeration literal.
     fn get_enum(&self, name: &str) -> Option<&(String, String)>;
     /// Find a function definition under a registered call name.
@@ -19,6 +37,12 @@ pub trait EvalEnvironment {
     fn get_array_dimensions(&self, name: &str) -> Option<&[i64]>;
     /// Identify declared parameters whose values await initialization.
     fn deferred_parameter(&self, name: &str) -> Option<DeferredParameterSource>;
+    /// The resource roots of a translation that evaluates parameter bindings,
+    /// which alone admits the cataloged foreign file readers (SPEC_0040
+    /// FLAT-C06). Any other evaluation leaves their calls unevaluated.
+    fn translation_resources(&self) -> Option<&ResourceRoots> {
+        None
+    }
 }
 
 impl EvalEnvironment for EvalContext {

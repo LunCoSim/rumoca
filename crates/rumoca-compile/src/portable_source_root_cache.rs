@@ -171,6 +171,19 @@ fn collect_modelica_sources(
     source_root_key: &str,
     files: &mut Vec<PortableModelicaFile>,
 ) -> Result<()> {
+    if dir.is_file() {
+        ensure!(
+            dir.extension() == Some(OsStr::new("mo")),
+            "source root file must be Modelica: {}",
+            dir.display()
+        );
+        let name = dir.file_name().context("source root file lacks a name")?;
+        files.push(PortableModelicaFile {
+            source_path: dir.to_path_buf(),
+            uri: format!("{source_root_key}/{}", name.to_string_lossy()),
+        });
+        return Ok(());
+    }
     for entry in sorted_dir_entries(dir)? {
         let path = entry.path();
         let file_type = entry
@@ -232,7 +245,7 @@ fn normalize_source_root_path(relative: &Path) -> PathBuf {
     normalized
 }
 
-fn strip_trailing_version_suffix(name: &str) -> String {
+pub(crate) fn strip_trailing_version_suffix(name: &str) -> String {
     let Some(separator) = name.rfind([' ', '-']) else {
         return name.to_owned();
     };
@@ -244,6 +257,28 @@ fn strip_trailing_version_suffix(name: &str) -> String {
     } else {
         name.to_owned()
     }
+}
+
+/// Parse the numeric components of a `Name X.Y.Z` directory suffix.
+///
+/// Every component is a run of ASCII digits and components are separated by
+/// single dots; anything else (an empty component, a letter, a trailing dot)
+/// is not a version and yields `None`.
+pub(crate) fn parse_version_components(suffix: &str) -> Option<Vec<u64>> {
+    let mut components = Vec::new();
+    let mut current: Option<u64> = None;
+    for ch in suffix.chars() {
+        match ch.to_digit(10) {
+            Some(digit) => {
+                let value = current.unwrap_or(0);
+                current = Some(value.checked_mul(10)?.checked_add(u64::from(digit))?);
+            }
+            None if ch == '.' => components.push(current.take()?),
+            None => return None,
+        }
+    }
+    components.push(current?);
+    Some(components)
 }
 
 fn sorted_dir_entries(dir: &Path) -> Result<Vec<fs::DirEntry>> {
@@ -258,6 +293,19 @@ fn sorted_dir_entries(dir: &Path) -> Result<Vec<fs::DirEntry>> {
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+
+    #[test]
+    fn version_components_parse_dotted_numbers_only() {
+        assert_eq!(
+            super::parse_version_components("4.1.0"),
+            Some(vec![4, 1, 0])
+        );
+        assert_eq!(super::parse_version_components("10"), Some(vec![10]));
+        assert_eq!(super::parse_version_components(""), None);
+        assert_eq!(super::parse_version_components("4..1"), None);
+        assert_eq!(super::parse_version_components("4.1."), None);
+        assert_eq!(super::parse_version_components("4.1a"), None);
+    }
 
     use flate2::read::GzDecoder;
 
@@ -335,6 +383,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["msl/Modelica/A.mo", "msl/Modelica/B.mo"]
         );
+    }
+
+    #[test]
+    fn file_root_does_not_include_neighboring_models() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let library = temp.path().join("Library.mo");
+        fs::write(&library, "package Library end Library;").unwrap();
+        fs::write(temp.path().join("Main.mo"), "model Main end Main;").unwrap();
+        let output = temp.path().join("cache.bin.gz");
+        let root = PortableSourceRoot::new("dependency", &library).unwrap();
+        let report = write_portable_source_root_cache(&output, &[root]).unwrap();
+        assert!(report.issues.is_empty());
+        assert_eq!(report.definition_count, 1);
+        let mut bytes = Vec::new();
+        GzDecoder::new(fs::File::open(output).unwrap())
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let documents = decode_source_root_snapshot(&bytes).unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].uri(), "dependency/Library.mo");
+        assert_eq!(
+            bytes,
+            encode_source_root_snapshot(&[(
+                "dependency/Library.mo".to_string(),
+                "package Library end Library;".to_string()
+            )])
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn file_root_refuses_non_modelica_input() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("Library.txt");
+        fs::write(&file, "package Library end Library;").unwrap();
+        let root = PortableSourceRoot::new("dependency", file).unwrap();
+        assert!(write_portable_source_root_cache(&temp.path().join("cache.gz"), &[root]).is_err());
     }
 
     #[test]

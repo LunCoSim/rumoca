@@ -15,8 +15,10 @@ mod cli_report_tests;
 #[cfg(test)]
 mod cli_tests;
 mod compile_selectors;
+mod compile_summary;
 mod debug_tracing;
 mod model_resolution;
+mod point_inspection;
 mod projection_report;
 pub(crate) mod sim_defaults;
 mod value;
@@ -24,7 +26,10 @@ mod value;
 use debug_tracing::expand_trace_filter;
 pub(crate) use debug_tracing::init_debug_tracing;
 use debug_tracing::trace_requests_viewer;
-use sim_defaults::{direct_sim_window, sim_window};
+use point_inspection::{PointInspection, run_point_inspection, run_sim_inspection};
+use sim_defaults::{direct_sim_options, direct_sim_window, sim_window};
+
+use compile_summary::print_summary;
 
 pub use compile_selectors::{CompilePhase, EmissionPolicyArg, InlinePolicyArg, ScalarizePolicyArg};
 
@@ -35,7 +40,6 @@ use crate::cache_cmd;
 use crate::fmt_cli;
 use crate::main_helpers::{completion_script, discover_workspace_root_for_model_file};
 use crate::sim_bench;
-use crate::sim_inspect;
 use crate::target_manifest;
 use crate::targets_cmd;
 #[cfg(feature = "scheduled-sim")]
@@ -50,13 +54,13 @@ use miette::{LabeledSpan, MietteDiagnostic, NamedSource, Report, Severity};
 pub use crate::fmt_cli::FmtArgs;
 pub use crate::sim_bench::SimBenchArgs;
 use crate::{CompilationResult, Compiler, CompilerError, DaeCompilationResult, TemplateIr};
+use rumoca_compile::parsing::StoredDefinition;
 use rumoca_compile::{
     codegen::{CodegenError, render_flat_template_with_name},
     compile::{Dae, FlatModel},
 };
 use rumoca_core::{Diagnostic as CommonDiagnostic, DiagnosticSeverity, SourceMap};
-use rumoca_phase_resolve::ResolvedTree;
-use rumoca_sim::{DiffsolMethod, SimOptions, SimSolverMode};
+use rumoca_sim::{SimOptions, SimSolverMode};
 use rumoca_sim::{SimulationRequestSummary, SimulationRunMetrics};
 use rumoca_tool_lint::{LintLevel, LintMessage, LintOptions, PartialLintOptions};
 
@@ -69,7 +73,7 @@ pub(crate) use model_resolution::{
 pub(crate) use model_resolution::{merge_source_root_path_sources, split_path_list};
 
 #[cfg(test)]
-pub(crate) use sim_inspect::parse_eval_at_spec;
+pub(crate) use crate::sim_inspect::parse_eval_at_spec;
 
 /// Git version string
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -151,6 +155,14 @@ pub struct Cli {
     // (a low-importance global that shouldn't crowd the primary options).
     #[arg(long, global = true, value_name = "DIR")]
     pub cache_dir: Option<PathBuf>,
+}
+
+impl Cli {
+    /// True for `rumoca sim --serve-stdio`, whose output pipe is a protocol channel.
+    #[must_use]
+    pub fn serves_stdio_session(&self) -> bool {
+        matches!(&self.command, Commands::Sim(args) if args.serve_stdio)
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -307,6 +319,9 @@ pub struct CompileArgs {
 
     /// Dump an intermediate representation: `<stage>-mo` for Modelica or
     /// `<stage>-json` for JSON (stage = ast/flat/dae/solve). See possible values.
+    /// `ast-json` is the parser's tree of MODELICA_FILE alone and ignores
+    /// --model and --source-root; every later stage selects the model and
+    /// resolves its class closure.
     #[arg(long, value_enum, conflicts_with = "target")]
     pub emit: Option<EmitTarget>,
 
@@ -485,6 +500,21 @@ pub struct SimCommandArgs {
     #[arg(short, long)]
     pub output: Option<String>,
 
+    /// Serve one simulation session over stdio instead of running a batch
+    /// simulation: read a JSON command per line on stdin (`set_input`,
+    /// `set_inputs`, `step`, `advance_to`, `get`, `state`, `reset`,
+    /// `input_names`, `variable_names`, `close`) and write a JSON event per
+    /// line on stdout. Diagnostics go to stderr; `--t-end` is the initial
+    /// horizon and the session extends it on demand.
+    #[arg(long, conflicts_with_all = ["inspect", "output", "config"])]
+    pub serve_stdio: bool,
+
+    /// Initial value of a model input for `--serve-stdio` (repeatable). Needed for
+    /// each input that has no binding equation default, because initialization
+    /// reads inputs before the controller has written any.
+    #[arg(long = "input", value_name = "NAME=VALUE", requires = "serve_stdio", value_parser = parse_initial_input)]
+    pub initial_inputs: Vec<(String, f64)>,
+
     /// Inspect the lowered model instead of simulating (see possible values
     /// below). `eval`/`jacobian` take a point via --at. Analyzes only.
     #[arg(long = "inspect", value_enum)]
@@ -510,6 +540,59 @@ pub struct SimCommandArgs {
     #[arg(long, value_enum, default_value_t = GradMode::Forward, requires = "inspect")]
     pub grad_mode: GradMode,
 
+    /// Parameters `--inspect trajectory-sensitivity|objective-gradient`
+    /// differentiates with respect to, comma separated. Defaults to every
+    /// independent tunable parameter some Solve program reads; the parameters left
+    /// out, and why, are printed. A `noEvent` relation of a state, an algebraic, or
+    /// a requested parameter is refused: one-sided sensitivities across a switching
+    /// surface are not constructed. Models are advanced with the `rk-like` solver
+    /// only; `--solver bdf` is refused.
+    #[arg(long, value_name = "NAME", value_delimiter = ',', requires = "inspect")]
+    pub wrt: Vec<String>,
+
+    /// Running objective term `integral NAME dt` over the run (a state or solver
+    /// algebraic); repeatable. Selects the trajectory mode of
+    /// `--inspect objective-gradient`.
+    #[arg(
+        long,
+        value_name = "NAME",
+        requires = "inspect",
+        conflicts_with = "objective"
+    )]
+    pub integral: Vec<String>,
+
+    /// Terminal objective term `NAME(T)` at the end of the run; repeatable.
+    /// Selects the trajectory mode of `--inspect objective-gradient`.
+    #[arg(
+        long,
+        value_name = "NAME",
+        requires = "inspect",
+        conflicts_with = "objective"
+    )]
+    pub terminal: Vec<String>,
+
+    /// Least-squares fit to measured data: a CSV whose first column is time and
+    /// whose other columns, named after model variables, hold the measurements.
+    /// The objective is `integral sum_k (variable_k - data_k)^2 dt`, with the
+    /// data interpolated linearly, every data time a step end of the integration
+    /// (so a narrow feature is integrated, not skipped). The objective is an
+    /// integral of the declared interpolant, not a sum of samples. Selects the
+    /// trajectory mode of `--inspect objective-gradient`.
+    #[arg(
+        long,
+        value_name = "CSV",
+        requires = "inspect",
+        conflicts_with = "objective"
+    )]
+    pub fit_data: Option<PathBuf>,
+
+    /// Memory the adjoint (`--grad-mode adjoint`, trajectory mode) may spend
+    /// storing the forward path, in bytes (default 1073741824, one GiB). A run that
+    /// needs more is refused with a typed error; loosen the tolerance, shorten the
+    /// window, or raise this budget.
+    #[arg(long, value_name = "BYTES", requires = "inspect")]
+    pub checkpoint_budget: Option<u64>,
+
     #[command(flatten)]
     pub diagnostics: DiagnosticsArgs,
 }
@@ -526,7 +609,16 @@ pub enum InspectKind {
     /// Steady-state gradient `d(objective)/dp` of a chosen variable (needs
     /// `--objective`); forward sensitivity by default, `--grad-mode adjoint` for
     /// reverse mode. Honors `--at` for the steady point and `--format json`.
+    /// With `--integral`, `--terminal`, or `--fit-data` it is instead the
+    /// gradient of a trajectory objective over the whole run (`sim` only).
     ObjectiveGradient,
+    /// Sensitivity `d(variable)/d(parameter)` over the whole run, written beside
+    /// the trajectory as result columns (`sim` only). `--wrt` selects the
+    /// parameters; `-o file.csv` writes the full trace.
+    TrajectorySensitivity,
+    /// State-space linearization `A`, `B`, `C`, `D` at `--at`: the state
+    /// Jacobian, the input Jacobian, and the output Jacobians.
+    Linearize,
 }
 
 /// How `--inspect objective-gradient` computes `d(objective)/dp`.
@@ -613,6 +705,9 @@ pub enum SimulateSolverMode {
     Bdf,
     #[value(name = "rk-like")]
     RkLike,
+    /// Opt-in MuJoCo-style fixed-step implicit solver.
+    #[value(name = "velimplicit")]
+    VelImplicit,
 }
 
 impl From<SimulateSolverMode> for SimSolverMode {
@@ -621,6 +716,7 @@ impl From<SimulateSolverMode> for SimSolverMode {
             SimulateSolverMode::Auto => SimSolverMode::Auto,
             SimulateSolverMode::Bdf => SimSolverMode::Bdf,
             SimulateSolverMode::RkLike => SimSolverMode::RkLike,
+            SimulateSolverMode::VelImplicit => SimSolverMode::VelImplicit,
         }
     }
 }
@@ -631,6 +727,7 @@ impl SimulateSolverMode {
             SimulateSolverMode::Auto => "auto",
             SimulateSolverMode::Bdf => "bdf",
             SimulateSolverMode::RkLike => "rk-like",
+            SimulateSolverMode::VelImplicit => "velimplicit",
         }
     }
 }
@@ -1084,12 +1181,12 @@ fn run_compile(args: CompileArgs) -> Result<()> {
     if let Some(emit) = args.emit
         && matches!(emit.phase(), CompilePhase::Ast | CompilePhase::Flat)
     {
-        let (artifact, model) = compile_early_ir_with_inferred_model(
+        let artifact = compile_early_ir_with_inferred_model(
             &args.input,
             emit.phase(),
             args.diagnostics.verbose,
         )?;
-        return run_early_ir_dump(&artifact, &model, emit.is_json(), args.output);
+        return run_early_ir_dump(&artifact, emit.is_json(), args.output);
     }
 
     let (result, model) = compile_with_inferred_model(&args.input, args.diagnostics.verbose)?;
@@ -1098,35 +1195,16 @@ fn run_compile(args: CompileArgs) -> Result<()> {
     // --inspect` machinery). Structure is a compile-time artifact, so it belongs
     // on `compile` too; eval/jacobian take a point via `--at`.
     if let Some(kind) = args.inspect {
-        let dae = &result.dae;
-        let at = inspect_at_spec(args.at.as_deref());
-        let solver = SimulateSolverMode::Auto;
-        if matches!(args.format, InspectFormat::Json)
-            && !matches!(kind, InspectKind::Jacobian | InspectKind::ObjectiveGradient)
-        {
-            anyhow::bail!(
-                "`--format json` is only supported with `--inspect jacobian|objective-gradient`"
-            );
-        }
-        return match kind {
-            InspectKind::Structure => sim_inspect::run_structure_dump(dae, &model, solver.into()),
-            InspectKind::Eval => sim_inspect::run_eval_at(dae, &model, at, solver.into()),
-            InspectKind::Jacobian => sim_inspect::run_jacobian(
-                dae,
-                &model,
-                at,
-                solver.into(),
-                matches!(args.format, InspectFormat::Json),
-            ),
-            InspectKind::ObjectiveGradient => sim_inspect::run_objective_gradient(
-                dae,
-                &model,
-                at,
-                args.objective.as_deref(),
-                matches!(args.grad_mode, GradMode::Adjoint),
-                matches!(args.format, InspectFormat::Json),
-            ),
-        };
+        return run_point_inspection(PointInspection {
+            kind,
+            dae: &result.dae,
+            model: &model,
+            at: inspect_at_spec(args.at.as_deref()),
+            solver: SimulateSolverMode::Auto,
+            objective: args.objective.as_deref(),
+            adjoint: matches!(args.grad_mode, GradMode::Adjoint),
+            json: matches!(args.format, InspectFormat::Json),
+        });
     }
 
     let emission_policy = compile_selectors::resolve_emission_policy(
@@ -1231,30 +1309,36 @@ fn selected_model_name(args: &ModelInputArgs) -> Result<String> {
     }
 }
 
+/// An IR dump that stops before the DAE.
 pub(crate) enum EarlyIrArtifact {
-    Ast(Box<ResolvedTree>),
-    Flat(Box<FlatModel>),
+    /// The parser's syntax tree of the input file: no model selection and no
+    /// name resolution, so it needs no source roots (SPEC_0007 Stage 1).
+    Ast(Box<StoredDefinition>),
+    /// The flattened model, with the selected model name its Modelica render
+    /// is written under.
+    Flat { flat: Box<FlatModel>, model: String },
 }
 
 fn run_early_ir_dump(
     artifact: &EarlyIrArtifact,
-    model: &str,
     json: bool,
     output: Option<PathBuf>,
 ) -> Result<()> {
     let rendered = match (artifact, json) {
-        (EarlyIrArtifact::Ast(resolved), true) => serde_json::to_string_pretty(resolved.inner())?,
+        (EarlyIrArtifact::Ast(parsed), true) => serde_json::to_string_pretty(parsed)?,
         (EarlyIrArtifact::Ast(_), false) => {
             bail!("the AST has no lossless Modelica export; use `--emit ast-json`")
         }
-        (EarlyIrArtifact::Flat(flat), true) => serde_json::to_string_pretty(flat)?,
-        (EarlyIrArtifact::Flat(flat), false) => render_early_ir_as_modelica_flat(flat, model)?,
+        (EarlyIrArtifact::Flat { flat, .. }, true) => serde_json::to_string_pretty(flat)?,
+        (EarlyIrArtifact::Flat { flat, model }, false) => {
+            render_early_ir_as_modelica_flat(flat, model)?
+        }
     };
     write_ir_dump(
         &rendered,
         match artifact {
             EarlyIrArtifact::Ast(_) => CompilePhase::Ast,
-            EarlyIrArtifact::Flat(_) => CompilePhase::Flat,
+            EarlyIrArtifact::Flat { .. } => CompilePhase::Flat,
         },
         json,
         output,
@@ -1386,38 +1470,22 @@ fn run_direct_simulation(args: SimCommandArgs) -> Result<()> {
     init_debug_tracing(&args.diagnostics)?;
     let (result, model) = compile_dae_with_inferred_model(&input, args.diagnostics.verbose)?;
     if let Some(kind) = args.inspect {
-        let solver = simulate_solver_or_auto(args.solver, result.experiment_solver.as_deref())?;
-        let dae = result.dae.as_ref();
-        let at = inspect_at_spec(args.at.as_deref());
-        if matches!(args.format, InspectFormat::Json)
-            && !matches!(kind, InspectKind::Jacobian | InspectKind::ObjectiveGradient)
-        {
-            anyhow::bail!(
-                "`--format json` is only supported with `--inspect jacobian|objective-gradient`"
-            );
-        }
-        return match kind {
-            InspectKind::Structure => sim_inspect::run_structure_dump(dae, &model, solver.into()),
-            InspectKind::Eval => sim_inspect::run_eval_at(dae, &model, at, solver.into()),
-            InspectKind::Jacobian => sim_inspect::run_jacobian(
-                dae,
-                &model,
-                at,
-                solver.into(),
-                matches!(args.format, InspectFormat::Json),
-            ),
-            InspectKind::ObjectiveGradient => sim_inspect::run_objective_gradient(
-                dae,
-                &model,
-                at,
-                args.objective.as_deref(),
-                matches!(args.grad_mode, GradMode::Adjoint),
-                matches!(args.format, InspectFormat::Json),
-            ),
-        };
+        let workspace_root = discover_workspace_root_for_model_file(&input.model_file);
+        return run_sim_inspection(&args, kind, &result, &model, workspace_root.as_deref());
     }
     let workspace_root = discover_workspace_root_for_model_file(&input.model_file);
     let solver = simulate_solver_or_auto(args.solver, result.experiment_solver.as_deref())?;
+    if args.serve_stdio {
+        let mut opts = direct_sim_options(
+            sim_window(&args, &result),
+            args.dt,
+            solver.into(),
+            args.atol,
+            args.rtol,
+        );
+        opts.initial_inputs = args.initial_inputs.clone();
+        return serve_stdio_session(result.dae.as_ref(), opts);
+    }
     run_simulation(SimulationRun {
         dae: result.dae.as_ref(),
         model: &model,
@@ -1446,7 +1514,7 @@ fn inspect_at_spec(at: Option<&str>) -> &str {
 /// explicit / artificial-compressibility schemes the implicit auto path cannot
 /// step, and silently ignoring a misspelling of that would run them on the
 /// solver they specifically asked not to use.
-fn simulate_solver_or_auto(
+pub(crate) fn simulate_solver_or_auto(
     solver: Option<SimulateSolverMode>,
     experiment_solver: Option<&str>,
 ) -> Result<SimulateSolverMode> {
@@ -1459,6 +1527,7 @@ fn simulate_solver_or_auto(
     };
     Ok(match rumoca_core::canonical_solver_name(name)? {
         "rk-like" => SimulateSolverMode::RkLike,
+        "velimplicit" => SimulateSolverMode::VelImplicit,
         "bdf" => SimulateSolverMode::Bdf,
         _ => SimulateSolverMode::Auto,
     })
@@ -1553,7 +1622,7 @@ fn run_lint(args: LintArgs) -> Result<()> {
 /// could not determine it, so a consumer comparing the two artifacts skips the
 /// check instead of comparing two equal placeholders and concluding they match.
 fn run_build_info() -> Result<()> {
-    let Some(identity) = rumoca_core::build_identity() else {
+    let Some(identity) = rumoca_tool_build_info::build_identity() else {
         anyhow::bail!(
             "build identity unavailable: this binary was built without commit \
              information, so it cannot be compared against another artifact"
@@ -1585,11 +1654,7 @@ fn compile_with_inferred_model(
     verbose: bool,
 ) -> Result<(CompilationResult, String)> {
     ensure_model_file_readable(&args.model_file)?;
-    let model = match &args.options.model {
-        Some(model) => model.clone(),
-        None => infer_model_name(&args.model_file)?,
-    };
-
+    let model = selected_model_name(args)?;
     let source_roots = merged_source_root_paths(&args.options.source_roots);
 
     let compiler = Compiler::new()
@@ -1600,35 +1665,39 @@ fn compile_with_inferred_model(
     Ok((result, model))
 }
 
+/// Build the AST or Flat dump for `--emit`. The AST stage is the parser's
+/// output for the named file alone, so it skips model inference and source
+/// roots; the Flat stage selects the model and resolves its closure.
 fn compile_early_ir_with_inferred_model(
     args: &ModelInputArgs,
     phase: CompilePhase,
     verbose: bool,
-) -> Result<(EarlyIrArtifact, String)> {
+) -> Result<EarlyIrArtifact> {
     ensure_model_file_readable(&args.model_file)?;
-    let model = match &args.options.model {
-        Some(model) => model.clone(),
-        None => infer_model_name(&args.model_file)?,
-    };
-
-    let source_roots = merged_source_root_paths(&args.options.source_roots);
-
-    let compiler = Compiler::new()
-        .model(&model)
-        .verbose(verbose)
-        .source_roots(&source_roots);
-    let artifact = match phase {
+    match phase {
         CompilePhase::Ast => {
-            EarlyIrArtifact::Ast(Box::new(compiler.compile_file_ast(&args.model_file)?))
+            let parsed = Compiler::new()
+                .verbose(verbose)
+                .parse_file(&args.model_file)?;
+            Ok(EarlyIrArtifact::Ast(Box::new(parsed)))
         }
         CompilePhase::Flat => {
-            EarlyIrArtifact::Flat(Box::new(compiler.compile_file_flat(&args.model_file)?))
+            let model = selected_model_name(args)?;
+            let source_roots = merged_source_root_paths(&args.options.source_roots);
+            let compiler = Compiler::new()
+                .model(&model)
+                .verbose(verbose)
+                .source_roots(&source_roots);
+            let flat = compiler.compile_file_flat(&args.model_file)?;
+            Ok(EarlyIrArtifact::Flat {
+                flat: Box::new(flat),
+                model,
+            })
         }
         CompilePhase::Dae | CompilePhase::Solve => {
             bail!("internal error: early IR compile requested for {phase:?}")
         }
-    };
-    Ok((artifact, model))
+    }
 }
 
 pub(crate) fn compile_dae_with_inferred_model(
@@ -1636,11 +1705,7 @@ pub(crate) fn compile_dae_with_inferred_model(
     verbose: bool,
 ) -> Result<(DaeCompilationResult, String)> {
     ensure_model_file_readable(&args.model_file)?;
-    let model = match &args.options.model {
-        Some(model) => model.clone(),
-        None => infer_model_name(&args.model_file)?,
-    };
-
+    let model = selected_model_name(args)?;
     let source_roots = merged_source_root_paths(&args.options.source_roots);
 
     let compiler = Compiler::new()
@@ -1672,20 +1737,26 @@ pub(crate) fn compile_str_early_ir_with_inferred_model(
     options: &ModelOptions,
     phase: CompilePhase,
     verbose: bool,
-) -> Result<(EarlyIrArtifact, String)> {
-    let (compiler, model) = compiler_for_source(source, file_name, options, verbose)?;
-    let artifact = match phase {
+) -> Result<EarlyIrArtifact> {
+    match phase {
         CompilePhase::Ast => {
-            EarlyIrArtifact::Ast(Box::new(compiler.compile_str_ast(source, file_name)?))
+            let parsed = Compiler::new()
+                .verbose(verbose)
+                .parse_str(source, file_name)?;
+            Ok(EarlyIrArtifact::Ast(Box::new(parsed)))
         }
         CompilePhase::Flat => {
-            EarlyIrArtifact::Flat(Box::new(compiler.compile_str_flat(source, file_name)?))
+            let (compiler, model) = compiler_for_source(source, file_name, options, verbose)?;
+            let flat = compiler.compile_str_flat(source, file_name)?;
+            Ok(EarlyIrArtifact::Flat {
+                flat: Box::new(flat),
+                model,
+            })
         }
         CompilePhase::Dae | CompilePhase::Solve => {
             bail!("internal error: early IR compile requested for {phase:?}")
         }
-    };
-    Ok((artifact, model))
+    }
 }
 
 /// In-memory counterpart to [`compile_dae_with_inferred_model`].
@@ -1698,65 +1769,6 @@ pub(crate) fn compile_str_dae_with_inferred_model(
     let (compiler, model) = compiler_for_source(source, file_name, options, verbose)?;
     let result = compiler.compile_str_dae(source, file_name)?;
     Ok((result, model))
-}
-
-fn print_summary(model: &str, result: &CompilationResult) {
-    let (states, algebraics, parameters, constants, inputs, outputs, continuous, initial) =
-        result.dae.inspect(|view| {
-            let mut roles = [0usize; 6];
-            for (_, variable) in view.variables() {
-                match variable.role() {
-                    rumoca_compile::compile::VariableRole::State => roles[0] += 1,
-                    rumoca_compile::compile::VariableRole::Algebraic => roles[1] += 1,
-                    rumoca_compile::compile::VariableRole::Parameter => roles[2] += 1,
-                    rumoca_compile::compile::VariableRole::Constant => roles[3] += 1,
-                    rumoca_compile::compile::VariableRole::Input => roles[4] += 1,
-                    rumoca_compile::compile::VariableRole::Output => roles[5] += 1,
-                    rumoca_compile::compile::VariableRole::DiscreteReal
-                    | rumoca_compile::compile::VariableRole::DiscreteValue => {}
-                }
-            }
-            (
-                roles[0],
-                roles[1],
-                roles[2],
-                roles[3],
-                roles[4],
-                roles[5],
-                view.continuous_owner_count(),
-                view.initialization_owner_count(),
-            )
-        });
-    println!("Compilation successful!");
-    println!();
-    println!("Model: {}", model);
-    println!("States: {states}");
-    println!("Algebraics: {algebraics}");
-    println!("Parameters: {parameters}");
-    println!("Constants: {constants}");
-    println!("Inputs: {inputs}");
-    println!("Outputs: {outputs}");
-    println!();
-    println!("Continuous equations (f_x): {}", continuous);
-    println!("Initial equations: {}", initial);
-    println!();
-    println!("Balance: {} (equations - unknowns)", result.balance());
-    if result.is_balanced() {
-        println!("Status: BALANCED");
-    } else {
-        println!("Status: UNBALANCED");
-    }
-    println!();
-    println!(
-        "Use `rumoca compile <file> --emit dae-mo` to dump the DAE IR as Modelica (or dae-json)"
-    );
-    println!("Use `rumoca compile <file> --emit solve-json` to dump the solver IR");
-    println!(
-        "Use `rumoca compile <file> --target <TARGET>` for code generation (`rumoca targets` to list)"
-    );
-    println!(
-        "Use `rumoca sim <file> --inspect structure` for BLT/tearing/SCC analysis (also `--inspect eval|jacobian`)"
-    );
 }
 
 /// Render a typed simulation failure for the CLI, keeping the SPEC_0008 code
@@ -1772,6 +1784,39 @@ pub(crate) fn simulation_failure_error(
     error: &rumoca_sim::SimulationDiagnosticError,
 ) -> anyhow::Error {
     anyhow::anyhow!("[{}] {error}", error.diagnostic_code())
+}
+
+/// Parse one `--input NAME=VALUE` initial input.
+fn parse_initial_input(text: &str) -> std::result::Result<(String, f64), String> {
+    let (name, value) = text
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=VALUE, got `{text}`"))?;
+    let value = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|error| format!("input `{name}` value `{value}` is not a number: {error}"))?;
+    Ok((name.trim().to_owned(), value))
+}
+
+/// `sim --serve-stdio`: drive one session from JSON-lines commands on stdin.
+///
+/// Stdout carries only protocol events; the process exits with the status of
+/// how the controller ended the session (`0` after `close`).
+fn serve_stdio_session(dae: &Dae, opts: SimOptions) -> Result<()> {
+    let mut session = rumoca_sim::SimulationSession::new(dae, opts)
+        .map_err(|error| simulation_failure_error(&error))?;
+    let exit = rumoca_sim::serve_session(
+        &mut session,
+        std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+    )?;
+    match exit {
+        rumoca_sim::SessionServeExit::Closed => Ok(()),
+        ended => {
+            eprintln!("rumoca sim --serve-stdio: session ended without close ({ended:?})");
+            std::process::exit(ended.exit_code())
+        }
+    }
 }
 
 struct SimulationRun<'a> {
@@ -1801,22 +1846,7 @@ fn run_simulation(run: SimulationRun<'_>) -> Result<()> {
     // Scenario configs carry the solver as free text, so this is where a name
     // this tree cannot run is reported rather than quietly replaced.
     validate_solver_label(run.solver_label)?;
-    let mut opts = SimOptions {
-        t_start: run.window.0,
-        t_end: run.window.1,
-        dt: run.dt,
-        solver_mode: run.solver_mode,
-        diffsol_method: DiffsolMethod::Bdf,
-        ..SimOptions::default()
-    };
-    // Explicit --atol/--rtol override the backend default so a host's tolerance
-    // policy can be reproduced exactly from the CLI.
-    if let Some(atol) = run.atol {
-        opts.atol = atol;
-    }
-    if let Some(rtol) = run.rtol {
-        opts.rtol = rtol;
-    }
+    let opts = direct_sim_options(run.window, run.dt, run.solver_mode, run.atol, run.rtol);
 
     eprintln!("Simulating {} to t={}...", run.model, run.window.1);
     // On a non-finite-suggestive failure (e.g. a model divide-by-zero showing up

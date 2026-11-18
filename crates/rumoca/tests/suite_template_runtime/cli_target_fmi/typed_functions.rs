@@ -76,8 +76,9 @@ md = read_model_description(path)
 fmi2 = md.fmiVersion.startswith('2')
 variables = {v.name: v for v in md.modelVariables}
 types = {name: v.type for name, v in variables.items()}
-integer = 'Integer' if fmi2 else 'Int32'
-assert types['n'] == integer and types['speed'] == integer and types['k'] == integer, types
+integer = 'Integer' if fmi2 else 'Int64'
+assert types['n'] == integer and types['k'] == integer, types
+assert types['speed'] == 'Enumeration' and variables['speed'].declaredType.name.endswith('Speed'), types
 assert types['doubled'] == 'Boolean' and types['label'] == 'String', types
 assert variables['label'].start == 'rumoca <typed>', variables['label'].start
 
@@ -98,11 +99,12 @@ assert 'x' in initial_unknowns, initial_unknowns
 unzipdir = extract(path)
 fmu = instantiate_fmu(unzipdir, md, fmi_type='ModelExchange')
 vr = {name: v.valueReference for name, v in variables.items()}
-set_integer = fmu.setInteger if fmi2 else fmu.setInt32
+set_integer = fmu.setInteger if fmi2 else fmu.setInt64
 set_real = fmu.setReal if fmi2 else fmu.setFloat64
 set_real([vr['gain']], [1.0])
 fmu.setBoolean([vr['doubled']], [False])
-set_integer([vr['speed']], [1])
+set_enumeration = fmu.setInteger if fmi2 else fmu.setInt64
+set_enumeration([vr['speed']], [1])
 fmu.freeInstance()
 
 lo, hi = 0.0, 1.0

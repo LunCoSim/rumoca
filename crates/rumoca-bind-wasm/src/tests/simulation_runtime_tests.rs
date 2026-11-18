@@ -3,6 +3,166 @@ use super::*;
 
 #[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
 #[test]
+fn interactive_scenario_parameters_match_the_authored_curve_and_reset() {
+    let _guard = session_test_guard();
+    clear_source_root_cache().unwrap();
+    let source = include_str!("../../../../examples/models/SympyDecay.mo");
+    for policy in ["auto", "interpreter"] {
+        for gain in [0.5_f64, 3.0] {
+            let options = serde_json::json!({"dt":0.05,"solver":"rk-like",
+                "atol":1e-10,"rtol":1e-10,"execution_policy":policy,
+                "parameters":{"k":gain}})
+            .to_string();
+            let mut session = crate::WasmSimulationSession::with_interactive_configuration(
+                source,
+                "SympyDecay",
+                &options,
+            )
+            .unwrap();
+            check_decay_steps_and_reset(&mut session, gain, policy);
+        }
+    }
+    let error = crate::WasmSimulationSession::with_interactive_configuration(
+        source,
+        "SympyDecay",
+        r#"{"parameters":{"missing":3}}"#,
+    )
+    .err()
+    .expect("canonical parameter owner rejects an unknown name");
+    assert!(error.message().contains("missing"), "{error}");
+    clear_source_root_cache().unwrap();
+}
+
+#[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
+fn check_decay_steps_and_reset(
+    session: &mut crate::WasmSimulationSession,
+    gain: f64,
+    policy: &str,
+) {
+    for _ in 0..2 {
+        assert_eq!(session.time(), 0.0);
+        assert_eq!(session.get("x").unwrap(), Some(1.0));
+        for time in [0.05, 0.1] {
+            session.advance_to(time).unwrap();
+            let actual = session.get("x").unwrap().unwrap();
+            assert!(
+                (actual - (-gain * time).exp()).abs() < 1e-7,
+                "{policy}: k={gain}, x({time})={actual}"
+            );
+        }
+        session.reset().unwrap();
+    }
+}
+
+#[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
+#[test]
+fn interactive_session_reset_at_preserves_modelica_time_and_invalid_reset_state() {
+    let _guard = session_test_guard();
+    clear_source_root_cache().unwrap();
+    let baseline = "model Timed parameter Real gain=1; Real x; output Real clock; initial equation x=time; equation der(x)=gain*time; clock=time; end Timed;";
+    for policy in ["auto", "interpreter"] {
+        for gain in [1.0, 2.0] {
+            let source = baseline.replace("gain=1", &format!("gain={gain}"));
+            let options =
+                serde_json::json!({"dt":0.01,"solver":"rk-like","atol":1e-10,"rtol":1e-10,
+                "execution_policy":policy})
+                .to_string();
+            let mut session = crate::WasmSimulationSession::with_interactive_configuration(
+                &source, "Timed", &options,
+            )
+            .unwrap();
+            check_absolute_resets(&mut session, gain);
+            let before = session.state_json().unwrap();
+            for invalid in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let error = session.reset_at(invalid).unwrap_err();
+                assert!(error.message().starts_with("[EX012]"), "{error}");
+                assert_eq!(session.state_json().unwrap(), before);
+            }
+            session.reset().unwrap();
+            assert_eq!(session.time(), 0.0);
+            assert_eq!(session.get("x").unwrap(), Some(0.0));
+            assert_eq!(session.get("clock").unwrap(), Some(0.0));
+        }
+    }
+    clear_source_root_cache().unwrap();
+}
+
+#[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
+fn check_absolute_resets(session: &mut crate::WasmSimulationSession, gain: f64) {
+    for start in [0.0, 7.0, 7000.125] {
+        session.reset_at(start).unwrap();
+        assert_eq!(session.time(), start);
+        assert_eq!(session.get("clock").unwrap(), Some(start));
+        assert_eq!(session.get("x").unwrap(), Some(start));
+        let elapsed = 0.125;
+        session.advance_to(start + elapsed).unwrap();
+        let expected = start + gain * (start * elapsed + 0.5 * elapsed * elapsed);
+        let actual = session.get("x").unwrap().unwrap();
+        assert!((actual - expected).abs() < 1e-8 * expected.abs().max(1.0));
+        assert_eq!(session.get("clock").unwrap(), Some(start + elapsed));
+    }
+}
+
+#[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
+#[test]
+fn structured_interactive_options_match_legacy_and_interpreter_trace() {
+    let _guard = session_test_guard();
+    clear_source_root_cache().unwrap();
+    let source = "model Driven input Real u(start=99); Real x; initial equation x=u; equation der(x)=u; end Driven;";
+    let mut legacy = crate::WasmSimulationSession::with_interactive_options(
+        source,
+        "Driven",
+        0.01,
+        "rk-like",
+        1e-10,
+        1e-8,
+        r#"[["u",2.0]]"#,
+    )
+    .unwrap();
+    for policy in ["auto", "interpreter"] {
+        legacy.reset().unwrap();
+        let options = serde_json::json!({"dt":0.01,"solver":"rk-like","atol":1e-10,"rtol":1e-8,
+            "initial_inputs":[["u",2.0]],"execution_policy":policy})
+        .to_string();
+        let mut configured = crate::WasmSimulationSession::with_interactive_configuration(
+            source, "Driven", &options,
+        )
+        .unwrap();
+        assert_eq!(configured.get("x").unwrap(), Some(2.0));
+        for step in 1..=18 {
+            let input = if step <= 9 {
+                r#"[["u",0.3]]"#
+            } else {
+                r#"[["u",-0.2]]"#
+            };
+            legacy.set_inputs(input).unwrap();
+            configured.set_inputs(input).unwrap();
+            let time = f64::from(step) / 90.0;
+            legacy.advance_to(time).unwrap();
+            configured.advance_to(time).unwrap();
+            assert_eq!(
+                configured.state_json().unwrap(),
+                legacy.state_json().unwrap()
+            );
+        }
+        let prior = configured.state_json().unwrap();
+        assert!(configured.set_inputs(r#"[["u",3],["missing",4]]"#).is_err());
+        assert_eq!(configured.state_json().unwrap(), prior);
+        configured.reset().unwrap();
+        assert_eq!(configured.get("x").unwrap(), Some(2.0));
+        let edited = source.replace("der(x)=u", "der(x)=2*u");
+        let mut changed = crate::WasmSimulationSession::with_interactive_configuration(
+            &edited, "Driven", &options,
+        )
+        .unwrap();
+        changed.advance_to(0.25).unwrap();
+        assert!((changed.get("x").unwrap().unwrap() - 3.0).abs() < 1e-8);
+    }
+    clear_source_root_cache().unwrap();
+}
+
+#[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
+#[test]
 fn interactive_session_applies_initial_inputs_before_initialization() {
     let _guard = session_test_guard();
     clear_source_root_cache().unwrap();
@@ -431,10 +591,14 @@ fn test_update_gpu_parameters_refreshes_parameter_bound_arrays() {
         .expect("prepare_gpu_simulation should cache the prepared GPU model");
     let payload: serde_json::Value =
         serde_json::from_str(&json).expect("GPU preparation payload should be valid JSON");
-    let mask_index = payload
-        .pointer("/var_layout/bindings/mask[2]/P/index")
-        .and_then(serde_json::Value::as_u64)
-        .expect("parameter-bound array member should be a P slot") as usize;
+    let layout: rumoca_ir_solve::VarLayout = serde_json::from_value(payload["var_layout"].clone())
+        .expect("GPU preparation payload carries a Solve variable layout");
+    let Some(rumoca_ir_solve::ScalarSlot::P {
+        index: mask_index, ..
+    }) = layout.binding("mask[2]")
+    else {
+        panic!("parameter-bound array member should be a P slot");
+    };
     assert_eq!(
         payload
             .get("p0")
@@ -854,4 +1018,128 @@ fn lower_to_solve_json_feeds_diffsol_simulation() {
         (last - (-1.0_f64).exp()).abs() < 0.02,
         "x(1) should be ~e^-1, got {last}"
     );
+}
+
+#[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
+#[test]
+fn session_binding_names_the_command_of_an_unexpected_reply() {
+    let error = crate::simulation_session_api::unexpected_event(
+        "get",
+        &rumoca_sim::SessionEvent::Closed { time: 0.0 },
+    );
+    assert!(error.message().contains("`get`"), "{error}");
+}
+
+#[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
+#[test]
+fn event_equations_hold_condition_history_until_algebraics_settle() {
+    let _guard = session_test_guard();
+    let source = "model ImplicitWhen Real x(start=0,fixed=true); Real a(start=1); discrete Real z(start=0,fixed=true); equation der(x)=1; a*a+z=3; when time>=0.15 then z=-2*a; end when; end ImplicitWhen;";
+    let json = simulate_model(source, "ImplicitWhen", 0.41, 0.23, "rk45", "{}").unwrap();
+    let simulation: Value = serde_json::from_str(&json).unwrap();
+    let payload = &simulation["payload"];
+    let names = payload["names"].as_array().unwrap();
+    let columns = payload["allData"].as_array().unwrap();
+    let a = names.iter().position(|name| name == "a").unwrap() + 1;
+    let z = names.iter().position(|name| name == "z").unwrap() + 1;
+    let mut checked = 0;
+    for (index, time) in columns[0].as_array().unwrap().iter().enumerate() {
+        if time.as_f64().unwrap() < 0.15 {
+            continue;
+        }
+        let algebraic = columns[a][index].as_f64().unwrap();
+        let discrete = columns[z][index].as_f64().unwrap();
+        assert!((algebraic * algebraic + discrete - 3.0).abs() < 1e-6);
+        assert!(
+            (discrete + 2.0 * algebraic).abs() < 1e-6,
+            "the active when equation must settle together with its algebraic dependency"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0);
+}
+
+#[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
+#[test]
+fn relation_mode_search_propagates_candidate_runtime_aliases() {
+    let _guard = session_test_guard();
+    let source = "model RelationCycle Real x(start=0,fixed=true), a(start=-1), b(start=-1); Boolean p,q; equation der(x)=1; a=if time<0.15 then -1 else (if q then 1 else -1); b=if time<0.15 then -1 else (if p then 1 else (if q then -1 else 1)); p=a>0; q=b>0; end RelationCycle;";
+    let json = simulate_model(source, "RelationCycle", 0.3, 0.1, "rk45", "{}").unwrap();
+    let simulation: Value = serde_json::from_str(&json).unwrap();
+    let payload = &simulation["payload"];
+    let names = payload["names"].as_array().unwrap();
+    let columns = payload["allData"].as_array().unwrap();
+    let mut checked = 0;
+    for (index, time) in columns[0].as_array().unwrap().iter().enumerate() {
+        if time.as_f64().unwrap() < 0.15 {
+            continue;
+        }
+        for name in ["a", "b", "p", "q"] {
+            let column = names.iter().position(|value| value == name).unwrap() + 1;
+            assert!((columns[column][index].as_f64().unwrap() - 1.0).abs() < 1e-6);
+        }
+        checked += 1;
+    }
+    assert!(checked > 0);
+}
+
+#[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
+#[test]
+fn interactive_switch_skips_inactive_index_and_checks_active_index() {
+    let _guard = session_test_guard();
+    let source = "model Switched input Integer index=0; parameter Real values[2]={4,7}; output Real result; equation result=if index>0 then values[index] else -1; end Switched;";
+    for policy in ["auto", "interpreter"] {
+        for (index, expected) in [(0, -1.0), (1, 4.0), (2, 7.0)] {
+            let options =
+                serde_json::json!({"execution_policy":policy,"initial_inputs":[["index",index]]})
+                    .to_string();
+            let mut session = crate::WasmSimulationSession::with_interactive_configuration(
+                source, "Switched", &options,
+            )
+            .unwrap();
+            assert_eq!(session.get("result").unwrap(), Some(expected));
+        }
+        let options = serde_json::json!({"execution_policy":policy,"initial_inputs":[["index",3]]})
+            .to_string();
+        let error = crate::WasmSimulationSession::with_interactive_configuration(
+            source, "Switched", &options,
+        )
+        .err()
+        .expect("an active out-of-range index must fail");
+        assert!(error.to_string().contains("outside 1..=2"), "{error}");
+    }
+}
+
+#[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
+#[test]
+fn interactive_boolean_switch_retains_inactive_gather_after_function_call() {
+    let _guard = session_test_guard();
+    let source = r#"
+    function first
+      input Boolean b[:]; output Integer index;
+    algorithm
+      index:=0;
+      for i in 1:size(b,1) loop
+        if b[i] then index:=i; return; end if;
+      end for;
+    end first;
+    model BooleanSwitched
+      input Boolean b[2]={false,false}; input Boolean values[2]={true,false};
+      Integer index; discrete Boolean result;
+    initial equation pre(result)=false;
+    equation index=first(b); result=if index==0 then pre(result) else values[index];
+    end BooleanSwitched;
+    "#;
+    for policy in ["auto", "interpreter"] {
+        for (values, expected) in [([0, 0], 0.0), ([1, 0], 1.0), ([0, 1], 0.0), ([1, 1], 1.0)] {
+            let options=serde_json::json!({"execution_policy":policy,"initial_inputs":[["b[1]",values[0]],["b[2]",values[1]]]}).to_string();
+            let mut session = crate::WasmSimulationSession::with_interactive_configuration(
+                source,
+                "BooleanSwitched",
+                &options,
+            )
+            .unwrap();
+            assert_eq!(session.get("result").unwrap(), Some(expected));
+        }
+    }
 }

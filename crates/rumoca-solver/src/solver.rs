@@ -7,6 +7,9 @@ pub enum SimSolverMode {
     Auto,
     Bdf,
     RkLike,
+    /// Opt-in fixed-step linearly implicit Euler with a reused Jacobian
+    /// (MuJoCo-style; `rumoca-solver-velimplicit`, 1 ms step, Jacobian reuse 200).
+    VelImplicit,
 }
 
 impl SimSolverMode {
@@ -20,6 +23,9 @@ impl SimSolverMode {
         }
 
         let normalized = lower.replace(['-', '_', ' '], "");
+        if normalized == "velimplicit" {
+            return Self::VelImplicit;
+        }
         // The ESDIRK34 / TR-BDF2 names are *implicit* tableaus, not the explicit
         // rk45 backend, so they land in `Bdf` here rather than `RkLike`.
         // `DiffsolMethod::from_external_name` reports that they are temporarily
@@ -103,16 +109,16 @@ impl SimPacingMode {
 /// to pin one side of the comparison, so the selection must stay part of the
 /// request rather than an ambient process setting.
 ///
-/// A third value, `NativeRequired` — fail instead of silently falling back to
-/// the interpreter when compiled execution is unavailable — is reserved for the
-/// slice that threads a typed unavailability error out of backend
-/// construction; it is deliberately not offered until it can be honored.
+/// Normal simulation requires compiled execution. Explicit interpreter
+/// execution remains available for reference evaluation.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SimExecutionPolicy {
-    /// Use compiled native execution when the target and model support it,
-    /// otherwise evaluate through the Solve-IR interpreter.
+    /// Require a compiled backend and complete preparation before execution.
     #[default]
+    NativeRequired,
+    /// Legacy target selection. Profile refusals are recorded in the execution
+    /// receipt; once a backend is selected, incomplete preparation fails.
     Auto,
     /// Always evaluate through the Solve-IR interpreter, even where compiled
     /// execution is available. This is the reference side of the backend
@@ -124,6 +130,7 @@ impl SimExecutionPolicy {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::NativeRequired => "native_required",
             Self::Auto => "auto",
             Self::Interpreter => "interpreter",
         }
@@ -132,10 +139,121 @@ impl SimExecutionPolicy {
     /// True when compiled native execution may be used.
     #[must_use]
     pub const fn allows_native(self) -> bool {
-        matches!(self, Self::Auto)
+        matches!(self, Self::Auto | Self::NativeRequired)
     }
 }
 
+/// The execution engine a simulation selected for its Solve programs.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimExecutionEngine {
+    /// The Solve-IR interpreter.
+    Interpreter,
+    /// Cranelift-compiled native programs.
+    Cranelift,
+    /// Portable WASM programs.
+    WasmProgram,
+}
+
+/// Why compiled execution was refused for a model the policy allowed.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimNativeRefusal {
+    /// The model has no continuous states; neither host instantiates an
+    /// integrator component, so compiled code would be discarded unused.
+    NoContinuousStates,
+    /// The target's compiled profile declines external tables.
+    ExternalTables,
+}
+
+impl SimNativeRefusal {
+    /// Human-readable reason.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::NoContinuousStates => "the model has no continuous states",
+            Self::ExternalTables => "the compiled profile declines external tables",
+        }
+    }
+}
+
+/// One optional optimization request the selected backend declined. Required
+/// execution still uses its prepared compiled base; missing required code rejects
+/// preparation instead of becoming a decline receipt.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SimNativeDecline {
+    /// The kind of program the backend was asked to compile.
+    pub program: String,
+    /// The backend's stated reason.
+    pub reason: String,
+    /// How many requests of that kind were declined for that reason.
+    pub count: usize,
+}
+
+/// The typed record of which engine a simulation selected and, when compiled
+/// execution was refused for an admissible request, why.
+///
+/// One decision site ([`Self::admission`]) produces it for every target, so
+/// the receipt and the backend actually constructed cannot disagree.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SimExecutionReceipt {
+    pub engine: SimExecutionEngine,
+    /// Absent when compiled execution was selected or the policy pinned the
+    /// interpreter.
+    pub refusal: Option<SimNativeRefusal>,
+    /// Optional optimized entries declined by the selected backend. Their
+    /// required compiled base entries remain prepared and executable.
+    pub declined: Vec<SimNativeDecline>,
+}
+
+impl SimExecutionReceipt {
+    /// Decide admission of `compiled` execution for a model with
+    /// `state_count` continuous states and `external_tables_declined` external
+    /// tables the target's profile cannot execute (zero when it can).
+    #[must_use]
+    pub const fn admission(
+        policy: SimExecutionPolicy,
+        state_count: usize,
+        external_tables_declined: usize,
+        compiled: SimExecutionEngine,
+    ) -> Self {
+        let refusal = if !policy.allows_native() {
+            return Self::interpreter(None);
+        } else if state_count == 0 && matches!(policy, SimExecutionPolicy::Auto) {
+            SimNativeRefusal::NoContinuousStates
+        } else if external_tables_declined != 0 {
+            SimNativeRefusal::ExternalTables
+        } else {
+            return Self {
+                engine: compiled,
+                refusal: None,
+                declined: Vec::new(),
+            };
+        };
+        Self::interpreter(Some(refusal))
+    }
+
+    const fn interpreter(refusal: Option<SimNativeRefusal>) -> Self {
+        Self {
+            engine: SimExecutionEngine::Interpreter,
+            refusal,
+            declined: Vec::new(),
+        }
+    }
+
+    /// The receipt with the backend's declined compile requests recorded.
+    #[must_use]
+    pub fn with_declined(mut self, declined: Vec<SimNativeDecline>) -> Self {
+        self.declined = declined;
+        self
+    }
+
+    /// True when compiled execution was selected.
+    #[must_use]
+    pub const fn is_compiled(&self) -> bool {
+        !matches!(self.engine, SimExecutionEngine::Interpreter)
+    }
+}
 #[derive(Debug, Clone)]
 pub struct SimOptions {
     pub t_start: f64,
@@ -173,7 +291,13 @@ pub struct SimOptions {
     /// programs. Part of the request so a run's interpreter/native selection is
     /// reproducible and inspectable rather than ambient.
     pub execution_policy: SimExecutionPolicy,
+    /// Memory the adjoint sensitivity may spend storing the forward trajectory,
+    /// in bytes; a run that needs more is refused with a typed error (SOLVE-C76).
+    pub checkpoint_budget_bytes: u64,
 }
+
+/// One gibibyte: the default memory budget of a stored forward trajectory.
+pub const DEFAULT_CHECKPOINT_BUDGET_BYTES: u64 = 1 << 30;
 
 impl Default for SimOptions {
     fn default() -> Self {
@@ -191,7 +315,8 @@ impl Default for SimOptions {
             param_overrides: Vec::new(),
             start_overrides: Vec::new(),
             initial_inputs: Vec::new(),
-            execution_policy: SimExecutionPolicy::Auto,
+            execution_policy: SimExecutionPolicy::NativeRequired,
+            checkpoint_budget_bytes: DEFAULT_CHECKPOINT_BUDGET_BYTES,
         }
     }
 }
@@ -217,6 +342,10 @@ pub struct SimVariableMeta {
     pub nominal: Option<String>,
     pub fixed: Option<bool>,
     pub description: Option<String>,
+    /// The source scalar a generated reduced-selection state scalar equals.
+    pub state_coordinate: Option<rumoca_ir_solve::SolveStateCoordinate>,
+    /// The phasor a visible angle or power-factor scalar is a function of.
+    pub phasor: Option<rumoca_ir_solve::SolvePhasor>,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +371,10 @@ pub struct SimDiagnostic {
 /// SPEC_0008 `WX001`: a warning-level assertion (MLS §8.3.7) was violated.
 pub const WARNING_ASSERTION_CODE: &str = "WX001";
 
+/// SPEC_0008 `WX002`: the model printed a message to the terminal (MLS 3.7
+/// §12.9, `Modelica.Utilities.Streams.print`).
+pub const MODEL_MESSAGE_CODE: &str = "WX002";
+
 #[derive(Debug, Clone)]
 pub struct SimResult {
     pub times: Vec<f64>,
@@ -256,7 +389,61 @@ pub struct SimResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffsolMethod, SimOptions, SimPacingMode, SimSolverMode};
+    use super::{
+        DiffsolMethod, SimExecutionEngine, SimExecutionPolicy, SimExecutionReceipt,
+        SimNativeRefusal, SimOptions, SimPacingMode, SimSolverMode,
+    };
+
+    #[test]
+    fn normal_simulation_requires_native_execution() {
+        assert_eq!(
+            SimOptions::default().execution_policy,
+            SimExecutionPolicy::NativeRequired
+        );
+        assert_eq!(
+            SimExecutionPolicy::default(),
+            SimExecutionPolicy::NativeRequired
+        );
+        assert!(
+            SimExecutionReceipt::admission(
+                SimExecutionPolicy::NativeRequired,
+                0,
+                0,
+                SimExecutionEngine::Cranelift
+            )
+            .is_compiled()
+        );
+    }
+
+    #[test]
+    fn admission_names_the_engine_and_the_refusal() {
+        use SimExecutionEngine::{Cranelift, Interpreter, WasmProgram};
+        let admit = |policy, states, tables, engine| {
+            SimExecutionReceipt::admission(policy, states, tables, engine)
+        };
+        let compiled = admit(SimExecutionPolicy::Auto, 2, 0, Cranelift);
+        assert_eq!((compiled.engine, compiled.refusal), (Cranelift, None));
+        assert!(compiled.is_compiled());
+        let wasm = admit(SimExecutionPolicy::Auto, 1, 0, WasmProgram);
+        assert_eq!(wasm.engine, WasmProgram);
+        let pinned = admit(SimExecutionPolicy::Interpreter, 2, 3, Cranelift);
+        assert_eq!((pinned.engine, pinned.refusal), (Interpreter, None));
+        let stateless = admit(SimExecutionPolicy::Auto, 0, 0, Cranelift);
+        assert_eq!(
+            stateless.refusal,
+            Some(SimNativeRefusal::NoContinuousStates)
+        );
+        assert!(!stateless.is_compiled());
+        let tables = admit(SimExecutionPolicy::Auto, 1, 1, WasmProgram);
+        assert_eq!(tables.refusal, Some(SimNativeRefusal::ExternalTables));
+        assert_eq!(tables.engine, Interpreter);
+        for refusal in [
+            SimNativeRefusal::NoContinuousStates,
+            SimNativeRefusal::ExternalTables,
+        ] {
+            assert!(!refusal.describe().is_empty());
+        }
+    }
 
     /// The implicit family carries exactly one integrator, so there is nothing
     /// left for a name to select inside it. Any name-level rejection now belongs

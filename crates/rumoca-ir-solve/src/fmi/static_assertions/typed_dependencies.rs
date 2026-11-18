@@ -1,14 +1,62 @@
 //! Conservative dependence on values that can change in Continuous-Time Mode.
 
 use crate::{
-    SolveOperation as Op, SolvePureCallTable, SolveRegisterId, SolveStorageClass, TypedProgram,
+    SolveOperation as Op, SolvePureCallOwner, SolvePureCallTable, SolveRegisterId,
+    SolveStorageClass, TypedProgram,
 };
+
+/// The settled state of each output of one owner invocation. A SOLVE-C62
+/// recursive group member is read through its least-fixed-point dependency
+/// summary, since walking its body would re-enter it without bound.
+pub(super) fn owner_outputs(
+    table: &SolvePureCallTable,
+    owner: &SolvePureCallOwner,
+    inputs: &[bool],
+) -> Vec<bool> {
+    if table.recursive_group(owner.id()).is_none() {
+        return outputs(table, owner.body(), inputs);
+    }
+    owner
+        .call_site()
+        .output_dependencies()
+        .iter()
+        .map(|dependencies| reads_only_true(dependencies, inputs))
+        .collect()
+}
+
+/// Whether every input leaf the summary reads is marked.
+fn reads_only_true(dependencies: &[crate::SolveCallDependency], inputs: &[bool]) -> bool {
+    dependencies
+        .iter()
+        .flat_map(crate::SolveCallDependency::inputs)
+        .all(|input| inputs.get(input) == Some(&true))
+}
 
 pub(super) fn outputs(
     table: &SolvePureCallTable,
     program: &TypedProgram,
     inputs: &[bool],
 ) -> Vec<bool> {
+    if !program.assigned_state_types().is_empty() {
+        return table
+            .program_output_dependencies(program)
+            .map(|outputs| {
+                outputs
+                    .iter()
+                    .map(|dependencies| reads_only_true(dependencies, inputs))
+                    .collect()
+            })
+            .unwrap_or_else(|_| {
+                vec![
+                    false;
+                    program
+                        .slots()
+                        .iter()
+                        .filter(|slot| slot.storage() == SolveStorageClass::Output)
+                        .count()
+                ]
+            });
+    }
     let mut slots = vec![false; program.slots().len()];
     for (slot, input) in program
         .slots()
@@ -47,10 +95,11 @@ fn transfer(table: &SolvePureCallTable, op: &Op, slots: &mut [bool], registers: 
             owner,
             arguments,
             destinations,
+            ..
         } => {
             let values = table
                 .owner(*owner)
-                .map(|owner| outputs(table, owner.body(), &read(registers, arguments)))
+                .map(|owner| owner_outputs(table, owner, &read(registers, arguments)))
                 .unwrap_or_else(|| vec![false; destinations.len()]);
             write(registers, destinations, &values);
         }
@@ -78,6 +127,10 @@ fn transfer(table: &SolvePureCallTable, op: &Op, slots: &mut [bool], registers: 
             captures,
             destinations,
             transition,
+            // The predicate only ends the loop early, and it reads only the
+            // carried tuple and captures already met below.
+            continuation: _,
+            state_captures: _,
         } => {
             let mut carried = read(registers, initial);
             let captures = read(registers, captures);

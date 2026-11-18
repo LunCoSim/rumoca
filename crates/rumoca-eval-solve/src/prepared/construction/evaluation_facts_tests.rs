@@ -1,8 +1,8 @@
 //! Issue #362: an explicit state-derivative row over array slices,
 //! `der(u[2:N-1]) = k * (u[1:N-2] - 2 * u[2:N-1] + u[3:N])`, is one tensor
-//! program with `N - 2` outputs. Residual preparation certifies every output as
-//! a target assignment and materializes one program per output, which grows
-//! with the square of the slice length; an evaluation-only block derives none.
+//! program with `N - 2` outputs. Residual preparation retains assignment facts
+//! but materializes tensor-affine programs only when selected; an
+//! evaluation-only block derives no assignment certificates.
 
 use super::*;
 use rumoca_ir_solve::{ComputeBlock, ComputeNode, TensorInputKind};
@@ -81,7 +81,7 @@ fn tensor_affine_count(block: &PreparedScalarProgramBlock) -> usize {
     block
         .row_tensor_affine_assignments
         .iter()
-        .map(std::collections::BTreeMap::len)
+        .map(|row| row.materialized_count())
         .sum()
 }
 
@@ -100,10 +100,11 @@ fn state() -> Vec<f64> {
 }
 
 #[test]
-fn residual_preparation_materializes_only_each_slice_outputs_dependencies() {
+fn residual_preparation_does_not_materialize_unselected_slice_assignments() {
     let full = PreparedScalarProgramBlock::new(stencil_block()).unwrap();
-    // Each interior stencil output reads exactly three adjacent states.
-    assert_eq!(tensor_affine_count(&full), 3 * INTERIOR);
+    // Checked row facts remain available; preparing residual evaluation does
+    // not expand every possible output/target isolation into a program.
+    assert_eq!(tensor_affine_count(&full), 0);
 }
 
 #[test]

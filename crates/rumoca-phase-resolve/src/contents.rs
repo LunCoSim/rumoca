@@ -5,8 +5,8 @@
 
 use crate::Resolver;
 use crate::traversal_adapter::{
-    ResolveTraversalCallbacks, walk_equations, walk_expression, walk_expressions, walk_statements,
-    walk_subscripts,
+    ResolveTraversalCallbacks, walk_class_modification_values, walk_equations, walk_expression,
+    walk_expressions, walk_statements, walk_subscripts,
 };
 use rumoca_core::{ComponentPath, DefId, Diagnostic, PrimaryLabel, ScopeId};
 use rumoca_ir_ast as ast;
@@ -32,13 +32,14 @@ impl ResolveTraversalCallbacks for Resolver {
         self.scope_tree.create_scope(enclosing, ScopeKind::ForLoop)
     }
 
-    fn bind_loop_index_name(&mut self, loop_scope: ScopeId, index_name: &str) {
+    fn bind_loop_index_name(&mut self, loop_scope: ScopeId, index_name: &str) -> DefId {
         let def_id = self.alloc_local_def_id();
         self.scope_tree.add_member(
             loop_scope,
             ComponentPath::from_flat_path(index_name),
             def_id,
         );
+        def_id
     }
 
     fn on_component_reference(&mut self, comp: &mut ComponentReference, scope: ScopeId) {
@@ -136,6 +137,16 @@ impl Resolver {
                 );
                 self.bind_redeclared_base_slot(modification, ext.base_def_id);
             }
+        }
+        // Constraining-clause modifiers a short class keeps for instantiation
+        // read the same scope as its own modifiers.
+        for modification in class.constraining_modifications.iter_mut() {
+            Self::resolve_extend_modification(
+                self,
+                &mut modification.expr,
+                class_scope,
+                short_class_modifier_scope.unwrap_or(class_scope),
+            );
         }
 
         self.resolve_subscripts(&mut class.array_subscripts, class_scope);
@@ -294,6 +305,26 @@ impl Resolver {
             Expression::Modification { target, value, .. } => {
                 self.resolve_component_reference(target, target_scope);
                 self.resolve_expression(std::sync::Arc::make_mut(value), value_scope);
+            }
+            // `x(...)` and `x(...) = e`: the nested values are written where
+            // the modifier is, like a plain value; nested targets name members
+            // of the modified element's type, which Resolve does not own.
+            Expression::ClassModification { target, .. } => {
+                self.resolve_component_reference(target, target_scope);
+                walk_class_modification_values(self, expr, value_scope);
+            }
+            Expression::Binary {
+                op: rumoca_core::OpBinary::Assign,
+                lhs,
+                rhs,
+                ..
+            } if matches!(lhs.as_ref(), Expression::ClassModification { .. }) => {
+                if let Expression::ClassModification { target, .. } = std::sync::Arc::make_mut(lhs)
+                {
+                    self.resolve_component_reference(target, target_scope);
+                }
+                walk_class_modification_values(self, std::sync::Arc::make_mut(lhs), value_scope);
+                self.resolve_expression(std::sync::Arc::make_mut(rhs), value_scope);
             }
             other => self.resolve_expression(other, target_scope),
         }
@@ -464,18 +495,21 @@ impl Resolver {
         }
 
         let first_name = &comp.parts[0].ident.text;
+        // MLS §5.3.3: a name with a leading dot (`.exp`) is looked up in the
+        // global scope only, never in the enclosing classes.
+        let lookup_scope = if comp.local { ScopeId::GLOBAL } else { scope };
 
         // Look up the name in the scope tree
         if let Some(def_id) = self
             .scope_tree
-            .lookup(scope, &ComponentPath::from_flat_path(first_name))
+            .lookup(lookup_scope, &ComponentPath::from_flat_path(first_name))
         {
             comp.parts[0].def_id = Some(def_id);
             self.stats.comp_refs_resolved += 1;
         } else {
             self.stats.comp_refs_unresolved += 1;
         }
-        match self.resolve_component_reference_full_path(comp, scope) {
+        match self.resolve_component_reference_full_path(comp, lookup_scope) {
             FullPathResolution::Exact(_)
             | FullPathResolution::DeferredDynamic
             | FullPathResolution::UnresolvedRoot => {}

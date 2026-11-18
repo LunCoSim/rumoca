@@ -1,3 +1,8 @@
+mod source_view;
+
+pub(crate) use source_view::advance_compute_output_cursor;
+pub use source_view::{ComputeOutputImage, ComputeOutputPlacement, ComputeSourceView};
+
 use super::*;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +84,47 @@ impl TensorOutputMap {
             start,
             strides: dense_domain_output_strides(domain)?,
         })
+    }
+
+    /// The affine map whose row-major enumeration of `domain` writes exactly
+    /// `outputs`, in order, or `None` when no affine map does. Each stride is
+    /// read from the point one step along its binder and the candidate is then
+    /// checked against every point, so a strided sub-range of an array (the
+    /// interior of a grid) keeps one compact owner.
+    pub fn from_outputs(
+        domain: &StructuredIndexDomain,
+        outputs: &[usize],
+    ) -> Result<Option<Self>, TensorOutputMapError> {
+        let extents = domain
+            .extents()
+            .map_err(|error| TensorOutputMapError::StructuredIndexDomain { error })?;
+        let point_count = extents
+            .iter()
+            .try_fold(1usize, |count, extent| count.checked_mul(*extent))
+            .ok_or(TensorOutputMapError::OutputIndexOverflow)?;
+        let Some(&start) = outputs.first() else {
+            return Ok(None);
+        };
+        if point_count != outputs.len() {
+            return Ok(None);
+        }
+        let mut strides = Vec::new();
+        let mut later_count = 1usize;
+        for (dimension, extent) in extents.iter().copied().enumerate().rev() {
+            if extent > 1 {
+                let stride = output_delta(start, outputs[later_count])?;
+                strides.extend(
+                    (stride != 0).then_some(AffineStencilIndexStrideTerm { dimension, stride }),
+                );
+            }
+            later_count = later_count
+                .checked_mul(extent)
+                .ok_or(TensorOutputMapError::OutputIndexOverflow)?;
+        }
+        // Ascending dimension order, as affine load strides are recorded.
+        strides.reverse();
+        let map = Self { start, strides };
+        Ok((map.output_indices(domain)? == outputs).then_some(map))
     }
 
     pub fn output_indices(
@@ -180,6 +226,12 @@ impl TensorOutputMap {
         }
         usize::try_from(value).map_err(|_| TensorOutputMapError::OutputIndexOverflow)
     }
+}
+
+fn output_delta(from: usize, to: usize) -> Result<isize, TensorOutputMapError> {
+    let delta = i128::try_from(to).map_err(|_| TensorOutputMapError::OutputIndexOverflow)?
+        - i128::try_from(from).map_err(|_| TensorOutputMapError::OutputIndexOverflow)?;
+    isize::try_from(delta).map_err(|_| TensorOutputMapError::OutputIndexOverflow)
 }
 
 fn aggregate_affine_index_strides(
@@ -388,129 +440,29 @@ impl ComputeBlock {
         &self,
         context: &'static str,
     ) -> Result<usize, SolveProblemShapeContractError> {
-        let mut output_cursor = 0usize;
+        let mut output_cursor = 0;
         for (node_index, node) in self.nodes.iter().enumerate() {
-            match node {
-                ComputeNode::ScalarPrograms(block) => {
-                    output_cursor = block.advance_compute_block_output_cursor(
-                        context,
-                        node_index,
-                        output_cursor,
-                    )?;
-                }
-                ComputeNode::Map {
-                    domain, output_map, ..
-                }
-                | ComputeNode::AffineStencil {
-                    domain, output_map, ..
-                } => {
-                    output_cursor = output_cursor.max(tensor_output_count_for_node(
-                        context, node_index, node, domain, output_map,
-                    )?);
-                }
-                ComputeNode::MatMul { m, n, span, .. } => {
-                    let output_count = m
-                        .checked_mul(*n)
-                        .ok_or_else(|| output_index_overflow(context, node_index, Some(*span)))?;
-                    output_cursor = output_cursor
-                        .checked_add(output_count)
-                        .ok_or_else(|| output_index_overflow(context, node_index, Some(*span)))?;
-                }
-                ComputeNode::LinSolve { n, span, .. } => {
-                    output_cursor = output_cursor
-                        .checked_add(*n)
-                        .ok_or_else(|| output_index_overflow(context, node_index, Some(*span)))?;
-                }
-            }
+            output_cursor =
+                advance_compute_output_cursor(context, node_index, node, output_cursor)?;
         }
         Ok(output_cursor)
     }
 
-    /// Exact logical output ordinals produced by this checked compute block.
-    ///
-    /// Unlike [`Self::output_count`], this preserves sparse holes. Root
-    /// construction uses the inventory to prove that a serialized owner does
-    /// not hide executable residual output behind an unowned row ordinal.
+    /// Materialized sorted output image; compact consumers use the borrowed source view.
     pub fn produced_output_indices(
         &self,
         context: &'static str,
     ) -> Result<Vec<usize>, SolveProblemShapeContractError> {
-        let mut output_cursor = 0usize;
+        let source = self.checked_source_view(context)?;
         let mut outputs = BTreeSet::new();
-        for (node_index, node) in self.nodes.iter().enumerate() {
-            match node {
-                ComputeNode::ScalarPrograms(block) => {
-                    outputs.extend(block.compute_block_output_indices(
-                        context,
-                        node_index,
-                        output_cursor,
-                    )?);
-                    output_cursor = block.advance_compute_block_output_cursor(
-                        context,
-                        node_index,
-                        output_cursor,
-                    )?;
-                }
-                ComputeNode::Map {
-                    domain,
-                    output_map,
-                    span,
-                    ..
-                } => {
-                    append_tensor_output_indices(
-                        &mut outputs,
-                        output_map,
-                        domain,
-                        TensorOutputContext {
-                            context,
-                            node_index,
-                            kind: "Map",
-                            span: *span,
-                        },
-                    )?;
-                    output_cursor = output_cursor.max(tensor_output_count_for_node(
-                        context, node_index, node, domain, output_map,
-                    )?);
-                }
-                ComputeNode::AffineStencil {
-                    domain,
-                    output_map,
-                    span,
-                    ..
-                } => {
-                    append_tensor_output_indices(
-                        &mut outputs,
-                        output_map,
-                        domain,
-                        TensorOutputContext {
-                            context,
-                            node_index,
-                            kind: "AffineStencil",
-                            span: *span,
-                        },
-                    )?;
-                    output_cursor = output_cursor.max(tensor_output_count_for_node(
-                        context, node_index, node, domain, output_map,
-                    )?);
-                }
-                ComputeNode::MatMul { m, n, span, .. } => {
-                    let count = m
-                        .checked_mul(*n)
-                        .ok_or_else(|| output_index_overflow(context, node_index, Some(*span)))?;
-                    let end = output_cursor
-                        .checked_add(count)
-                        .ok_or_else(|| output_index_overflow(context, node_index, Some(*span)))?;
-                    outputs.extend(output_cursor..end);
-                    output_cursor = end;
-                }
-                ComputeNode::LinSolve { n, span, .. } => {
-                    let end = output_cursor
-                        .checked_add(*n)
-                        .ok_or_else(|| output_index_overflow(context, node_index, Some(*span)))?;
-                    outputs.extend(output_cursor..end);
-                    output_cursor = end;
-                }
+        let result = source.visit_output_placements(|placement| {
+            match placement.append_indices(&mut outputs, context) {
+                Ok(()) => std::ops::ControlFlow::Continue(()),
+                Err(error) => std::ops::ControlFlow::Break(error),
             }
+        })?;
+        if let std::ops::ControlFlow::Break(error) = result {
+            return Err(error);
         }
         Ok(outputs.into_iter().collect())
     }
@@ -567,23 +519,27 @@ impl ComputeBlock {
     }
 }
 
-fn tensor_output_count_for_node(
+fn affine_placement<'source>(
     context: &'static str,
     node_index: usize,
-    node: &ComputeNode,
-    domain: &StructuredIndexDomain,
-    output_map: &TensorOutputMap,
-) -> Result<usize, SolveProblemShapeContractError> {
-    let (dimension, span) = match node {
-        ComputeNode::Map { span, .. } => ("Map", *span),
-        ComputeNode::AffineStencil { span, .. } => ("AffineStencil", *span),
-        ComputeNode::ScalarPrograms(_)
-        | ComputeNode::MatMul { .. }
-        | ComputeNode::LinSolve { .. } => unreachable!("tensor output count requires tensor node"),
-    };
-    output_map
+    cursor: usize,
+    domain: &'source StructuredIndexDomain,
+    output_map: &'source TensorOutputMap,
+    kind: &'static str,
+    span: Span,
+) -> Result<(ComputeOutputImage<'source>, usize), SolveProblemShapeContractError> {
+    let count = output_map
         .output_count(domain)
-        .map_err(|error| tensor_output_map_error(context, node_index, dimension, error, span))
+        .map_err(|error| tensor_output_map_error(context, node_index, kind, error, span))?;
+    Ok((
+        ComputeOutputImage::Affine {
+            domain,
+            output_map,
+            kind,
+            span,
+        },
+        cursor.max(count),
+    ))
 }
 
 struct TensorOutputContext {

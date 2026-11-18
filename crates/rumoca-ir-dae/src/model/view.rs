@@ -1,5 +1,9 @@
 mod arena_walks;
+mod expression_operands;
+mod model_conditionals;
 mod quotient_owners;
+pub use expression_operands::ConditionalExpressionOperands;
+pub use model_conditionals::ModelConditionalView;
 #[cfg(test)]
 mod scalar_owner_tests;
 pub use quotient_owners::{RuntimeQuotientOwnerKind, RuntimeQuotientOwnerView};
@@ -241,16 +245,15 @@ impl<'dae> DaeView<'dae> {
             return None;
         }
         let outer_count = checked_extent_product(record.dimensions())?;
-        let field_offset = (0..ordinal).try_fold(0usize, |offset, field| {
-            let (_, value_type) = self.record_field(id, field)?;
-            offset.checked_add(self.packed_value_count(value_type)?)
-        })?;
-        let (_, selected) = self.record_field(id, ordinal)?;
-        let field_width = self.packed_value_count(selected)?;
-        let record_width = (0..record.record_field_count()).try_fold(0usize, |width, field| {
-            let (_, value_type) = self.record_field(id, field)?;
-            width.checked_add(self.packed_value_count(value_type)?)
-        })?;
+        let prefixes = self
+            .dae
+            .storage
+            .record_field_prefixes
+            .get(id.index() as usize)?
+            .as_deref()?;
+        let field_offset = *prefixes.get(ordinal)?;
+        let field_width = prefixes.get(ordinal + 1)? - field_offset;
+        let record_width = *prefixes.last()?;
         outer_count.checked_mul(record_width)?;
         outer_count.checked_mul(field_width)?;
         Some(RecordFieldLayout {
@@ -272,17 +275,11 @@ impl<'dae> DaeView<'dae> {
     }
 
     fn packed_value_count(self, id: ValueTypeId<'dae>) -> Option<usize> {
-        let value_type = self.value_type(id)?;
-        if !value_type.is_record() {
-            return value_type.scalar_count();
-        }
-        let outer_count = checked_extent_product(value_type.dimensions())?;
-        let record_width =
-            (0..value_type.record_field_count()).try_fold(0usize, |width, ordinal| {
-                let (_, field) = self.record_field(id, ordinal)?;
-                width.checked_add(self.packed_value_count(field)?)
-            })?;
-        outer_count.checked_mul(record_width)
+        self.dae
+            .storage
+            .packed_value_counts
+            .get(id.index() as usize)
+            .copied()?
     }
 
     pub fn value_type_provenance(self, id: ValueTypeId<'dae>) -> Option<DaeProvenance> {
@@ -488,6 +485,27 @@ impl<'dae> DaeView<'dae> {
         })
     }
 
+    /// Borrow every finalized B.1c target in owner insertion order.
+    ///
+    /// The aggregate owns one packed target slice; construction appends complete
+    /// owner ranges atomically, so iteration carries checked target identities
+    /// without recovering owners through optional ordinal lookups.
+    pub fn discrete_value_targets(self) -> crate::DiscreteValueTargets<'dae> {
+        crate::DiscreteValueTargets {
+            raw: &self.dae.storage.discrete_value_targets,
+            marker: PhantomData,
+        }
+    }
+
+    pub fn discrete_value_target_indices(
+        self,
+        target: crate::DiscreteValueTarget<'dae>,
+    ) -> Option<Vec<i64>> {
+        let offset = target.scalar_selection()?;
+        let variable = self.variable(target.variable().into())?;
+        crate::discrete_values::selection_indices(variable.value_type().dimensions(), offset)
+    }
+
     pub fn discrete_value_owner(
         self,
         id: DiscreteValueOwnerId<'dae>,
@@ -633,6 +651,8 @@ impl<'dae> VariableView<'dae> {
         fn state_select -> StateSelect = |view| view.attributes().state_select;
         fn description -> Option<&'dae str> =
             |view| view.attributes().description.as_deref();
+        fn enumeration -> Option<&'dae rumoca_core::EnumerationDeclaration> =
+            |view| view.attributes().enumeration.as_ref();
         fn causality -> VariableCausality = |view| view.attributes().causality;
         fn declared_causality -> DeclaredCausality =
             |view| view.attributes().declared_causality;
@@ -709,16 +729,14 @@ impl<'dae> VariableView<'dae> {
     }
 
     pub fn scalar_name(self, flat_index: usize) -> Option<String> {
-        let subscripts = self.value_type.scalar_subscripts(flat_index)?;
-        if subscripts.is_empty() {
-            return Some(self.entry.name.to_string());
+        if self.value_type.is_record() {
+            return None;
         }
-        let indices = subscripts
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        Some(format!("{}[{indices}]", self.entry.name))
+        rumoca_core::scalar_component_name(
+            self.entry.name.as_str(),
+            self.value_type.dimensions(),
+            flat_index,
+        )
     }
 
     fn attributes(self) -> &'dae VariableAttributesWire {
@@ -747,6 +765,13 @@ pub struct FunctionView<'dae> {
 }
 
 impl<'dae> FunctionView<'dae> {
+    /// Exact operation interval issued by the function construction callback.
+    /// Closed body expressions have no function value scope, but remain within
+    /// this global construction suspension during checked reconstruction.
+    pub fn construction_expression_range(self) -> std::ops::Range<u32> {
+        self.entry.construction_start..self.entry.construction_end
+    }
+
     pub fn derivatives(self) -> impl ExactSizeIterator<Item = FunctionDerivativeView<'dae>> {
         self.entry
             .derivatives
@@ -886,6 +911,15 @@ impl<'dae> ExternalFunctionView<'dae> {
         fn argument_count -> usize = |view| view.entry.arguments.len();
     }
 
+    /// The SPEC_0040 DAE-C30 compiler-defined body construction proved this
+    /// interface matches, if any.
+    pub fn native_body(self) -> Option<NativeBodyView<'dae>> {
+        self.entry
+            .native
+            .as_ref()
+            .map(|binding| NativeBodyView { binding })
+    }
+
     /// Output bound by the MLS §12.9 `output = symbol(...)` return form.
     pub fn result(self) -> Option<FunctionValueId<'dae>> {
         self.entry
@@ -907,6 +941,30 @@ impl<'dae> ExternalFunctionView<'dae> {
                     FunctionValueId::from_raw(function.index(), *value),
                 ),
             })
+    }
+}
+
+/// Read-only view of one proven SPEC_0040 DAE-C30 native body binding.
+#[derive(Clone, Copy)]
+pub struct NativeBodyView<'dae> {
+    binding: &'dae NativeBodyBinding,
+}
+
+impl<'dae> NativeBodyView<'dae> {
+    pub const fn body(self) -> rumoca_core::native_body::NativeBody {
+        self.binding.body
+    }
+
+    /// The argument expression each catalog input reads, in interface order;
+    /// each is closed over the function's own parameters.
+    pub fn inputs(self) -> impl ExactSizeIterator<Item = ExprId<'dae>> {
+        self.binding.inputs.iter().map(|raw| ExprId::from_raw(*raw))
+    }
+
+    /// The function result position each catalog output writes, in interface
+    /// order.
+    pub fn results(self) -> &'dae [u32] {
+        &self.binding.results
     }
 }
 
@@ -1004,7 +1062,7 @@ impl<'dae> FunctionDefinitionValues<'dae> {
     }
 }
 
-fn function_definition_view<'dae>(
+pub(super) fn function_definition_view<'dae>(
     dae: &'dae Dae,
     function: FunctionId<'dae>,
     ordinal: u32,
@@ -1020,12 +1078,20 @@ fn function_definition_view<'dae>(
 
 #[derive(Clone)]
 pub enum FunctionStatementView<'dae> {
+    RequireAssigned {
+        conditional: FunctionConditionalBodyView<'dae>,
+        value: FunctionValueId<'dae>,
+        definition: FunctionDefinitionView<'dae>,
+        provenance: DaeProvenance,
+    },
+    Conditional {
+        conditional: FunctionConditionalBodyView<'dae>,
+    },
     Assignment {
         definition: FunctionDefinitionView<'dae>,
     },
     AssignmentGroup {
         definitions: FunctionDefinitionValues<'dae>,
-        conditional: Option<FunctionConditionalView<'dae>>,
     },
     Assertion {
         condition: ExprId<'dae>,
@@ -1040,36 +1106,6 @@ pub enum FunctionStatementView<'dae> {
     },
 }
 
-/// Checked shared branch correlation for one atomic function assignment group.
-#[derive(Clone, Copy)]
-pub struct FunctionConditionalView<'dae> {
-    raw: &'dae FunctionConditionalWire,
-}
-
-impl<'dae> FunctionConditionalView<'dae> {
-    pub fn conditions(self) -> impl ExactSizeIterator<Item = ExprId<'dae>> + 'dae {
-        self.raw.conditions.iter().copied().map(ExprId::from_raw)
-    }
-
-    pub fn branch_count(self) -> usize {
-        self.raw.branches.len()
-    }
-
-    pub fn branch(
-        self,
-        ordinal: usize,
-    ) -> Option<impl ExactSizeIterator<Item = ExprId<'dae>> + 'dae> {
-        self.raw
-            .branches
-            .get(ordinal)
-            .map(|values| values.iter().copied().map(ExprId::from_raw))
-    }
-
-    pub fn fallback(self) -> impl ExactSizeIterator<Item = ExprId<'dae>> + 'dae {
-        self.raw.fallback.iter().copied().map(ExprId::from_raw)
-    }
-}
-
 impl<'dae> FunctionStatementView<'dae> {
     fn from_wire(
         dae: &'dae Dae,
@@ -1077,21 +1113,41 @@ impl<'dae> FunctionStatementView<'dae> {
         statement: &'dae FunctionStatementWire,
     ) -> Self {
         match statement {
+            FunctionStatementWire::RequireAssigned {
+                owner,
+                target,
+                definition,
+            } => {
+                let definition = function_definition_view(dae, function, *definition);
+                Self::RequireAssigned {
+                    conditional: DaeView {
+                        dae,
+                        marker: PhantomData,
+                    }
+                    .function_conditional(FunctionConditionalId::from_raw(function.index(), *owner))
+                    .expect("checked partial-state owner resolves"),
+                    value: FunctionValueId::from_raw(function.index(), *target),
+                    definition,
+                    provenance: definition.provenance(),
+                }
+            }
+            FunctionStatementWire::ScopedConditional { owner } => Self::Conditional {
+                conditional: DaeView {
+                    dae,
+                    marker: PhantomData,
+                }
+                .function_conditional(FunctionConditionalId::from_raw(function.index(), *owner))
+                .expect("issued conditional owner resolves"),
+            },
             FunctionStatementWire::Assignment { definition } => Self::Assignment {
                 definition: function_definition_view(dae, function, *definition),
             },
-            FunctionStatementWire::AssignmentGroup {
-                definitions,
-                conditional,
-            } => Self::AssignmentGroup {
+            FunctionStatementWire::AssignmentGroup { definitions } => Self::AssignmentGroup {
                 definitions: FunctionDefinitionValues {
                     dae,
                     function,
                     raw: definitions,
                 },
-                conditional: conditional
-                    .as_ref()
-                    .map(|raw| FunctionConditionalView { raw }),
             },
             FunctionStatementWire::Assertion {
                 condition,
@@ -1128,6 +1184,21 @@ pub struct FunctionStatements<'dae> {
     function: FunctionId<'dae>,
     statements: &'dae [FunctionStatementWire],
     next: usize,
+}
+
+impl<'dae> FunctionStatements<'dae> {
+    pub(super) const fn new(
+        dae: &'dae Dae,
+        function: FunctionId<'dae>,
+        statements: &'dae [FunctionStatementWire],
+    ) -> Self {
+        Self {
+            dae,
+            function,
+            statements,
+            next: 0,
+        }
+    }
 }
 
 impl<'dae> Iterator for FunctionStatements<'dae> {
@@ -1184,6 +1255,12 @@ impl<'dae> FunctionFoldView<'dae> {
             function: view.id.function(),
             raw: &view.entry.output_definitions,
         };
+    }
+
+    /// The Boolean predicate a bounded `while` fold evaluates on its carried
+    /// state before each pass; the first false value ends the fold.
+    pub fn continuation(self) -> Option<ExprId<'dae>> {
+        self.entry.continuation.map(ExprId::from_raw)
     }
 
     pub fn targets(self) -> impl ExactSizeIterator<Item = FunctionValueId<'dae>> {
@@ -1285,6 +1362,7 @@ impl<'dae> ExpressionView<'dae> {
             ExprNode::FunctionValue { .. } => ExpressionKind::FunctionValue,
             ExprNode::FunctionFoldParameter { .. } => ExpressionKind::FunctionFoldParameter,
             ExprNode::FunctionFoldOutput { .. } => ExpressionKind::FunctionFoldOutput,
+            ExprNode::FunctionConditionalOutput { .. } => ExpressionKind::FunctionConditionalOutput,
             ExprNode::ClockTransfer { .. } => ExpressionKind::ClockTransfer,
         }
     }
@@ -1310,7 +1388,8 @@ impl<'dae> ExpressionView<'dae> {
             ExprNode::ClockTransfer { .. } => self.application_operation(),
             ExprNode::FunctionValue { .. }
             | ExprNode::FunctionFoldParameter { .. }
-            | ExprNode::FunctionFoldOutput { .. } => self.function_operation(),
+            | ExprNode::FunctionFoldOutput { .. }
+            | ExprNode::FunctionConditionalOutput { .. } => self.function_operation(),
         }
     }
 
@@ -1435,6 +1514,20 @@ impl<'dae> ExpressionView<'dae> {
 
     fn function_operation(self) -> ExpressionOperation<'dae> {
         match self.node {
+            ExprNode::FunctionConditionalOutput {
+                function,
+                conditional,
+                value,
+                definition_ordinal,
+            } => ExpressionOperation::FunctionConditionalOutput {
+                conditional: FunctionConditionalId::from_raw(*function, *conditional),
+                value: FunctionValueId::from_raw(*function, *value),
+                definition: function_definition_view(
+                    self.dae,
+                    FunctionId::from_raw(*function),
+                    *definition_ordinal,
+                ),
+            },
             ExprNode::FunctionValue {
                 function,
                 value,
@@ -1664,6 +1757,11 @@ impl<'dae> RangeView<'dae> {
 
 #[derive(Clone, Copy)]
 pub enum ExpressionOperation<'dae> {
+    FunctionConditionalOutput {
+        conditional: FunctionConditionalId<'dae>,
+        value: FunctionValueId<'dae>,
+        definition: FunctionDefinitionView<'dae>,
+    },
     Literal(&'dae DaeLiteral),
     Coordinate(CoordinateView<'dae>),
     Unary {
@@ -1785,6 +1883,7 @@ fn coordinate_view<'dae>(coordinate: Coordinate) -> CoordinateView<'dae> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpressionKind {
+    FunctionConditionalOutput,
     Literal,
     Coordinate,
     Unary,

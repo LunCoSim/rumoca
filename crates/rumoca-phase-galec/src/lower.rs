@@ -18,8 +18,11 @@ mod expression_function_folds;
 mod expression_functions;
 mod expression_helpers;
 mod expression_projection;
+mod function_assertions;
 mod guard_binding;
+use function_assertions::first_function_assertion;
 mod inline_policy;
+mod integer_call_bounds;
 use inline_policy::EmissionFacts;
 mod local_integer_bounds;
 mod pre_references;
@@ -198,8 +201,10 @@ fn lower_view<'dae>(
         .iter()
         .map(|variable| (variable.id.index(), variable.clone()))
         .collect::<HashMap<_, _>>();
-    let referenced_pre = referenced_pre_variables(view)?;
+    let referenced_pre = referenced_pre_variables(view, definitions)?;
     let pre_names = build_pre_names(&referenced_pre, &by_id)?;
+    let commits =
+        pre_references::settled_commit_schedule(view, definitions, &referenced_pre, &by_id)?;
 
     // Counted once for the whole projection, not per call site: the census is a
     // whole-arena scan, and asking it per site would make the cost model
@@ -237,6 +242,15 @@ fn lower_view<'dae>(
     .map_err(single)?;
     parts.do_step_locals.extend(clocked.locals);
     let mut do_step = clocked.statements;
+    // The event's own sampled actions have read their entry snapshots, so the
+    // previous values the equation-section definitions read are committed
+    // first: those definitions publish the settled event, where pre(x) = x.
+    append_pre_commits(
+        &commits.before_definitions,
+        &by_id,
+        &pre_names,
+        &mut do_step,
+    )?;
     let mut called_user_functions = clocked.called_user_functions;
     called_user_functions.extend(parts.startup_called_user_functions.iter().copied());
     called_user_functions.extend(
@@ -248,7 +262,7 @@ fn lower_view<'dae>(
         )
         .map_err(single)?,
     );
-    append_pre_commits(&referenced_pre, &by_id, &pre_names, &mut do_step)?;
+    append_pre_commits(&commits.after_definitions, &by_id, &pre_names, &mut do_step)?;
     let block_name = crate::mangle::galec_variable_name(
         options.block_name.as_deref().unwrap_or(input.model_name),
     )
@@ -1105,7 +1119,7 @@ fn lower_action_guard<'dae>(
         )),
         // An unguarded algorithm section and a section-level `assert` run
         // whenever the section runs, so their guard adds nothing to the clock.
-        dae::ConditionOperation::Always => Ok(None),
+        dae::ConditionOperation::Always => Ok(Some(gast::Expression::Bool(true))),
     }
 }
 
@@ -1151,6 +1165,10 @@ struct ExpressionLowerer<'a, 'dae> {
     /// byte-identical to a build that has no dial at all.
     emission: EmissionFacts<'a>,
     conditional_depth: usize,
+    /// Branches of an `if` expression lowered inline (without per-branch
+    /// prefix capture) that enclose the current expression. A prefix
+    /// statement emitted here would run whether or not its branch is taken.
+    inline_conditional_depth: usize,
     materialized_function_values: HashMap<MaterializedFunctionValueKey, gast::Name>,
     materialized_function_calls: HashMap<MaterializedFunctionCallKey, Vec<gast::Name>>,
     materialized_shared_record_fields: HashMap<(u32, usize), gast::Expression>,
@@ -1169,6 +1187,7 @@ struct ExpressionLowerer<'a, 'dae> {
     /// bounds every value a reader can observe, and a local read before its
     /// assignment simply has no entry and is refused.
     local_integer_bounds: LocalIntegerBounds,
+    finite_counter_bounds: user_functions::finite_counter_bounds::FiniteCounterBounds<'dae>,
     /// Primitive expression values already committed to a function local
     /// ([`AssignedPrimitives`]).
     assigned_primitive_expressions: AssignedPrimitives,
@@ -1358,11 +1377,13 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
             inline_causal_locals: false,
             emission: EmissionFacts::structured(),
             conditional_depth: 0,
+            inline_conditional_depth: 0,
             materialized_function_values: HashMap::new(),
             materialized_function_calls: HashMap::new(),
             materialized_shared_record_fields: HashMap::new(),
             array_update_index_locals: HashMap::new(),
             local_integer_bounds: LocalIntegerBounds::new(),
+            finite_counter_bounds: Default::default(),
             assigned_primitive_expressions: AssignedPrimitives::default(),
             called_user_functions: HashSet::new(),
             function_scope: None,
@@ -1666,7 +1687,12 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
             }
             dae::ExpressionOperation::Builtin { builtin, arguments } => {
                 if matches!(builtin, dae::PureBuiltin::Sum | dae::PureBuiltin::Product) {
-                    return self.lower_reduction(builtin, arguments, scalar_type);
+                    return self.lower_reduction(
+                        builtin,
+                        arguments,
+                        scalar_type,
+                        node.provenance().span(),
+                    );
                 }
                 if !indices.is_empty() {
                     return self.lower_elementwise_builtin(
@@ -1686,7 +1712,12 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
                 return self.lower_index_at(base, subscripts, indices, node.provenance().span());
             }
             dae::ExpressionOperation::Array(elements) => {
-                return self.lower_array_at(elements, indices, node.provenance().span());
+                return self.lower_array_at(
+                    elements,
+                    indices,
+                    scalar_type,
+                    node.provenance().span(),
+                );
             }
             _ => return self.lower_aggregate_operation(id, node, indices, scalar_type),
         };
@@ -1889,6 +1920,7 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
                 value,
                 subscripts,
                 indices,
+                scalar_type,
                 node.provenance().span(),
             ),
             dae::ExpressionOperation::Comprehension { domain, body } => {
@@ -1905,6 +1937,17 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
                 .lower_function_fold_parameter_at(fold, carried, indices, node.provenance().span()),
             dae::ExpressionOperation::FunctionFoldOutput { fold, carried, .. } => {
                 self.lower_function_fold_output_at(fold, carried, indices, node.provenance().span())
+            }
+            dae::ExpressionOperation::FunctionConditionalOutput { definition, .. } => {
+                if self.function_scope != Some(definition.id().function()) {
+                    return Err(unsupported(
+                        "function-conditional-owner",
+                        "a conditional output requires its ordered function statement owner"
+                            .to_owned(),
+                        node.provenance().span(),
+                    ));
+                }
+                self.lower_function_value(definition, indices, scalar_type)
             }
             dae::ExpressionOperation::Record(_)
             | dae::ExpressionOperation::StringConversion { .. } => Err(unsupported(
@@ -1930,30 +1973,6 @@ fn conditional_activation_operands(operands: dae::ExpressionOperands<'_>) -> Vec
                 .index()
         })
         .collect()
-}
-
-fn first_function_assertion(statements: dae::FunctionStatements<'_>) -> Option<Span> {
-    for statement in statements {
-        match statement {
-            // A warning-level assertion has no influence on behavior and no
-            // GALEC representation (MLS §8.3.7).
-            dae::FunctionStatementView::Assertion {
-                level: dae::AssertionLevel::Warning,
-                ..
-            } => {}
-            dae::FunctionStatementView::Assertion { provenance, .. } => {
-                return Some(provenance.span());
-            }
-            dae::FunctionStatementView::For { statements, .. } => {
-                if let Some(span) = first_function_assertion(statements) {
-                    return Some(span);
-                }
-            }
-            dae::FunctionStatementView::Assignment { .. }
-            | dae::FunctionStatementView::AssignmentGroup { .. } => {}
-        }
-    }
-    None
 }
 
 #[cfg(test)]

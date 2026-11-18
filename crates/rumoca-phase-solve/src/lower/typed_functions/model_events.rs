@@ -6,11 +6,12 @@ use rumoca_ir_dae as dae;
 use rumoca_ir_solve as solve;
 
 use super::{
-    ExpressionLowerer, LoweredValue, PureCallRegistry, RegisteredAssertion, arithmetic_profile,
-    lower_primitive_type, lower_value_type_leaves,
+    AssertionSlot, CallLoweringError, EagerScope, ExpressionLowerer, LoweredValue,
+    PureCallRegistry, RegisteredAssertion, arithmetic_profile, lower_primitive_type,
+    lower_value_type_leaves,
     model_calls::RegisteredExpressionAssertion,
     model_coordinates::{ModelCoordinateKey, collect_model_coordinate_types},
-    regions::{RegionContext, RegionOutput, RegionValues, lower_region_values},
+    regions::{RegionOutput, RegionValues, lower_region_values},
 };
 use crate::LowerError;
 use crate::layout::LoweredLayout;
@@ -97,6 +98,13 @@ impl<'dae> PendingEventTransaction<'dae> {
         &self.same_tick_value_reads
     }
 
+    /// The compiler-issued assertion projections this transaction publishes.
+    pub(in crate::lower) fn assertion_projections(
+        &self,
+    ) -> impl Iterator<Item = CallAssertionProjection> + '_ {
+        self.assertions.iter().map(|(_, projection)| *projection)
+    }
+
     pub(in crate::lower) fn provenance(&self) -> rumoca_core::Span {
         self.provenance.span()
     }
@@ -161,7 +169,7 @@ impl<'dae> PureCallRegistry<'dae> {
             solve::SolvePureCallSite,
             Vec<RegisteredExpressionAssertion<'dae, dae::ClockId<'dae>>>,
         ),
-        solve::SolveProgramConstructionError,
+        CallLoweringError,
     > {
         let definitions = &transaction.definitions;
         let (callees, predicate_ranges, assertions, assertion_slots) = self
@@ -171,9 +179,8 @@ impl<'dae> PureCallRegistry<'dae> {
                     .iter()
                     .map(|definition| (definition.value, definition.clock)),
             )?;
-        let predicate_count = assertions.len();
         let (coordinate_inputs, inputs, outputs) =
-            event_transaction_interface(view, transaction, coordinate_types, predicate_count)?;
+            event_transaction_interface(view, transaction, coordinate_types, &assertion_slots)?;
         let identity = self.identities.issue(provenance)?;
         let owner = self.table.add_owner(
             identity,
@@ -205,18 +212,25 @@ impl<'dae> PureCallRegistry<'dae> {
                     model_coordinates,
                     parameters: HashMap::new(),
                     function_values: HashMap::new(),
-                    conditional_groups: HashMap::new(),
                     fold_parameters: HashMap::new(),
                     fold_values: HashMap::new(),
                     binders: HashMap::new(),
-                    callees,
-                    predicate_ranges,
+                    callees: callees.into(),
+                    predicate_ranges: predicate_ranges.into(),
                     cache: HashMap::new(),
                     call_values: HashMap::new(),
                     predicate_values: vec![None; assertion_slots.len()],
                     assertion_slots: assertion_slots.clone(),
                     next_direct_assertion: 0,
                     direct_assertion_count: 0,
+                    direct_assertions: std::sync::Arc::from([]),
+                    assertion_output_base: definitions.len(),
+                    loop_statements: Default::default(),
+                    conditional_statements: Default::default(),
+                    assigned_values: HashMap::new(),
+                    totality: HashMap::new(),
+                    implied_guards: Vec::new(),
+                    eager: EagerScope::default(),
                 };
                 let mut values = vec![None; definitions.len()];
                 for clock in &transaction.clock_owners {
@@ -237,17 +251,8 @@ impl<'dae> PureCallRegistry<'dae> {
                         .only_register(provenance)?;
                     lowerer.builder.store(*output, register, provenance)?;
                 }
-                for (predicate, output) in lowerer
-                    .predicate_values
-                    .into_iter()
-                    .zip(assertion_slots.iter())
-                    .filter(|(_, slot)| slot.is_predicate())
-                    .map(|(value, _)| value)
-                    .zip(&outputs[definitions.len()..])
-                {
-                    let predicate = predicate.ok_or(
-                        solve::SolveProgramConstructionError::InvalidCallOutput { provenance },
-                    )?;
+                for (slot, output) in outputs[definitions.len()..].iter().enumerate() {
+                    let predicate = lowerer.published_slot(slot, provenance)?;
                     lowerer.builder.store(*output, predicate, provenance)?;
                 }
                 Ok(())
@@ -360,7 +365,7 @@ fn event_transaction_interface<'dae>(
     view: dae::DaeView<'dae>,
     transaction: &EligibleEventTransaction<'dae>,
     coordinate_types: &[(ModelCoordinateKey<'dae>, dae::ValueTypeId<'dae>)],
-    predicate_count: usize,
+    assertion_slots: &[AssertionSlot],
 ) -> Result<EventTransactionInterface, solve::SolveProgramConstructionError> {
     let coordinate_inputs = coordinate_types
         .iter()
@@ -379,10 +384,7 @@ fn event_transaction_interface<'dae>(
                 .map(solve::SolvePureCallOutput::result)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    outputs.extend(
-        std::iter::repeat_with(solve::SolvePureCallOutput::assertion_predicate)
-            .take(predicate_count),
-    );
+    outputs.extend(assertion_slots.iter().map(AssertionSlot::output));
     Ok((coordinate_inputs, inputs, outputs))
 }
 
@@ -397,7 +399,7 @@ fn activated_assignment_group<'program, 'dae>(
         .iter()
         .map(|&index| definitions[index].value)
         .collect::<Vec<_>>();
-    let pending = lowerer.pending_predicates(expressions.iter().copied());
+    let pending = lowerer.pending_predicates(expressions.iter().copied())?;
     let (mut captures, environment) =
         lowerer.capture_environment_for(expressions.iter().copied())?;
     let fallback_ranges =
@@ -413,14 +415,7 @@ fn activated_assignment_group<'program, 'dae>(
         .iter()
         .map(|&slot| lowerer.assertion_slots[slot].clone())
         .collect::<Vec<_>>();
-    let context = RegionContext {
-        view: lowerer.view,
-        callees: lowerer.callees.clone(),
-        predicate_ranges: lowerer.predicate_ranges.clone(),
-        conditional_groups: lowerer.conditional_groups.clone(),
-        assertion_slots: lowerer.assertion_slots.clone(),
-        direct_assertion_count: lowerer.direct_assertion_count,
-    };
+    let context = lowerer.region_context();
     let true_environment = environment.clone();
     let true_context = context.clone();
     let true_pending = pending.clone();
@@ -445,6 +440,7 @@ fn activated_assignment_group<'program, 'dae>(
                 RegionValues {
                     results: &results,
                     pending_predicates: &true_pending,
+                    publish_predicates: true,
                     provenance,
                 },
             )
@@ -512,7 +508,7 @@ pub(in crate::lower) fn lower_model_event_transactions<'dae>(
             .collect::<Result<Vec<_>, _>>()?;
         let (site, assertions) = registry
             .add_event_transaction_owner(view, &eligible, &coordinate_types, provenance)
-            .map_err(|error| LowerError::contract(error.to_string(), provenance))?;
+            .map_err(|error| error.into_lower_error(provenance))?;
         let assertions = assertions
             .into_iter()
             .map(|registered| {
@@ -633,20 +629,12 @@ fn event_transaction_assertion<'dae>(
     clock: solve::PeriodicClockId,
     provenance: rumoca_core::Span,
 ) -> Result<solve::SolveEventAction, LowerError> {
-    let message = view
-        .expression(assertion.message)
-        .and_then(|expression| match expression.operation() {
-            dae::ExpressionOperation::Literal(dae::DaeLiteral::String(message)) => {
-                Some(message.clone())
-            }
-            _ => None,
-        })
-        .ok_or_else(|| {
-            LowerError::non_computable(
-                "event-transaction assertion message is not a checked literal String",
-                provenance,
-            )
-        })?;
+    let message = assertion.message.literal(view).ok_or_else(|| {
+        LowerError::non_computable(
+            "event-transaction assertion message is not a checked literal String",
+            provenance,
+        )
+    })?;
     Ok(solve::SolveEventAction {
         kind: crate::lower::scalar::action_kind(assertion.level),
         message: solve::SolveEventMessage {
@@ -655,6 +643,7 @@ fn event_transaction_assertion<'dae>(
         span: assertion.provenance.span(),
         origin: assertion.provenance.origin().to_string(),
         clock_owner: Some(clock),
+        assertion_projection: None,
     })
 }
 

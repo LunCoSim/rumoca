@@ -321,6 +321,7 @@ fn execute_general_op(
             for row in 0..rows {
                 for column in 0..columns {
                     let output = (row * columns + column) * lanes;
+                    // The first term is its own sum; an empty dot is +0.0.
                     let mut re = 0.0;
                     let mut du = 0.0;
                     for term in 0..inner {
@@ -328,10 +329,13 @@ fn execute_general_op(
                         let rhs = (term * columns + column) * lanes;
                         let lhs_re = read_reg_value(regs, lhs_start as usize + lhs);
                         let rhs_re = read_reg_value(regs, rhs_start as usize + rhs);
-                        re += lhs_re * rhs_re;
+                        let product = lhs_re * rhs_re;
+                        re = if term == 0 { product } else { re + product };
                         if lanes == 2 {
-                            du += read_reg_value(regs, lhs_start as usize + lhs + 1) * rhs_re
+                            let tangent = read_reg_value(regs, lhs_start as usize + lhs + 1)
+                                * rhs_re
                                 + lhs_re * read_reg_value(regs, rhs_start as usize + rhs + 1);
+                            du = if term == 0 { tangent } else { du + tangent };
                         }
                     }
                     set_reg_value(regs, dst_start as usize + output, re);
@@ -488,51 +492,9 @@ fn execute_general_op(
                 .iter()
                 .fold(1usize, |count, extent| count * *extent as usize);
             for element in 0..count {
-                let mut value_offset = 0usize;
-                let mut axis_stride = count;
-                let mut selected = true;
-                for (&extent, subscript) in dimensions.iter().zip(subscripts.iter()) {
-                    axis_stride /= extent as usize;
-                    let coordinate = (element / axis_stride) % extent as usize;
-                    match subscript {
-                        rumoca_ir_solve::TensorUpdateSubscript::Whole => {
-                            value_offset = value_offset * extent as usize + coordinate;
-                        }
-                        rumoca_ir_solve::TensorUpdateSubscript::Index(index) => {
-                            let index = match *index {
-                                rumoca_ir_solve::TensorIndex::Constant(index) => index as usize,
-                                rumoca_ir_solve::TensorIndex::Runtime(register) => {
-                                    let value = read_reg_value(regs, register as usize);
-                                    if !value.is_finite() || value.round() != value || value < 1.0 {
-                                        selected = false;
-                                        break;
-                                    }
-                                    value as usize - 1
-                                }
-                            };
-                            if index != coordinate {
-                                selected = false;
-                                break;
-                            }
-                        }
-                        rumoca_ir_solve::TensorUpdateSubscript::Slice { start, dimensions } => {
-                            let slice_count = dimensions
-                                .iter()
-                                .fold(1usize, |count, extent| count * *extent as usize);
-                            let slice_offset = (0..slice_count).find(|offset| {
-                                read_reg_value(regs, *start as usize + *offset)
-                                    == (coordinate + 1) as f64
-                            });
-                            let Some(slice_offset) = slice_offset else {
-                                selected = false;
-                                break;
-                            };
-                            value_offset = value_offset * slice_count + slice_offset;
-                        }
-                    }
-                }
+                let selected = tensor_update_value_offset(regs, &dimensions, &subscripts, element);
                 for lane in 0..lanes {
-                    let source = if selected {
+                    let source = if let Some(value_offset) = selected {
                         value_start as usize + value_offset * lanes + lane
                     } else {
                         base_start as usize + element * lanes + lane
@@ -680,6 +642,30 @@ fn execute_general_op(
                 .index_tuple_iter()
                 .map_err(|error| CompileError::Backend(error.to_string()))?
             {
+                if let Some(continuation) = &program.continuation {
+                    let mut predicate = None;
+                    let mut continuation_regs = vec![0.0; continuation.register_count];
+                    for operation in continuation.ops.iter().cloned() {
+                        match operation {
+                            LinearOp::StoreOutput { src } => {
+                                predicate = Some(read_reg_value(&continuation_regs, src as usize));
+                            }
+                            operation => execute_general_op(
+                                &mut continuation_regs,
+                                operation,
+                                GeneralOpContext {
+                                    fold_carried: Some(&carried),
+                                    fold_indices: Some(&[]),
+                                    fold_captures: Some(&captures),
+                                    ..context
+                                },
+                            )?,
+                        }
+                    }
+                    if predicate == Some(0.0) {
+                        break;
+                    }
+                }
                 let mut update_regs = vec![0.0; update_count];
                 let mut outputs = Vec::with_capacity(program.carried_count);
                 for operation in program.update.iter().cloned() {
@@ -916,6 +902,11 @@ fn execute_general_op(
                 set_reg_value(regs, dst_start as usize + offset, value);
             }
         }
+        LinearOp::PureCallObservation { .. } => {
+            return Err(CompileError::Backend(
+                "assertion observation requires a checked event-action adapter".into(),
+            ));
+        }
         LinearOp::PureCall { .. } | LinearOp::PureCallDirectional { .. } => {
             return Err(CompileError::Backend(
                 "typed pure-call interpreter requires the model call table".into(),
@@ -1014,7 +1005,7 @@ fn tensor_register_offset(
 fn tensor_update_value_offset(
     regs: &[f64],
     dimensions: &[u32],
-    subscripts: &[rumoca_ir_solve::TensorSubscript],
+    subscripts: &[rumoca_ir_solve::TensorUpdateSubscript],
     element: usize,
 ) -> Option<usize> {
     let mut value_offset = 0usize;
@@ -1024,15 +1015,24 @@ fn tensor_update_value_offset(
     for (&extent, subscript) in dimensions.iter().zip(subscripts) {
         axis_stride /= extent as usize;
         let coordinate = (element / axis_stride) % extent as usize;
-        match *subscript {
-            rumoca_ir_solve::TensorSubscript::Whole => {
+        match subscript {
+            rumoca_ir_solve::TensorUpdateSubscript::Whole => {
                 value_offset = value_offset * extent as usize + coordinate;
             }
-            rumoca_ir_solve::TensorSubscript::Index(index) => {
-                let selected = tensor_index_coordinate(regs, extent, index)?;
+            rumoca_ir_solve::TensorUpdateSubscript::Index(index) => {
+                let selected = tensor_index_coordinate(regs, extent, *index)?;
                 if selected != coordinate {
                     return None;
                 }
+            }
+            rumoca_ir_solve::TensorUpdateSubscript::Slice { start, dimensions } => {
+                let slice_count = dimensions.iter().fold(1usize, |count, extent| {
+                    count.saturating_mul(*extent as usize)
+                });
+                let slice_offset = (0..slice_count).find(|offset| {
+                    read_reg_value(regs, *start as usize + *offset) == (coordinate + 1) as f64
+                })?;
+                value_offset = value_offset * slice_count + slice_offset;
             }
         }
     }
@@ -1121,7 +1121,11 @@ fn table_compile_error(
     } else {
         format!("external table {operation} failed for table id {table_id}: {error}")
     };
-    CompileError::Input(message)
+    CompileError::SourceOperation {
+        kind: crate::NativeSourceFault::ExternalTable,
+        message,
+        span: None,
+    }
 }
 
 fn read_input_value(

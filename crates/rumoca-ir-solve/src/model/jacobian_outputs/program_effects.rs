@@ -10,11 +10,12 @@ fn operation_is_repeatable(op: &LinearOp) -> bool {
     match op {
         LinearOp::ImpureRandomInit { .. }
         | LinearOp::ImpureRandom { .. }
+        | LinearOp::PureCallObservation { .. }
         | LinearOp::ImpureRandomInteger { .. } => false,
         LinearOp::FunctionFold { program, .. }
         | LinearOp::GuardedFunctionFold { program, .. }
         | LinearOp::StoreOutputFunctionFold { program, .. } => {
-            program_is_repeatable(&program.update)
+            program.regions().all(program_is_repeatable)
         }
         LinearOp::FunctionConditional { program, .. } => {
             program.arms.iter().all(|arm| {

@@ -5,9 +5,19 @@ use super::entry::lower_dae_for_simulation;
 use crate::SimulationSession;
 use crate::{SimOptions, SimSolverMode, simulate_dae, simulate_dae_with_diagnostics};
 
+mod array_storage_views;
 mod array_trajectories;
 mod block_residual_split;
 mod coincident_strict;
+#[cfg(not(target_arch = "wasm32"))]
+mod compiled_messages;
+#[cfg(feature = "fmi")]
+mod fmi_export_defaults;
+mod function_returns;
+mod host_initialization;
+mod initial_relation_geometry;
+#[cfg(all(feature = "solver-diffsol", feature = "solver-rk45"))]
+mod initial_relation_truth;
 #[cfg(all(feature = "solver-diffsol", feature = "solver-rk45"))]
 mod input_batches;
 mod jacobian_source_trajectories;
@@ -16,9 +26,22 @@ mod nested_events;
 #[cfg(all(feature = "solver-diffsol", feature = "solver-rk45"))]
 mod parameter_bindings;
 mod probe_jacobian;
+#[cfg(feature = "solver-rk45")]
+mod quotient_root_capture;
+#[cfg(feature = "solver-velimplicit")]
+mod refresh_validation;
+scheduled_executor_items! {
+    #[cfg(all(feature = "solver-diffsol", feature = "solver-rk45"))]
+    mod session_api;
+}
 mod settled_initial_tangent;
 mod structure_report;
 mod tangent_jacobian;
+#[cfg(feature = "solver-velimplicit")]
+mod velimplicit_batch;
+#[cfg(feature = "solver-velimplicit")]
+mod velimplicit_convergence;
+mod when_array_coordinates;
 #[cfg(feature = "solver-rk45")]
 mod zero_state_batch;
 
@@ -45,9 +68,9 @@ fn fmi_execution_backend_honors_external_host_policy() {
     );
     let mut options = SimOptions::default();
     let component = crate::prepare_fmi_component(&dae, &options).unwrap();
-    assert!(crate::fmi_execution_backend(&component, &options).is_some());
+    assert!(crate::fmi_execution_backend(&component, &options).unwrap().is_some());
     options.execution_policy = rumoca_solver::SimExecutionPolicy::Interpreter;
-    assert!(crate::fmi_execution_backend(&component, &options).is_none());
+    assert!(crate::fmi_execution_backend(&component, &options).unwrap().is_none());
 }
 
 /// Source-ordered plan of the checked B.1c discrete-value owners: each entry pairs an
@@ -336,6 +359,234 @@ fn checked_relation_root_and_reinitialization_execute_end_to_end() {
     assert!(
         (final_x - 0.2).abs() <= 2.0e-3,
         "two checked root-triggered reinitializations should leave x≈0.2, found {final_x}"
+    );
+}
+
+fn final_state_after_reinit(value: &str) -> f64 {
+    let source = format!(
+        concat!(
+            "model ReinitSelfReference\n",
+            "  Real v(start=1, fixed=true);\n",
+            "  Real a;\n",
+            "equation\n",
+            "  der(v) = 1;\n",
+            "  a = 2 * v;\n",
+            "  when time >= 0.35 then\n",
+            "    reinit(v, {});\n",
+            "  end when;\n",
+            "end ReinitSelfReference;\n",
+        ),
+        value
+    );
+    let dae = compile(&source, "ReinitSelfReference");
+    let options = SimOptions {
+        t_end: 0.5,
+        dt: Some(0.05),
+        ..SimOptions::default()
+    };
+    let result = simulate_dae(&dae, &options)
+        .unwrap_or_else(|error| panic!("reinit(v, {value}) must execute: {error}"));
+    let v = result
+        .names
+        .iter()
+        .position(|name| name == "v")
+        .expect("state result column");
+    result.data[v].last().copied().expect("final state value")
+}
+
+#[test]
+fn reinitialization_value_reads_the_state_before_the_event() {
+    // MLS 8.3.6: reinit(v, expr) assigns v its new value from expr evaluated at
+    // the event instant, before the reinitialization takes effect. It is not an
+    // equation in the reinitialized value: v = 1.35 just before t = 0.35, so the
+    // new value is expr(1.35), and v then grows by 0.15 until t = 0.5.
+    for (value, expected) in [("2 * v", 2.85), ("v + 1", 2.5), ("2 * pre(v)", 2.85)] {
+        let final_v = final_state_after_reinit(value);
+        assert!(
+            (final_v - expected).abs() <= 2.0e-3,
+            "reinit(v, {value}) should leave v = {expected} at t = 0.5, found {final_v}"
+        );
+    }
+}
+
+fn final_states_after(source: &str, model: &str, names: &[&str]) -> Vec<f64> {
+    let dae = compile(source, model);
+    let options = SimOptions {
+        t_end: 0.5,
+        dt: Some(0.05),
+        ..SimOptions::default()
+    };
+    let result = simulate_dae(&dae, &options)
+        .unwrap_or_else(|error| panic!("{model} must execute: {error}"));
+    names
+        .iter()
+        .map(|name| {
+            let column = result
+                .names
+                .iter()
+                .position(|candidate| candidate == name)
+                .unwrap_or_else(|| panic!("{model} has no result column {name}"));
+            result.data[column]
+                .last()
+                .copied()
+                .expect("final state value")
+        })
+        .collect()
+}
+
+#[test]
+fn reinitializations_of_one_pass_read_its_values_before_any_copy() {
+    // MLS 8.3.6: every reinit of an event-iteration step evaluates its value
+    // with the other equations of that step, and the copies happen together at
+    // the end of it, so two reinits reading each other's state swap them.
+    let finals = final_states_after(
+        concat!(
+            "model ReinitSwap\n",
+            "  Real x(start=1, fixed=true);\n",
+            "  Real y(start=5, fixed=true);\n",
+            "equation\n",
+            "  der(x) = 0;\n",
+            "  der(y) = 0;\n",
+            "  when time >= 0.35 then\n",
+            "    reinit(x, y);\n",
+            "    reinit(y, x);\n",
+            "  end when;\n",
+            "end ReinitSwap;\n",
+        ),
+        "ReinitSwap",
+        &["x", "y"],
+    );
+    assert!(
+        (finals[0] - 5.0).abs() <= 1.0e-9 && (finals[1] - 1.0).abs() <= 1.0e-9,
+        "reinit(x, y); reinit(y, x) should swap to x = 5, y = 1, found {finals:?}"
+    );
+}
+
+#[test]
+fn reinitialization_triggers_a_later_step_of_the_same_event() {
+    // The copy at the end of one event-iteration step is visible to the next
+    // step of the same event: resetting v to 10 makes `v > 5` true at the same
+    // instant, and the reinit that edge fires reads the reset value (10), not
+    // v's left limit (1.35).
+    let finals = final_states_after(
+        concat!(
+            "model ReinitCascade\n",
+            "  Real v(start=1, fixed=true);\n",
+            "  Real w(start=0, fixed=true);\n",
+            "equation\n",
+            "  der(v) = 1;\n",
+            "  der(w) = 0;\n",
+            "  when time >= 0.35 then\n",
+            "    reinit(v, 10);\n",
+            "  end when;\n",
+            "  when v > 5 then\n",
+            "    reinit(w, v);\n",
+            "  end when;\n",
+            "end ReinitCascade;\n",
+        ),
+        "ReinitCascade",
+        &["v", "w"],
+    );
+    assert!(
+        (finals[0] - 10.15).abs() <= 2.0e-3 && (finals[1] - 10.0).abs() <= 1.0e-9,
+        "the reset-triggered reinit should leave v = 10.15, w = 10 at t = 0.5, found {finals:?}"
+    );
+}
+
+#[test]
+fn one_reinitialization_program_fires_again_in_a_later_step_of_the_same_event() {
+    // Both branches of one when/elsewhen reinitialize v, so they share one
+    // program. The first branch sets v to 10 in the first step of the event;
+    // that makes `v > 5` rise in the next step, where the elsewhen branch must
+    // still apply and reset v to 0, so v grows from 0 to 0.15 by t = 0.5.
+    let finals = final_states_after(
+        concat!(
+            "model ReinitElsewhenCascade\n",
+            "  Real v(start=1, fixed=true);\n",
+            "equation\n",
+            "  der(v) = 1;\n",
+            "  when time >= 0.35 then\n",
+            "    reinit(v, 10);\n",
+            "  elsewhen v > 5 then\n",
+            "    reinit(v, 0);\n",
+            "  end when;\n",
+            "end ReinitElsewhenCascade;\n",
+        ),
+        "ReinitElsewhenCascade",
+        &["v"],
+    );
+    assert!(
+        (finals[0] - 0.15).abs() <= 2.0e-3,
+        "the elsewhen reinit fired by the first reset should leave v = 0.15 at t = 0.5, found {}",
+        finals[0]
+    );
+}
+
+#[test]
+fn reinitialization_through_an_algebraic_alias_reads_the_left_limit() {
+    // reinit(v, a) with `a = 2 * v`: the value reaches the state through an
+    // algebraic, which the event step solves with v still at its left limit
+    // (1.35), so v becomes 2.7 and grows by 0.15 until t = 0.5.
+    let final_v = final_state_after_reinit("a");
+    assert!(
+        (final_v - 2.85).abs() <= 2.0e-3,
+        "reinit(v, a) with a = 2 * v should leave v = 2.85 at t = 0.5, found {final_v}"
+    );
+}
+
+#[test]
+fn a_reinitialization_that_keeps_its_value_still_reads_the_event_entry_values() {
+    // x = y = 1: reinit(x, y) leaves x unchanged while reinit(y, 2) moves y.
+    // Both values come from the event's entry, so x stays 1 however often the
+    // event's when bodies are evaluated at the instant.
+    let finals = final_states_after(
+        concat!(
+            "model ReinitNoOp\n",
+            "  Real x(start=1, fixed=true);\n",
+            "  Real y(start=1, fixed=true);\n",
+            "equation\n",
+            "  der(x) = 0;\n",
+            "  der(y) = 0;\n",
+            "  when time >= 0.35 then\n",
+            "    reinit(x, y);\n",
+            "    reinit(y, 2);\n",
+            "  end when;\n",
+            "end ReinitNoOp;\n",
+        ),
+        "ReinitNoOp",
+        &["x", "y"],
+    );
+    assert!(
+        (finals[0] - 1.0).abs() <= 1.0e-9 && (finals[1] - 2.0).abs() <= 1.0e-9,
+        "reinit(x, y); reinit(y, 2) from x = y = 1 should give x = 1, y = 2, found {finals:?}"
+    );
+}
+
+#[test]
+fn the_right_limit_probe_reads_one_side_of_the_event() {
+    // Before the event x = 0 with `active` false; after it x = 1 with `active`
+    // true. der(x) is defined on both sides, but sqrt(x - 1) has no value at
+    // the mixed point x = 0 with `active` true, so the right-limit probe must
+    // evaluate the derivative on one side of the event, never across them.
+    let finals = final_states_after(
+        concat!(
+            "model ReinitProbeSide\n",
+            "  Real x(start=0, fixed=true);\n",
+            "  discrete Boolean active(start=false, fixed=true);\n",
+            "equation\n",
+            "  der(x) = if active then sqrt(x - 1) else 0;\n",
+            "  when time >= 0.35 then\n",
+            "    active = true;\n",
+            "    reinit(x, x + 1);\n",
+            "  end when;\n",
+            "end ReinitProbeSide;\n",
+        ),
+        "ReinitProbeSide",
+        &["x"],
+    );
+    assert!(
+        (finals[0] - 1.0).abs() <= 1.0e-9,
+        "reinit(x, x + 1) from x = 0 should leave x = 1, found {finals:?}"
     );
 }
 
@@ -713,7 +964,7 @@ fn unprovided_input_is_rejected_instead_of_receiving_a_default_value() {
 /// `examples/interactive/rover` — and aborted `prepare_gpu_simulation` before any shader
 /// was rendered.
 #[test]
-fn gpu_preparation_seeds_host_driven_inputs_from_their_declared_start() {
+fn host_driven_preparation_seeds_inputs_from_their_declared_start() {
     let dae = compile(
         concat!(
             "model HostDrivenInput\n",
@@ -727,21 +978,28 @@ fn gpu_preparation_seeds_host_driven_inputs_from_their_declared_start() {
         "HostDrivenInput",
     );
 
-    let prepared = super::entry::lower_dae_for_gpu_preparation(&dae, &SimOptions::default())
-        .expect("a host-driven input carries its declared start into the prepared vectors");
-    let slot = prepared
-        .problem
-        .layout
-        .binding("u_cmd")
-        .expect("the input keeps a storage slot the host can write");
-    let rumoca_ir_solve::ScalarSlot::P { index, .. } = slot else {
-        panic!("a host-driven input belongs in parameter storage, got {slot:?}");
-    };
-    assert_eq!(
-        prepared.parameters.get(index).copied(),
-        Some(2.0),
-        "the seeded slot must hold the declared start, not a stand-in"
-    );
+    // Native expression-kernel preparation hands its host the same `P` slots, so it
+    // shares the rule.
+    for prepare in [
+        super::entry::lower_dae_for_gpu_preparation,
+        super::entry::lower_dae_for_native_preparation,
+    ] {
+        let prepared = prepare(&dae, &SimOptions::default())
+            .expect("a host-driven input carries its declared start into the prepared vectors");
+        let slot = prepared
+            .problem
+            .layout
+            .binding("u_cmd")
+            .expect("the input keeps a storage slot the host can write");
+        let rumoca_ir_solve::ScalarSlot::P { index, .. } = slot else {
+            panic!("a host-driven input belongs in parameter storage, got {slot:?}");
+        };
+        assert_eq!(
+            prepared.parameters.get(index).copied(),
+            Some(2.0),
+            "the seeded slot must hold the declared start, not a stand-in"
+        );
+    }
 
     // The strict rule for headless simulation is untouched: the same model still has no
     // provider when nothing drives it.
@@ -777,9 +1035,9 @@ fn string_declaration_does_not_block_numeric_runtime_vectors() {
         .expect("a String declaration must not be evaluated as a numeric runtime value");
 
     assert!(
-        !solve.visible_names.iter().any(|name| name == "method"),
+        !solve.visible_names().iter().any(|name| name == "method"),
         "a String declaration has no numeric trace column: {:?}",
-        solve.visible_names
+        solve.visible_names()
     );
 
     let result = simulate_dae(&dae, &SimOptions::default())
@@ -1301,21 +1559,15 @@ fn a_failed_initialization_names_the_coordinate_its_row_was_planned_to_determine
     );
 }
 
-/// A row no block solves is not automatically a surplus check, and calling it one
-/// names the wrong defect. MLS 3.6 §8.6 makes a surplus row legal — a coordinate a
-/// declaration determines may still be read by another initialization equation —
-/// so failing one means two declarations contradict each other. A row over a
-/// coordinate the projection never owned is the opposite: nothing solved that
-/// coordinate. The two must not share a message.
-///
-/// `Modelica.Electrical.Analog.Examples.IdealTriacCircuit` is the MSL model this
-/// separates: its failing row reads a discrete coordinate, and the old message
-/// called it a consistency check.
+/// A row that reads a discrete coordinate is planned with the discrete held at
+/// its current value (MLS 3.7 §8.6 mixed system): `x = d + 2` with
+/// `d(start = 0, fixed = true)` initializes `x = 2`, as OpenModelica does. A row
+/// whose algebraic dependency the continuous matching owns is solved through it.
 #[test]
-fn an_unowned_initialization_row_is_not_reported_as_a_surplus_check() {
+fn initialization_rows_read_held_discretes_and_owned_algebraics() {
     let discrete_read = compile(
         concat!(
-            "model UnownedDiscrete\n",
+            "model HeldDiscrete\n",
             "  Real x(start=0, fixed=false);\n",
             "  discrete Real d(start=0, fixed=true);\n",
             "equation\n",
@@ -1325,22 +1577,13 @@ fn an_unowned_initialization_row_is_not_reported_as_a_surplus_check() {
             "  end when;\n",
             "initial equation\n",
             "  x = d + 2;\n",
-            "end UnownedDiscrete;\n",
+            "end HeldDiscrete;\n",
         ),
-        "UnownedDiscrete",
+        "HeldDiscrete",
     );
-    let error = simulate_dae(&discrete_read, &SimOptions::default())
-        .expect_err("a discrete coordinate is outside the planned unknown space")
-        .to_string();
-    assert!(
-        error.contains("outside the planned initialization unknown space")
-            && error.contains("discrete-time coordinate"),
-        "an unowned discrete read names its kind, got: {error}"
-    );
-    assert!(
-        !error.contains("surplus-check"),
-        "a row nothing solved must not be reported as a surplus check, got: {error}"
-    );
+    let result = simulate_dae(&discrete_read, &SimOptions::default())
+        .expect("the projection holds the discrete and solves x");
+    assert!((column(&result, "x")[0] - 2.0).abs() <= 1.0e-9);
 
     let algebraic_read = compile(
         concat!(

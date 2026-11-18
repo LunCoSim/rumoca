@@ -61,11 +61,14 @@
 //!   component mints that stage where the failure happens rather than letting a
 //!   host re-derive it from rendered text.
 
+mod decline_log;
 pub mod driver;
 pub mod fixed_step;
+pub(crate) mod instance;
 pub mod integrator;
 mod kernel;
 pub(crate) mod lifecycle;
+pub mod ode_driver;
 /// Host-private root policy. SPEC_0044 §6 makes the scan/location policy, the
 /// root application, and the domain classification host-private with no
 /// unchecked constructor: none of it belongs in the solver-plugin API
@@ -87,6 +90,8 @@ pub use integrator::{
     trial_discard_count,
 };
 pub use kernel::SolveMeKernel;
+#[cfg(feature = "native-wasm")]
+pub use kernel::{MePendingNativeComponent, MePendingNativeState};
 pub use session::{
     MeAdvanceOutcome, MeComponentHost, MeOutputCursor, MePluginArity, MeRetainedComponent,
     MeSessionError, MeSessionLoss, MeSessionOptions, MeSessionOptionsInput, MeSimulationSession,
@@ -116,9 +121,9 @@ enum MeModelSourceInner<'a> {
 
 /// The checked pieces an [`MeModelSource`] resolves to: the Solve model, the
 /// ordered event-indicator inventory, the optional max-step value reference,
-/// the structural-configuration capability and checked numeric parameter inventory.
-type MeModelParts<'a> = (
-    &'a rumoca_ir_solve::SolveModel,
+/// and the structural-configuration capability.
+type MeModelParts = (
+    crate::SolveRuntimeModel,
     rumoca_ir_solve::fmi::FmiIndicatorPlan,
     Option<u32>,
     lifecycle::MeConfigurationCapability,
@@ -183,7 +188,7 @@ impl<'a> MeModelSource<'a> {
 
     pub(crate) fn into_parts(
         self,
-    ) -> Result<MeModelParts<'a>, rumoca_ir_solve::fmi::FmiComponentError> {
+    ) -> Result<MeModelParts, rumoca_ir_solve::fmi::FmiComponentError> {
         match self.0 {
             MeModelSourceInner::Correlated(view) => {
                 let configuration = match view.configuration_capability() {
@@ -197,7 +202,8 @@ impl<'a> MeModelSource<'a> {
                         lifecycle::MeConfigurationCapability::TunableStructuralParameter
                     }
                 };
-                let (model, metadata, inventory) = view.into_parts();
+                let model = crate::SolveRuntimeModel::retained(view.retain_assertion_root());
+                let (_, metadata, inventory) = view.into_parts();
                 Ok((
                     model,
                     inventory.plan().clone(),
@@ -224,7 +230,7 @@ impl<'a> MeModelSource<'a> {
                 max_step_duration_value_reference,
                 configuration,
             } => Ok((
-                model,
+                crate::SolveRuntimeModel::copied(model),
                 rumoca_ir_solve::fmi::FmiEventIndicatorInventory::derive(model)?
                     .plan()
                     .clone(),
@@ -253,16 +259,35 @@ impl<'a> From<&'a rumoca_ir_solve::fmi::FmiComponent> for MeModelSource<'a> {
 /// API. Hosts name this handle instead, and can only hand it to
 /// `SolveMeKernel::instantiate_with_execution_backend`.
 #[derive(Clone)]
-pub struct MeExecutionBackend(Rc<dyn crate::SolveExecutionBackend>);
+pub struct MeExecutionBackend {
+    backend: Rc<dyn crate::SolveExecutionBackend>,
+    declines: decline_log::DeclineLog,
+}
 
 impl MeExecutionBackend {
+    /// Wrap a host backend; every compile request it declines is recorded and
+    /// readable through [`Self::declined`] on any clone of the handle.
     #[must_use]
     pub fn new(backend: Rc<dyn crate::SolveExecutionBackend>) -> Self {
-        Self(backend)
+        let declines = decline_log::DeclineLog::default();
+        Self {
+            backend: Rc::new(decline_log::RecordingBackend::new(
+                backend,
+                declines.clone(),
+            )),
+            declines,
+        }
+    }
+
+    /// The compile requests the backend has declined so far; each names a
+    /// program that runs in the interpreter instead.
+    #[must_use]
+    pub fn declined(&self) -> Vec<crate::SimNativeDecline> {
+        self.declines.snapshot()
     }
 
     pub(crate) fn into_runtime_backend(self) -> Rc<dyn crate::SolveExecutionBackend> {
-        self.0
+        self.backend
     }
 }
 
@@ -282,14 +307,15 @@ impl From<Rc<dyn crate::SolveExecutionBackend>> for MeExecutionBackend {
 /// being trustworthy, so the contradiction is typed data, never a quiet
 /// resolution in either direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "execution policy '{policy}' forbids compiled native execution, but a compiled \
-     execution backend handle was supplied; withhold the handle or request the \
-     'auto' policy"
-)]
-pub struct MeExecutionPolicyContradiction {
-    /// The rendered label of the rejecting policy.
-    pub policy: &'static str,
+pub enum MeExecutionPolicyContradiction {
+    #[error(
+        "execution policy '{policy}' forbids compiled native execution, but a compiled execution backend handle was supplied"
+    )]
+    UnexpectedBackend { policy: &'static str },
+    #[error(
+        "execution policy '{policy}' requires compiled native execution, but no compiled execution backend is available"
+    )]
+    MissingBackend { policy: &'static str },
 }
 
 /// Admit a host-supplied opaque execution backend handle against the request's
@@ -306,7 +332,12 @@ pub fn admit_execution_backend(
     execution_backend: Option<MeExecutionBackend>,
 ) -> Result<Option<MeExecutionBackend>, MeExecutionPolicyContradiction> {
     if execution_backend.is_some() && !policy.allows_native() {
-        return Err(MeExecutionPolicyContradiction {
+        return Err(MeExecutionPolicyContradiction::UnexpectedBackend {
+            policy: policy.label(),
+        });
+    }
+    if execution_backend.is_none() && policy == crate::SimExecutionPolicy::NativeRequired {
+        return Err(MeExecutionPolicyContradiction::MissingBackend {
             policy: policy.label(),
         });
     }
@@ -319,29 +350,48 @@ pub fn admit_execution_backend(
 /// The generic ME runtime is the only layer that can project this artifact
 /// into a component. Concrete solver crates may store it and request an opaque
 /// [`MeModelSource`], but cannot inspect rows, layouts, opcodes, or events.
-pub struct MeModelArtifact(rumoca_ir_solve::fmi::FmiComponent);
+pub struct MeModelArtifact {
+    component: rumoca_ir_solve::fmi::FmiComponent,
+    execution: Option<crate::SimExecutionReceipt>,
+}
 
 impl MeModelArtifact {
     /// The root-location rules of the artifact's component (SPEC_0044
     /// ME-EVENT-004), which a driver derives its session options from.
     #[must_use]
     pub fn root_location(&self) -> rumoca_ir_solve::fmi::RootLocationPlan {
-        *self.0.root_location()
+        *self.component.root_location()
     }
 
     #[must_use]
     pub fn new(component: rumoca_ir_solve::fmi::FmiComponent) -> Self {
-        Self(component)
+        Self {
+            component,
+            execution: None,
+        }
+    }
+
+    /// Record the engine selection made while this artifact was prepared.
+    #[must_use]
+    pub fn with_execution_receipt(mut self, receipt: crate::SimExecutionReceipt) -> Self {
+        self.execution = Some(receipt);
+        self
+    }
+
+    /// The engine selection recorded at preparation, when one was made.
+    #[must_use]
+    pub fn execution_receipt(&self) -> Option<crate::SimExecutionReceipt> {
+        self.execution.clone()
     }
 
     #[must_use]
     pub fn source(&self) -> MeModelSource<'_> {
-        MeModelSource::new(&self.0)
+        MeModelSource::new(&self.component)
     }
 
     #[must_use]
     pub fn continuous_state_count(&self) -> usize {
-        self.0.problem().solve_layout.state_scalar_count()
+        self.component.problem().solve_layout.state_scalar_count()
     }
 }
 
@@ -414,6 +464,14 @@ pub enum MeError {
     /// A model evaluation failed. `message` is already rendered.
     #[error("{message}")]
     Evaluation { message: String },
+
+    /// An admitted backend or ABI operation failed, outside numerical trial recovery.
+    #[error("compiled {context} execution failed: {message}")]
+    CompiledExecution {
+        context: &'static str,
+        message: String,
+        source_spans: Box<[rumoca_core::Span]>,
+    },
 
     /// A state derivative evaluated to a non-finite value.
     #[error("non-finite derivative evaluation for state '{state_name}'")]
@@ -501,12 +559,23 @@ impl From<crate::runtime::solve_ops::RuntimeSolveError> for MeError {
     fn from(value: crate::runtime::solve_ops::RuntimeSolveError) -> Self {
         use crate::runtime::solve_ops::RuntimeSolveError as Runtime;
         match value {
-            Runtime::SolveIr { message, span } => Self::Evaluation {
-                message: match span {
-                    Some(span) => format!("{message} @ {span:?}"),
-                    None => message,
-                },
+            Runtime::CompiledExecution {
+                context,
+                message,
+                source_spans,
+            } => Self::CompiledExecution {
+                context,
+                message,
+                source_spans,
             },
+            Runtime::SolveIr { message, span } | Runtime::SourceFault { message, span } => {
+                Self::Evaluation {
+                    message: match span {
+                        Some(span) => format!("{message} @ {span:?}"),
+                        None => message,
+                    },
+                }
+            }
             Runtime::UnsupportedModel { reason } => Self::UnsupportedModel { reason },
             unassignable @ Runtime::RefreshTargetUnassignable { .. } => Self::Evaluation {
                 message: unassignable.to_string(),
@@ -546,31 +615,51 @@ impl From<rumoca_eval_solve::EvalSolveError> for MeError {
 #[derive(Debug, Clone)]
 pub struct MeInstanceConfig {
     /// FMI `instanceName`; also labels the component's eval-trace snapshot.
-    instance_name: &'static str,
+    instance_name: std::sync::Arc<str>,
     /// FMI relative integration `tolerance` (`toleranceDefined = true`).
     tolerance: f64,
     /// FMI `startTime`.
     start_time: f64,
-    /// FMI `stopTime`; None means `stopTimeDefined = false`.
-    stop_time: Option<f64>,
+    /// FMI `stopTime` when `stopTimeDefined = true`; `f64::INFINITY` when it
+    /// is undefined, so no scheduled event lies beyond the horizon.
+    stop_time: f64,
     /// Who orders this instance's continuous-time evaluations, which selects
     /// its refresh warm start (Solve IR `RefreshSeedRule`).
     executor: rumoca_ir_solve::RefreshExecutor,
 }
 
 impl MeInstanceConfig {
+    #[must_use]
+    pub fn instance_name(&self) -> &str {
+        &self.instance_name
+    }
+
+    #[must_use]
+    pub const fn relative_tolerance(&self) -> f64 {
+        self.tolerance
+    }
+
+    #[must_use]
+    pub const fn start_time(&self) -> f64 {
+        self.start_time
+    }
+
+    #[must_use]
+    pub fn stop_time(&self) -> Option<f64> {
+        self.stop_time.is_finite().then_some(self.stop_time)
+    }
     /// Construct the complete checked FMI Model Exchange instance request.
     ///
     /// The tolerance is FMI's relative integration tolerance. Keeping the
     /// fields private prevents a concrete solver adapter from substituting an
     /// absolute tolerance or bypassing the horizon proof.
     pub fn new(
-        instance_name: &'static str,
+        instance_name: impl Into<std::sync::Arc<str>>,
         relative_tolerance: f64,
         start_time: f64,
-        stop_time: impl Into<Option<f64>>,
+        stop_time: f64,
     ) -> Result<Self, MeError> {
-        let stop_time = stop_time.into();
+        let instance_name = instance_name.into();
         if instance_name.is_empty() {
             return Err(MeError::Contract {
                 reason: "ME instance name must not be empty".to_owned(),
@@ -582,7 +671,7 @@ impl MeInstanceConfig {
             });
         }
         if !start_time.is_finite()
-            || stop_time.is_some_and(|stop| !stop.is_finite() || stop < start_time)
+            || !stop_time.is_finite() || stop_time < start_time
         {
             return Err(MeError::Contract {
                 reason: "ME time horizon requires finite values with stop_time >= start_time"
@@ -596,6 +685,34 @@ impl MeInstanceConfig {
             stop_time,
             executor: rumoca_ir_solve::RefreshExecutor::IntegratorDriven,
         })
+    }
+
+    /// The request of an open-ended (live) instance: FMI `stopTimeDefined =
+    /// false`. The component's event schedule is then a function of the
+    /// clock definitions and the current time only, with no preparation
+    /// horizon past which scheduled events stop being announced.
+    pub fn open_ended(
+        instance_name: impl Into<std::sync::Arc<str>>,
+        relative_tolerance: f64,
+        start_time: f64,
+    ) -> Result<Self, MeError> {
+        let mut config = Self::new(instance_name, relative_tolerance, start_time, start_time)?;
+        config.stop_time = f64::INFINITY;
+        Ok(config)
+    }
+
+    fn restarted_at(&self, start_time: f64, stop_time: Option<f64>) -> Result<Self, MeError> {
+        if !start_time.is_finite()
+            || stop_time.is_some_and(|stop| !stop.is_finite() || stop < start_time)
+        {
+            return Err(MeError::Contract {
+                reason: "ME restart requires a finite coordinate within its horizon".to_owned(),
+            });
+        }
+        let mut config = self.clone();
+        config.start_time = start_time;
+        config.stop_time = stop_time.unwrap_or(f64::INFINITY);
+        Ok(config)
     }
 
     /// The same request for an importer-driven component, whose trial
@@ -622,7 +739,7 @@ pub struct MeModelDescription<'a> {
     /// `SolveMeKernel::get_outputs`, in value-reference order.
     pub output_names: &'a [String],
     /// Names of every writable input variable.
-    pub input_names: &'a [String],
+    pub input_names: &'a rumoca_ir_solve::SolveScalarNames,
     /// Per-output metadata (causality/variability) for result reporting.
     pub output_meta: &'a [SimVariableMeta],
 }
@@ -637,7 +754,6 @@ pub struct MeValueRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MeFloat64Backing {
     InputParameter(usize),
-    Parameter(usize),
     MaxStepDuration(u32),
 }
 
@@ -684,6 +800,8 @@ pub struct MeIndicatorCrossing {
 /// Why the host is entering Event Mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeEventCause {
+    /// The importer applies a discontinuous input frame at its current point.
+    InputEvent,
     /// The integrator located an event-indicator sign change.
     StateEvent,
     /// The instant the component itself scheduled through

@@ -1,7 +1,7 @@
-// SPEC_0021 file-size exception - split plan: move the soundness roster and reviewed-boundary checks into balance_pipeline_quality_gate/soundness.rs, leaving the stage and trace floor checks here; tracked as MSL gate cleanup debt (SPEC_0021 follow-up).
-
+mod baseline_io;
 mod cache;
 mod certified_cohort;
+mod cohort_evidence;
 mod compiler_contract_migration;
 mod parity_measurement;
 mod reference_stage;
@@ -11,10 +11,18 @@ mod soundness_roster;
 mod status;
 #[cfg(test)]
 mod tests;
+mod timing_margin;
 
 use super::*;
+use baseline_io::json_f64_field_any;
+pub(super) use baseline_io::{
+    json_f64_field, json_usize_field, load_msl_quality_baseline, msl_quality_baseline_path,
+    msl_quality_current_path, msl_simulation_targets_path, omc_parity_cache_dir,
+    omc_simulation_reference_path,
+};
 use cache::*;
 use certified_cohort::*;
+use cohort_evidence::*;
 use compiler_contract_migration::*;
 use indexmap::{IndexMap, IndexSet};
 pub(super) use parity_measurement::*;
@@ -24,6 +32,7 @@ use runtime_cohort::*;
 use schema_migrations::*;
 use soundness_roster::*;
 use status::*;
+use timing_margin::*;
 
 // =============================================================================
 // MSL quality gate (compile/balance strict + simulation tolerant gate)
@@ -54,8 +63,10 @@ pub(super) const MSL_SOLVE_STAGE_COUNT_ALLOWED_DROP: usize = 3;
 pub(super) const MSL_STAGE_COUNT_ALLOWED_DROP_MIN_DENOMINATOR: usize = 100;
 /// Allowed drop in compared trace-model count from baseline.
 pub(super) const TRACE_MODELS_COMPARED_ALLOWED_DROP: usize = 2;
-/// Allowed relative drop in runtime speedup median (omc/rumoca) before failing.
+/// Allowed relative drop in system-time speedup median (omc/rumoca) before failing.
 pub(super) const RUNTIME_RATIO_MEDIAN_REL_TOLERANCE: f64 = 0.35;
+/// Wall time includes hosted-runner scheduling; retain the stricter CPU rule.
+pub(super) const RUNTIME_WALL_RATIO_MEDIAN_REL_TOLERANCE: f64 = 0.45;
 /// OMC per-model timeout budget for simulation reference generation. OMC's
 /// `simulate()` generates C code and invokes gcc per model, which on shared CI
 /// runners far exceeds rumoca's warm per-model budget; giving OMC the same tiny
@@ -81,7 +92,7 @@ pub(super) const OMC_PARITY_THREADS_DEFAULT: usize = 1;
 /// boundary without changing any baseline floor. Earlier reference-convergence
 /// and conditioned-observable boundaries and version 4's source-static partial
 /// roster remain pinned.
-pub(super) const MSL_QUALITY_GATE_VERSION: u32 = 11;
+pub(super) const MSL_QUALITY_GATE_VERSION: u32 = 14;
 pub(super) const MSL_QUALITY_RUN_SCOPE_FULL: &str = "full";
 pub(super) const MSL_QUALITY_RUN_SCOPE_PARTIAL: &str = "partial";
 pub(super) const MSL_QUALITY_BASELINE_FILE_REL: &str = "tests/msl_tests/msl_quality_baseline.json";
@@ -105,7 +116,7 @@ pub(super) struct MslRuntimeRatioStatsBaseline {
     wall_ratio_both_success: MslDistributionStats,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub(super) struct MslRuntimeModelRatio {
     system: f64,
     wall: f64,
@@ -285,7 +296,8 @@ pub(super) struct MslQualityBaseline {
     msl_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     omc_version: Option<String>,
-    sim_timeout_seconds: f64,
+    #[serde(flatten)]
+    phase_budgets: PhaseBudgets,
     simulatable_attempted: usize,
     #[serde(default)]
     parse_models: usize,
@@ -325,6 +337,11 @@ pub(super) struct MslQualityBaseline {
     /// not disappear while another entered, so the baseline owns the roster.
     #[serde(default, skip_serializing_if = "IndexSet::is_empty")]
     certified_strict_high_models: IndexSet<String>,
+    /// Strict-high completions whose evidence run used more than the
+    /// certification timing margin of a phase budget: reported, not certified,
+    /// and left out of every ratcheted count (SPEC_0050).
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    timing_margin_models: IndexMap<String, TimingMarginEntry>,
     /// Models that simulated without strict-high parity and without a typed
     /// trace exception. The target is empty; the gate fails when a current
     /// model is outside this roster, so it only shrinks (SPEC_0033).
@@ -515,56 +532,6 @@ pub(super) fn balance_success_rate(
         return None;
     }
     Some(balanced_models as f64 / balance_denominator as f64)
-}
-
-pub(super) fn msl_quality_baseline_path() -> PathBuf {
-    if let Some(path) = quality_baseline_file_override() {
-        return path;
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(MSL_QUALITY_BASELINE_FILE_REL)
-}
-
-pub(super) fn msl_quality_current_path() -> PathBuf {
-    msl_results_dir().join(MSL_QUALITY_CURRENT_FILE_REL)
-}
-
-pub(super) fn msl_simulation_targets_path() -> PathBuf {
-    msl_results_dir().join(MSL_SIM_TARGETS_FILE_REL)
-}
-
-pub(super) fn omc_parity_cache_dir() -> PathBuf {
-    // Results directories are intentionally disposable and often unique per
-    // diagnostic run. Keep the content-keyed OMC cache at the relocatable MSL
-    // cache root so a fresh results directory can reuse the same verified
-    // reference without coupling it to a machine-specific path.
-    msl_cache_dir().join(OMC_PARITY_CACHE_DIR_REL)
-}
-
-pub(super) fn load_msl_quality_baseline(path: &Path) -> io::Result<MslQualityBaseline> {
-    let file = File::open(path)?;
-    let baseline: MslQualityBaseline = serde_json::from_reader(file)
-        .map_err(|error| io::Error::other(format!("invalid MSL quality baseline JSON: {error}")))?;
-    validate_certified_strict_high_roster(&baseline)?;
-    validate_unexcepted_non_high_roster(&baseline)?;
-    Ok(baseline)
-}
-
-pub(super) fn omc_simulation_reference_path() -> PathBuf {
-    msl_results_dir().join(OMC_SIM_REFERENCE_FILE_REL)
-}
-
-pub(super) fn json_usize_field(root: &serde_json::Value, key: &str) -> Option<usize> {
-    root.get(key)?
-        .as_u64()
-        .and_then(|value| usize::try_from(value).ok())
-}
-
-pub(super) fn json_f64_field(root: &serde_json::Value, key: &str) -> Option<f64> {
-    root.get(key)?.as_f64()
-}
-
-fn json_f64_field_any(root: &serde_json::Value, keys: &[&str]) -> Option<f64> {
-    keys.iter().find_map(|key| json_f64_field(root, key))
 }
 
 pub(super) fn parse_distribution_stats(root: &serde_json::Value) -> Option<MslDistributionStats> {
@@ -1028,9 +995,10 @@ pub(super) fn model_names_from_omc_models_map(payload: &serde_json::Value) -> Op
     Some(normalize_model_names(models.keys().cloned().collect()))
 }
 
-pub(super) fn current_msl_quality_baseline(
+fn current_msl_quality_baseline(
     summary: &MslSummary,
     parity_input: Option<&MslParityGateInput>,
+    phase_budgets: PhaseBudgets,
 ) -> MslQualityBaseline {
     let gate_input = MslQualityGateInput::from(summary);
     MslQualityBaseline {
@@ -1039,7 +1007,7 @@ pub(super) fn current_msl_quality_baseline(
         git_commit: summary.git_commit.clone(),
         msl_version: gate_input.msl_version.to_string(),
         omc_version: parity_input.and_then(|parity| parity.omc_version.clone()),
-        sim_timeout_seconds: SIM_TIMEOUT_SECS,
+        phase_budgets,
         simulatable_attempted: gate_input.simulatable_attempted,
         parse_models: gate_input.parse_models,
         flatten_models: gate_input.flatten_models,
@@ -1068,6 +1036,7 @@ pub(super) fn current_msl_quality_baseline(
                 .then(|| parity.runtime_model_ratios.keys().cloned().collect())
         }),
         certified_strict_high_models: IndexSet::new(),
+        timing_margin_models: IndexMap::new(),
         unexcepted_non_high_models: IndexSet::new(),
         trace_exceptions_sha256: None,
         evidence_provenance: None,
@@ -1094,8 +1063,9 @@ fn current_msl_quality_snapshot_json(
     summary: &MslSummary,
     parity_input: Option<&MslParityGateInput>,
     partial: bool,
+    phase_budgets: PhaseBudgets,
 ) -> io::Result<serde_json::Value> {
-    let baseline = current_msl_quality_baseline(summary, parity_input);
+    let baseline = current_msl_quality_baseline(summary, parity_input, phase_budgets);
     let certified_simulations = parity_input
         .and_then(|parity| parity.trace_accuracy_stats.as_ref())
         .map_or(0, |trace| trace.agreement_high);
@@ -1200,10 +1170,12 @@ pub(super) fn write_current_msl_quality_snapshot(
         return Ok(());
     }
     let measurement = measure_msl_parity(stage, summary.sim_target_models.len());
+    let phase_budgets = PhaseBudgets::configured().map_err(io::Error::other)?;
     let snapshot = current_msl_quality_snapshot_json(
         summary,
         measurement.gate_input(),
         should_skip_msl_quality_gate(),
+        phase_budgets,
     )?;
     let mut snapshot = snapshot;
     if let Some(root) = snapshot.as_object_mut() {
@@ -1221,13 +1193,23 @@ pub(super) fn write_current_msl_quality_snapshot(
             );
         }
         if let Some(cohort) = measurement.cohort() {
-            let certified = cohort
+            let strict_high = cohort
                 .table
                 .rows
                 .iter()
                 .filter(|row| row.band == BandLabel::High)
-                .map(|row| row.model_name.clone())
+                .map(|row| row.model_name.as_str());
+            let timing_margin = timing_margin_models(summary, strict_high.clone(), phase_budgets);
+            let certified = strict_high
+                .filter(|model| !timing_margin.contains_key(*model))
+                .map(str::to_string)
                 .collect::<IndexSet<_>>();
+            root.insert(
+                "timing_margin_models".to_string(),
+                serde_json::to_value(timing_margin).map_err(|error| {
+                    io::Error::other(format!("failed to serialize timing-margin roster: {error}"))
+                })?,
+            );
             root.insert(
                 "certified_strict_high_models".to_string(),
                 serde_json::to_value(certified).map_err(|error| {
@@ -1237,7 +1219,16 @@ pub(super) fn write_current_msl_quality_snapshot(
                 })?,
             );
             insert_soundness_roster(root, &cohort.table)?;
+            if let Some(parity) = measurement.gate_input() {
+                insert_cohort_evidence(root, parity, &cohort.table)?;
+            }
         }
+    }
+    if snapshot
+        .get("runtime_ratio_stats")
+        .is_some_and(|stats| !stats.is_null())
+    {
+        validate_runtime_snapshot_evidence(&snapshot)?;
     }
     let baseline_path = msl_quality_current_path();
     if let Some(parent) = baseline_path.parent() {
@@ -1299,11 +1290,12 @@ pub(super) fn msl_quality_context_mismatch_reason(
             baseline_omc_version, current_omc_version
         ));
     }
-    if (baseline.sim_timeout_seconds - SIM_TIMEOUT_SECS).abs() > SIM_RATE_GATE_EPSILON {
-        return Some(format!(
-            "sim_timeout_seconds differs (baseline={:.3}, current={:.3})",
-            baseline.sim_timeout_seconds, SIM_TIMEOUT_SECS
-        ));
+    let phase_budgets = match PhaseBudgets::configured() {
+        Ok(budgets) => budgets,
+        Err(reason) => return Some(reason),
+    };
+    if let Some(reason) = baseline.phase_budgets.mismatch_reason(phase_budgets) {
+        return Some(reason);
     }
     if baseline.trace_accuracy_stats.is_none() {
         return Some("trace_accuracy_stats missing in baseline".to_string());
@@ -1528,12 +1520,14 @@ pub(super) fn sim_completion_report_notes(
 ) -> Vec<String> {
     let mut notes = Vec::new();
     let allowed_drop = stage_count_allowed_drop(gate_input.sim_target_models);
-    if stage_count_regressed(gate_input.sim_ok, baseline.sim_ok, allowed_drop) {
+    let sim_floor = certified_floor(baseline, baseline.sim_ok);
+    let ic_floor = certified_floor(baseline, baseline.ic_ok);
+    if stage_count_regressed(gate_input.sim_ok, sim_floor, allowed_drop) {
         push_stage_count_regression_reason_with_drop(
             &mut notes,
             "IC",
             gate_input.ic_ok,
-            baseline.ic_ok,
+            ic_floor,
             gate_input.sim_target_models,
             allowed_drop,
         );
@@ -1542,7 +1536,7 @@ pub(super) fn sim_completion_report_notes(
         &mut notes,
         "Sim",
         gate_input.sim_ok,
-        baseline.sim_ok,
+        sim_floor,
         gate_input.sim_target_models,
     );
     notes
@@ -1711,7 +1705,7 @@ pub(super) fn push_trace_regression_reasons(
             reasons,
             "Trace strict-high",
             current_trace.agreement_high,
-            baseline_trace.agreement_high,
+            certified_floor(baseline, baseline_trace.agreement_high),
             baseline.sim_target_models,
         );
         let current_classified = trace_classified_models(current_trace);
@@ -1720,7 +1714,7 @@ pub(super) fn push_trace_regression_reasons(
             reasons,
             "Trace classified",
             current_classified,
-            baseline_classified,
+            certified_floor(baseline, baseline_classified),
             baseline.sim_target_models,
         );
 
@@ -1732,13 +1726,13 @@ pub(super) fn push_trace_regression_reasons(
                 reasons,
                 "Trace no severe",
                 current_no_severe,
-                baseline_no_severe,
+                certified_floor(baseline, baseline_no_severe),
                 baseline.sim_target_models,
             );
         }
 
         let current_accounted = trace_accounted_models(current_trace);
-        let baseline_accounted = trace_accounted_models(baseline_trace);
+        let baseline_accounted = certified_floor(baseline, trace_accounted_models(baseline_trace));
         if current_accounted + TRACE_MODELS_COMPARED_ALLOWED_DROP < baseline_accounted {
             reasons.push(format!(
                 "trace model accounting regressed: current={} < baseline={} (allowed_drop={})",
@@ -1944,16 +1938,7 @@ pub(super) fn selected_target_failures(summary: &MslSummary) -> Vec<String> {
 }
 
 pub(super) fn should_skip_msl_quality_gate() -> bool {
-    msl_target_scope() != MslTargetScope::RootExamples
-        || sim_targets_file_override().is_some()
-        || !sim_subset_patterns().is_empty()
-        || sim_subset_limit().is_some()
-        || sim_set_mode() != SimSetMode::Full
-        // A shard sees only its stripe of the model set, so the aggregate
-        // baseline ratchet + strict-high floor are meaningless here; the fan-in
-        // job runs the gate once on the merged results. Also stamps the snapshot
-        // partial:true, which promote-quality-baseline correctly refuses.
-        || sim_shard().is_some()
+    parity_config().is_partial_run()
 }
 
 /// Reject a run whose compile/balance KPIs are not measurable at all.

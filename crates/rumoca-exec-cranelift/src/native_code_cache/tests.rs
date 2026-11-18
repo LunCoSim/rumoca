@@ -1,7 +1,62 @@
 use super::*;
 use rumoca_core::{SourceId, Span};
 use rumoca_ir_solve::{BinaryOp, LinearOp, ScalarProgramBlock, UnaryOp};
-use std::{borrow::Cow, collections::BTreeMap};
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::Write,
+    sync::Arc,
+    thread,
+};
+
+#[test]
+fn concurrent_perf_map_registrations_keep_function_rows_intact() {
+    let path = std::env::temp_dir().join(format!(
+        "rumoca-perf-map-{}-{}.map",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    let _ = fs::remove_file(&path);
+    let path = Arc::new(path);
+    let writers = 48usize;
+    let handles: Vec<_> = (0..writers)
+        .map(|index| {
+            let path = path.clone();
+            thread::spawn(move || {
+                with_perf_map_registration(true, || {
+                    let mut file = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path.as_ref())
+                        .unwrap();
+                    write!(file, "{:x}", 0x1000 + index * 0x100).unwrap();
+                    thread::yield_now();
+                    write!(file, " {:x} ", 0x80).unwrap();
+                    thread::yield_now();
+                    writeln!(file, "rumoca_test_{index}").unwrap();
+                });
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let contents = fs::read_to_string(path.as_ref()).unwrap();
+    let mut names = BTreeMap::new();
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let address = usize::from_str_radix(fields.next().unwrap(), 16).unwrap();
+        let size = usize::from_str_radix(fields.next().unwrap(), 16).unwrap();
+        let name = fields.next().unwrap();
+        assert_eq!(size, 0x80);
+        assert!(fields.next().is_none());
+        assert!(names.insert(name.to_owned(), address).is_none());
+    }
+    assert_eq!(names.len(), writers);
+    fs::remove_file(path.as_ref()).unwrap();
+}
 
 #[derive(Default)]
 pub(crate) struct MemoryStore(BTreeMap<Vec<u8>, Vec<u8>>);

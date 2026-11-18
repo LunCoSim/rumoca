@@ -5,8 +5,8 @@
 //! every operand was checked when its node entered the arena.
 
 use crate::{
-    CoordinateView, DaeView, ExprId, ExpressionOperation, ExpressionView, StateId, SubscriptView,
-    VariableId,
+    CoordinateView, DaeView, DomainId, ExprId, ExpressionOperation, ExpressionView,
+    FunctionConditionalId, FunctionValueId, StateId, SubscriptView, VariableId,
 };
 
 /// Visit one expression DAG, including index and slice expressions.
@@ -30,7 +30,8 @@ pub fn for_each_expression<'dae>(
 /// are visited once. This keeps dependency selection at the checked DAE
 /// boundary without requiring consumers to reproduce the expression grammar.
 /// The visited set is this thread's shared stamp table, so a call costs only
-/// the nodes it reaches; a multi-root pass uses an [`ExpressionTraversal`].
+/// the nodes it reaches, nested or not; a multi-root pass uses an
+/// [`ExpressionTraversal`].
 pub fn for_each_expression_pruned<'dae>(
     dae: DaeView<'dae>,
     root: ExprId<'dae>,
@@ -47,9 +48,13 @@ fn walk_root<'dae>(
     visit: &mut dyn FnMut(ExprId<'dae>, ExpressionView<'dae>) -> bool,
 ) {
     with_shared_stamps(dae, &mut |stamps| {
-        walk_pruned(dae, stamps, &mut vec![root], &mut |id, node| {
-            Some(visit(id, node))
-        });
+        walk_pruned(
+            dae,
+            stamps,
+            &mut vec![root],
+            &mut |_, _| false,
+            &mut |id, node| Some(visit(id, node)),
+        );
     });
 }
 
@@ -60,7 +65,19 @@ fn walk_pruned<'dae>(
     dae: DaeView<'dae>,
     stamps: &mut StampTable,
     pending: &mut Vec<ExprId<'dae>>,
+    prune_state: &mut dyn FnMut(FunctionConditionalId<'dae>, FunctionValueId<'dae>) -> bool,
     visit: &mut dyn FnMut(ExprId<'dae>, ExpressionView<'dae>) -> Option<bool>,
+) -> bool {
+    walk_projected(dae, stamps, pending, prune_state, visit, &mut |_, _| None)
+}
+
+fn walk_projected<'dae>(
+    dae: DaeView<'dae>,
+    stamps: &mut StampTable,
+    pending: &mut Vec<ExprId<'dae>>,
+    prune_state: &mut dyn FnMut(FunctionConditionalId<'dae>, FunctionValueId<'dae>) -> bool,
+    visit: &mut dyn FnMut(ExprId<'dae>, ExpressionView<'dae>) -> Option<bool>,
+    project: &mut dyn FnMut(ExprId<'dae>, ExpressionView<'dae>) -> Option<ExprId<'dae>>,
 ) -> bool {
     while let Some(expression) = pending.pop() {
         if !stamps.mark(expression) {
@@ -70,12 +87,28 @@ fn walk_pruned<'dae>(
             .expression(expression)
             .expect("a branded expression identity resolves in its owning DAE");
         match visit(expression, node) {
-            Some(true) => push_children(dae, node.operation(), pending),
+            Some(true) => {
+                push_projected_children(dae, expression, node, pending, prune_state, project)
+            }
             Some(false) => {}
             None => return true,
         }
     }
     false
+}
+
+fn push_projected_children<'dae>(
+    dae: DaeView<'dae>,
+    expression: ExprId<'dae>,
+    node: ExpressionView<'dae>,
+    pending: &mut Vec<ExprId<'dae>>,
+    prune_state: &mut dyn FnMut(FunctionConditionalId<'dae>, FunctionValueId<'dae>) -> bool,
+    project: &mut dyn FnMut(ExprId<'dae>, ExpressionView<'dae>) -> Option<ExprId<'dae>>,
+) {
+    match project(expression, node) {
+        Some(selected) => pending.push(selected),
+        None => push_children(dae, node.operation(), pending, prune_state),
+    }
 }
 
 /// Generation-stamped visited marks: stamp `0` is never visited, and each pass
@@ -90,6 +123,8 @@ struct StampTable {
 impl StampTable {
     fn begin_pass(&mut self, len: usize) {
         if self.stamps.len() < len {
+            #[cfg(test)]
+            STAMP_TABLE_GROWTHS.with(|growths| growths.set(growths.get() + 1));
             self.stamps.resize(len, 0);
         }
         self.generation = self.generation.checked_add(1).unwrap_or_else(|| {
@@ -108,33 +143,40 @@ impl StampTable {
     }
 }
 
+#[cfg(test)]
 thread_local! {
-    /// The table single-root walks share; a walk nested in another walk's
-    /// visitor finds it borrowed and uses a table of its own.
-    static SHARED_STAMPS: std::cell::RefCell<StampTable> = std::cell::RefCell::default();
+    /// How many times a stamp table on this thread grew to cover a larger arena.
+    pub(crate) static STAMP_TABLE_GROWTHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Stamp tables idle on this thread. A walk takes one for its duration and
+    /// returns it, so a walk nested in another walk's visitor takes a second
+    /// table instead of allocating one: the pool holds one table per nesting
+    /// depth ever reached, each sized once to the largest arena it has seen,
+    /// and a query costs only the nodes it reaches.
+    static STAMP_POOL: std::cell::RefCell<Vec<StampTable>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
 }
 
 fn with_shared_stamps(dae: DaeView<'_>, walk: &mut dyn FnMut(&mut StampTable)) {
-    SHARED_STAMPS.with(|shared| {
-        let (mut borrowed, mut own);
-        let table: &mut StampTable = if let Ok(table) = shared.try_borrow_mut() {
-            borrowed = table;
-            &mut borrowed
-        } else {
-            own = StampTable::default();
-            &mut own
-        };
-        table.begin_pass(dae.expression_count());
-        walk(table)
-    })
+    let mut table = STAMP_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_default();
+    table.begin_pass(dae.expression_count());
+    walk(&mut table);
+    STAMP_POOL.with(|pool| pool.borrow_mut().push(table));
 }
 
 /// Reusable workspace for pruned expression walks over one DAE.
 ///
-/// The visited set is the whole expression arena, so allocating one per root
+/// The visited set is the whole expression arena, so allocating one per walk
 /// makes a multi-root query cost `roots * arena` before it looks at a single
-/// operand. This workspace is allocated once and reused: each pass stamps
-/// nodes with a fresh generation instead of clearing, and the pending stack is
+/// operand. The visited sets are therefore the thread's pooled stamp tables,
+/// shared by every traversal and every nested walk: each pass stamps nodes
+/// with a fresh generation instead of clearing, so a workspace is free to
+/// create and a query costs only the nodes it reaches. The pending stack is
 /// kept across passes so a steady-state query allocates nothing at all.
 ///
 /// [`visit_pruned`](Self::visit_pruned) takes all of a pass's roots together
@@ -144,7 +186,6 @@ fn with_shared_stamps(dae: DaeView<'_>, walk: &mut dyn FnMut(&mut StampTable)) {
 /// node alone, so a second arrival could only repeat the first answer.
 #[derive(Debug, Default)]
 pub struct ExpressionTraversal<'dae> {
-    stamps: StampTable,
     pending: Vec<ExprId<'dae>>,
 }
 
@@ -153,10 +194,6 @@ impl<'dae> ExpressionTraversal<'dae> {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            stamps: StampTable {
-                stamps: Vec::new(),
-                generation: 0,
-            },
             pending: Vec::new(),
         }
     }
@@ -170,14 +207,59 @@ impl<'dae> ExpressionTraversal<'dae> {
         &mut self,
         dae: DaeView<'dae>,
         roots: impl IntoIterator<Item = ExprId<'dae>>,
+        visit: impl FnMut(ExprId<'dae>, ExpressionView<'dae>) -> bool,
+    ) {
+        self.visit_pruned_with_conditional_states(dae, roots, |_, _| false, visit);
+    }
+
+    /// Visit expressions while treating selected exact conditional states as leaves.
+    /// The predicate selects state interfaces; it issues no assignedness or payload.
+    pub fn visit_pruned_with_conditional_states(
+        &mut self,
+        dae: DaeView<'dae>,
+        roots: impl IntoIterator<Item = ExprId<'dae>>,
+        mut prune_state: impl FnMut(FunctionConditionalId<'dae>, FunctionValueId<'dae>) -> bool,
         mut visit: impl FnMut(ExprId<'dae>, ExpressionView<'dae>) -> bool,
     ) {
-        self.stamps.begin_pass(dae.expression_count());
         self.pending.clear();
         self.pending.extend(roots);
         self.pending.reverse();
-        walk_pruned(dae, &mut self.stamps, &mut self.pending, &mut |id, node| {
-            Some(visit(id, node))
+        let pending = &mut self.pending;
+        with_shared_stamps(dae, &mut |stamps| {
+            walk_pruned(dae, stamps, pending, &mut prune_state, &mut |id, node| {
+                Some(visit(id, node))
+            });
+        });
+    }
+
+    /// Visit a semantic projection of existing checked source expressions.
+    ///
+    /// A semantic owner may select an existing value instead of descending
+    /// into every source operand. `None` retains the full source descent.
+    /// This read-only query changes neither the source DAG nor its owners.
+    /// The same pending stack and visited stamps cover all selected values.
+    pub fn visit_projected(
+        &mut self,
+        dae: DaeView<'dae>,
+        roots: impl IntoIterator<Item = ExprId<'dae>>,
+        mut project: impl FnMut(ExprId<'dae>, ExpressionView<'dae>) -> Option<ExprId<'dae>>,
+        mut visit: impl FnMut(ExprId<'dae>, ExpressionView<'dae>),
+    ) {
+        self.pending.clear();
+        self.pending.extend(roots);
+        self.pending.reverse();
+        with_shared_stamps(dae, &mut |stamps| {
+            walk_projected(
+                dae,
+                stamps,
+                &mut self.pending,
+                &mut |_, _| false,
+                &mut |id, node| {
+                    visit(id, node);
+                    Some(true)
+                },
+                &mut project,
+            );
         });
     }
 }
@@ -217,6 +299,21 @@ pub fn expr_refers_to_var<'dae>(
     }
 }
 
+/// True when `root` reads a binder of `domain`.
+pub fn expr_reads_binder_of<'dae>(
+    dae: DaeView<'dae>,
+    root: ExprId<'dae>,
+    domain: DomainId<'dae>,
+) -> bool {
+    expression_any(dae, root, |node| {
+        matches!(
+            node.operation(),
+            ExpressionOperation::Coordinate(CoordinateView::Binder(binder))
+                if binder.domain() == domain
+        )
+    })
+}
+
 /// True when `root` contains the derivative coordinate of `state`.
 pub fn expr_contains_der_of<'dae>(
     dae: DaeView<'dae>,
@@ -251,9 +348,13 @@ fn expression_any<'dae>(
 ) -> bool {
     let mut found = false;
     with_shared_stamps(dae, &mut |stamps| {
-        found = walk_pruned(dae, stamps, &mut vec![root], &mut |_, node| {
-            (!predicate(node)).then_some(true)
-        });
+        found = walk_pruned(
+            dae,
+            stamps,
+            &mut vec![root],
+            &mut |_, _| false,
+            &mut |_, node| (!predicate(node)).then_some(true),
+        );
     });
     found
 }
@@ -262,6 +363,7 @@ fn push_children<'dae>(
     dae: DaeView<'dae>,
     operation: ExpressionOperation<'dae>,
     pending: &mut Vec<ExprId<'dae>>,
+    prune_state: &mut dyn FnMut(FunctionConditionalId<'dae>, FunctionValueId<'dae>) -> bool,
 ) {
     match operation {
         ExpressionOperation::Literal(_)
@@ -315,6 +417,18 @@ fn push_children<'dae>(
                 .expect("checked function fold identity resolves");
             pending.extend(fold.initial_values().rhs_iter());
             pending.extend(fold.update_values().rhs_iter());
+            pending.extend(fold.continuation());
+        }
+        ExpressionOperation::FunctionConditionalOutput {
+            conditional, value, ..
+        } => {
+            let conditional = dae
+                .function_conditional(conditional)
+                .expect("checked function conditional identity resolves");
+            assert!(
+                conditional
+                    .visit_value_inputs_pruned(value, prune_state, |input| pending.push(input))
+            );
         }
         ExpressionOperation::Index { base, subscripts } => {
             push_subscripts(subscripts, pending);

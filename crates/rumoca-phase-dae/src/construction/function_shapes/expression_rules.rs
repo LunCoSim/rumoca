@@ -38,7 +38,16 @@ pub(in crate::construction) fn call_free_target_shape(
     apply_subscripts(declared, &target.subs, values).ok()
 }
 
-pub(super) type FunctionResultShape<'scope> = dyn FnMut(&rumoca_core::Reference, &[Expression], bool, Span) -> Result<ValueShape, ToDaeError>
+/// The result shape of one call, with its arguments shaped in `scope`: the
+/// environment of the call site, which inside an MLS §10.4.1 comprehension
+/// binds the comprehension indices.
+pub(super) type FunctionResultShape<'scope> = dyn FnMut(
+        &rumoca_core::Reference,
+        &[Expression],
+        bool,
+        &ShapeEnvironment,
+        Span,
+    ) -> Result<ValueShape, ToDaeError>
     + 'scope;
 
 fn reference_shape(
@@ -46,6 +55,9 @@ fn reference_shape(
     values: &ShapeEnvironment,
     span: Span,
 ) -> Result<ValueShape, ToDaeError> {
+    if values.is_source_comprehension_binder(name) {
+        return Ok(Vec::new());
+    }
     if values.is_enumeration_literal_name(name.var_name()) {
         return values
             .is_enumeration_literal(name)
@@ -110,7 +122,7 @@ pub(super) fn expression_shape(
             args,
             is_constructor,
             ..
-        } => function_result(name, args, *is_constructor, span),
+        } => function_result(name, args, *is_constructor, values, span),
         Expression::If {
             branches,
             else_branch,
@@ -132,7 +144,12 @@ pub(super) fn expression_shape(
         }
         Expression::Range {
             start, step, end, ..
-        } => range_expression_shape(start, step.as_deref(), end, values, span),
+        } => {
+            if let Some(plan) = super::super::affine_slices::plan(expression, values) {
+                return Ok(vec![plan.extent]);
+            }
+            range_expression_shape(start, step.as_deref(), end, values, span)
+        }
         Expression::ArrayComprehension {
             expr,
             indices,
@@ -384,8 +401,8 @@ fn comprehension_expression_shape(
         })?);
     }
     let mut scoped = values.clone();
-    for index in indices {
-        scoped.insert(VarName::new(&index.name), Vec::new());
+    for index in indices.iter().rev() {
+        scoped.bind_comprehension_index(index);
     }
     shape.extend(expression_shape(body, &scoped, function_result)?);
     Ok(shape)
@@ -398,19 +415,27 @@ fn range_expression_shape(
     values: &ShapeEnvironment,
     span: Span,
 ) -> Result<ValueShape, ToDaeError> {
-    let start = evaluate_shape_integer(start, values)?;
     let step = step
         .map(|step| evaluate_shape_integer(step, values))
         .transpose()?
         .unwrap_or(1);
-    let end = evaluate_shape_integer(end, values)?;
-    Ok(vec![range_cardinality(start, step, end, span)?])
+    let bounds = evaluate_shape_integer(start, values)
+        .and_then(|start| Ok((start, evaluate_shape_integer(end, values)?)));
+    match bounds {
+        Ok((start, end)) => Ok(vec![range_cardinality(start, step, end, span)?]),
+        // MLS §10.4.1: the element count depends only on `end - start` and the
+        // step, so bounds sharing an unproven term still have an exact extent.
+        Err(error) => super::integer_bounds::exact_range_distance(start, end, values)
+            .map(|distance| Ok(vec![range_cardinality(0, step, distance, span)?]))
+            .unwrap_or(Err(error)),
+    }
 }
 
 pub(super) fn reject_shape_call(
     name: &rumoca_core::Reference,
     _arguments: &[Expression],
     _is_constructor: bool,
+    _scope: &ShapeEnvironment,
     span: Span,
 ) -> Result<ValueShape, ToDaeError> {
     Err(ToDaeError::unsupported_flat(
@@ -619,7 +644,7 @@ fn reduction_operand_shape(
         return expression_shape(argument, values, function_result);
     };
     let mut scoped = values.clone();
-    for index in indices {
+    for index in indices.iter().rev() {
         let Expression::Range {
             start, step, end, ..
         } = &index.range
@@ -631,10 +656,11 @@ fn reduction_operand_shape(
             expression_shape(step, &scoped, function_result)?;
         }
         expression_shape(end, &scoped, function_result)?;
-        if let Some((lower, upper)) = scoped.proven_range_bounds(&index.range) {
-            scoped.bind_integer_bounds(VarName::new(&index.name), lower, upper);
-        } else {
-            scoped.insert(VarName::new(&index.name), Vec::new());
+        match index.binder {
+            rumoca_core::IndexBinderProvenance::Source(_) => scoped.bind_comprehension_index(index),
+            rumoca_core::IndexBinderProvenance::Generated => {
+                scoped.bind_range_binder(VarName::new(&index.name), &index.range)
+            }
         }
     }
     if let Some(filter) = filter {

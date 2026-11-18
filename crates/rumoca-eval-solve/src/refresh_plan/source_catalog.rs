@@ -47,10 +47,12 @@ impl<'a> CanonicalScalarProgramCatalog<'a> {
         self.programs.get(index)
     }
 
+    /// Construction appends programs in ascending `(node, program)` order, so
+    /// the catalog is sorted by source and one lookup is a binary search.
     pub(super) fn source_index(&self, source: solve::RefreshScalarProgramSource) -> Option<usize> {
         self.programs
-            .iter()
-            .position(|program| program.source == source)
+            .binary_search_by(|program| program.source.cmp(&source))
+            .ok()
     }
 
     pub(super) fn positions(&self) -> &IndexMap<usize, OutputRowPosition> {
@@ -195,6 +197,14 @@ fn append_scalar_programs<'a>(
         first_block_span(block),
     )?;
     let mut output_ordinal = 0usize;
+    programs
+        .try_reserve_exact(block.programs().len())
+        .map_err(|_| {
+            source_error(
+                "canonical scalar-program catalog exceeds memory",
+                first_block_span(block),
+            )
+        })?;
     for (program_index, operations) in block.programs().iter().enumerate() {
         let source = solve::RefreshScalarProgramSource::checked(node_index, program_index)
             .ok_or_else(|| {
@@ -207,12 +217,6 @@ fn append_scalar_programs<'a>(
         let span = block
             .program_span(program_index)
             .ok_or_else(|| source_error("canonical scalar program is missing provenance", None))?;
-        programs.try_reserve_exact(1).map_err(|_| {
-            source_error(
-                "canonical scalar-program catalog exceeds memory",
-                Some(span),
-            )
-        })?;
         programs.push(CanonicalScalarProgram {
             source,
             operations,

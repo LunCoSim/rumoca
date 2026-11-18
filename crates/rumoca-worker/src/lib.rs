@@ -930,6 +930,7 @@ impl WorkerSimSettings {
             rumoca_sim::SimSolverMode::Auto => "auto",
             rumoca_sim::SimSolverMode::Bdf => "bdf",
             rumoca_sim::SimSolverMode::RkLike => "rk",
+            rumoca_sim::SimSolverMode::VelImplicit => "velimplicit",
         };
         let span = (options.t_end - options.t_start).abs();
         Self {
@@ -956,8 +957,9 @@ impl WorkerModelResult {
         self.projection_fallback_rate = worst;
         let surfaces = report.relation_surface_total();
         self.relation_surface_settles = (surfaces > 0).then_some(surfaces);
+        let sliding = report.sliding_mode_total();
         self.projection_fallback_detail =
-            (worst.is_some() || surfaces > 0).then(|| report.warnings().join("; "));
+            (worst.is_some() || surfaces > 0 || sliding > 0).then(|| report.warnings().join("; "));
     }
 
     pub fn phase_failure(

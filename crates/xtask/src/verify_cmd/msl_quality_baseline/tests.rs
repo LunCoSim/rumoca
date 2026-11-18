@@ -24,6 +24,7 @@ fn header(omc_version: &str) -> MslQualityBaselineHeader {
         partial_classification_migration: Some(partial_classification_migration()),
         compiler_contract_migration: None,
         promoted_baseline_bridge: None,
+        budget_metadata_correction: None,
         simulatable_attempted: 566,
         parse_models: 566,
         flatten_models: 565,
@@ -43,8 +44,14 @@ fn header(omc_version: &str) -> MslQualityBaselineHeader {
         ic_solver_fail: 15,
         sim_ok: 207,
         runtime_ratio_stats: RuntimeRatioStats {
-            system_ratio_both_success: DistributionMedian { median: 1.5 },
-            wall_ratio_both_success: DistributionMedian { median: 45.0 },
+            system_ratio_both_success: DistributionMedian {
+                median: 1.5,
+                sample_count: None,
+            },
+            wall_ratio_both_success: DistributionMedian {
+                median: 45.0,
+                sample_count: None,
+            },
         },
         trace_accuracy_stats: TraceAccuracyStats {
             models_compared: 202,
@@ -58,17 +65,47 @@ fn header(omc_version: &str) -> MslQualityBaselineHeader {
             models_with_any_channel_deviation: 60,
             violation_mass_total: 229.0,
             initial_condition: InitialConditionStats {
+                models_compared: None,
                 deviation_channels_total: 439,
                 severe_channels_total: 50,
                 violation_mass_total: 121.0,
             },
             state_selection: StateSelectionStats {
+                models_compared: None,
                 exact_state_set_match_models: 164,
                 total_rumoca_only_states: 108,
                 total_omc_only_states: 122,
             },
         },
+        cohort: Default::default(),
     }
+}
+
+/// Record per-model state-set evidence (rumoca-only state counts, no
+/// initial-condition deviations) and the totals it sums to.
+fn with_state_evidence(
+    mut baseline: MslQualityBaselineHeader,
+    models: &[(&str, usize)],
+) -> MslQualityBaselineHeader {
+    let evidence = models
+        .iter()
+        .map(|(model, rumoca_only)| {
+            let state_set = json!({"rumoca_only": rumoca_only, "omc_only": 0, "exact": *rumoca_only == 0});
+            (model.to_string(), json!({"ic_deviation_channels": 0, "ic_severe_channels": 0, "ic_violation_mass": 0.0, "state_set": state_set}))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    baseline.cohort = serde_json::from_value(json!({ "trace_model_evidence": evidence })).unwrap();
+    let initial = &mut baseline.trace_accuracy_stats.initial_condition;
+    initial.models_compared = Some(models.len());
+    initial.deviation_channels_total = 0;
+    initial.severe_channels_total = 0;
+    initial.violation_mass_total = 0.0;
+    let state = &mut baseline.trace_accuracy_stats.state_selection;
+    state.models_compared = Some(models.len());
+    state.total_rumoca_only_states = models.iter().map(|(_, count)| count).sum();
+    state.total_omc_only_states = 0;
+    state.exact_state_set_match_models = models.iter().filter(|(_, count)| *count == 0).count();
+    baseline
 }
 
 fn promoted_bridge() -> PromotedBaselineBridge {
@@ -198,12 +235,12 @@ fn same_omc_context_keeps_promoted_baseline() {
 }
 
 #[test]
-fn checked_in_v11_baseline_preserves_historical_migrations_and_reference_boundary() {
+fn checked_in_v14_baseline_preserves_historical_migrations_and_reference_boundary() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../rumoca-test-msl/tests/msl_tests/msl_quality_baseline.json");
-    let baseline = load_baseline_header(&path).expect("checked v11 baseline must validate");
+    let baseline = load_baseline_header(&path).expect("checked v14 baseline must validate");
 
-    assert_eq!(baseline.quality_gate_version, 11);
+    assert_eq!(baseline.quality_gate_version, 14);
     assert!(baseline.reference_boundary_migration.is_some());
     assert_eq!(baseline.partial_models, 13);
     assert_eq!(baseline.partial_model_names, reviewed_partial_model_names());
@@ -346,6 +383,25 @@ fn partial_schema_migration_rejects_unrelated_cumulative_regression() {
 }
 
 #[test]
+fn schema_migration_compares_state_sets_over_the_models_both_baselines_measured() {
+    let promoted = with_state_evidence(promoted_v3("a96aa1a-cmake"), &[("A", 2), ("B", 0)]);
+    let grown = with_state_evidence(header("a96aa1a-cmake"), &[("A", 2), ("B", 0), ("C", 9)]);
+    assert_eq!(
+        choose_baseline(&promoted, &grown).expect("a newly measured model is no regression"),
+        BaselineChoice::CheckedInMigration
+    );
+
+    let regressed = with_state_evidence(header("a96aa1a-cmake"), &[("A", 3), ("B", 0), ("C", 9)]);
+    let error = choose_baseline(&promoted, &regressed).expect_err("a shared model regressed");
+    assert!(
+        error
+            .to_string()
+            .contains("state-set rumoca-only states over 2 shared models"),
+        "{error}"
+    );
+}
+
+#[test]
 fn partial_schema_migration_rejects_unreviewed_partial_count() {
     let mut promoted = promoted_v3("a96aa1a-cmake");
     promoted.partial_models = 10;
@@ -452,4 +508,54 @@ fn baseline_header_rejects_missing_or_invalid_omc_version() {
         let error = load_baseline_header(&path).expect_err("invalid context must fail");
         assert!(error.to_string().contains("omc_version"), "{error}");
     }
+}
+
+#[test]
+fn actual_header_binds_new_candidates_and_defers_historical_reader_activation() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../rumoca-test-msl/tests/msl_tests/msl_quality_baseline.json");
+    let original: serde_json::Value = serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+    let good = load_baseline_header(&source).unwrap();
+    assert_eq!(good.cohort_snapshot().quality_gate_version, Some(14));
+    let root = std::env::temp_dir().join(format!("msl-header-schema-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let path = root.join("baseline.json");
+    let mut failures = Vec::new();
+    for missing in ["runtime_model_ratios", "system", "wall"] {
+        let mut bad = original.clone();
+        if missing == "runtime_model_ratios" {
+            bad.as_object_mut().unwrap().remove(missing);
+        } else {
+            let metric = format!("{missing}_ratio_both_success");
+            bad["runtime_ratio_stats"][metric]
+                .as_object_mut()
+                .unwrap()
+                .remove("sample_count");
+        }
+        fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        let bad = load_baseline_header(&path).unwrap();
+        for (side, reference, candidate, must_refuse) in [
+            ("historical reference", &bad, &good, false),
+            ("new candidate", &good, &bad, true),
+        ] {
+            let refused = super::validate_cohort_metric_integrity(reference, candidate).is_err();
+            if refused != must_refuse {
+                failures.push(format!(
+                    "{side}: missing {missing}, refused={refused}, expected={must_refuse}"
+                ));
+            }
+        }
+        let mut legacy = bad.clone();
+        legacy.quality_gate_version = 13;
+        for (reference, candidate) in [(&legacy, &good), (&good, &legacy)] {
+            if super::validate_cohort_metric_integrity(reference, candidate).is_err() {
+                failures.push(format!("legacy compatibility lost for {missing}"));
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+    assert!(
+        failures.is_empty(),
+        "root schema controls failed: {failures:?}"
+    );
 }

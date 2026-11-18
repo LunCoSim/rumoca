@@ -1,4 +1,4 @@
-use super::codegen_test_support::builtin_template;
+use super::codegen_test_support::{builtin_template, derivative_problem};
 use super::*;
 use rumoca_ir_solve as solve;
 
@@ -10,14 +10,6 @@ fn fixture_provenance() -> rumoca_core::ProvenanceSpan {
     )
     .require_provenance("scalar plan fixture")
     .expect("fixture span is source-backed")
-}
-
-fn derivative_problem(program: Vec<solve::LinearOp>) -> solve::SolveProblem {
-    let block = solve::ScalarProgramBlock::with_source_span(vec![program], fixture_provenance())
-        .expect("fixture scalar program is checked");
-    let mut problem = solve::SolveProblem::default();
-    problem.continuous.derivative_rhs = solve::ComputeBlock::from_scalar_program_block(block);
-    problem
 }
 
 #[test]
@@ -407,7 +399,7 @@ op:{{ op is mapping }}:{% for key in op %}{{ key }}={{ op[key] is defined }},{% 
         [
             "plan:true:programs,output_count,stored_output_count,uses_linear_solve_component",
             "programs:true:1",
-            "program:true:ops,span,output_count,temporary_count",
+            "program:true:ops,span,output_count,output_indices,temporary_count",
             "ops:true:6",
         ],
         "{rendered}"

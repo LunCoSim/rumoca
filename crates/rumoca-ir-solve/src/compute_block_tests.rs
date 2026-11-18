@@ -9,6 +9,7 @@ use crate::{
 fn test_domain(count: usize) -> StructuredIndexDomain {
     StructuredIndexDomain {
         binders: vec![StructuredIndexBinder {
+            provenance: rumoca_core::IndexBinderProvenance::Generated,
             id: 0,
             display_name: "i".to_string(),
             lower: 1,
@@ -47,6 +48,7 @@ fn wide_2d_domain() -> StructuredIndexDomain {
     StructuredIndexDomain {
         binders: vec![
             StructuredIndexBinder {
+                provenance: rumoca_core::IndexBinderProvenance::Generated,
                 id: 0,
                 display_name: "i".to_string(),
                 lower: 1,
@@ -54,6 +56,7 @@ fn wide_2d_domain() -> StructuredIndexDomain {
                 step: 1,
             },
             StructuredIndexBinder {
+                provenance: rumoca_core::IndexBinderProvenance::Generated,
                 id: 1,
                 display_name: "j".to_string(),
                 lower: 1,
@@ -61,6 +64,7 @@ fn wide_2d_domain() -> StructuredIndexDomain {
                 step: 1,
             },
             StructuredIndexBinder {
+                provenance: rumoca_core::IndexBinderProvenance::Generated,
                 id: 2,
                 display_name: "k".to_string(),
                 lower: 1,
@@ -462,7 +466,9 @@ fn derivative_problem_names_its_states_as_solver_coordinates() {
     assert_eq!(problem.solve_layout.state_scalar_count, 1);
     assert_eq!(problem.solve_layout.solver_scalar_count(), 1);
     assert_eq!(
-        problem.solve_layout.solver_maps.names,
+        problem
+            .solver_named_report(0..problem.solver_scalar_count())
+            .unwrap(),
         vec!["x".to_string()]
     );
 }
@@ -479,4 +485,64 @@ fn derivative_problem_refuses_state_storage_it_cannot_name() {
             Err(SolveProblemShapeContractError::DerivativeStateStorage { .. })
         ));
     }
+}
+
+fn grid_domain(rows: (i64, i64), columns: (i64, i64)) -> StructuredIndexDomain {
+    let binder = |id: usize, name: &str, (lower, upper): (i64, i64)| StructuredIndexBinder {
+        provenance: rumoca_core::IndexBinderProvenance::Generated,
+        id,
+        display_name: name.to_string(),
+        lower,
+        upper,
+        step: 1,
+    };
+    StructuredIndexDomain {
+        binders: vec![binder(0, "i", rows), binder(1, "j", columns)],
+    }
+}
+
+#[test]
+fn output_map_from_strided_grid_interior_is_affine() {
+    // The interior 2:4 x 2:4 of a 5x5 row-major array starting at slot 25.
+    let domain = grid_domain((2, 4), (2, 4));
+    let outputs = (2..=4)
+        .flat_map(|i| (2..=4).map(move |j| 25 + (i - 1) * 5 + (j - 1)))
+        .collect::<Vec<usize>>();
+    let map = TensorOutputMap::from_outputs(&domain, &outputs)
+        .expect("small grid fits")
+        .expect("a grid interior is an affine image of its domain");
+    assert_eq!(map.start, 31);
+    assert_eq!(
+        map.strides,
+        vec![
+            AffineStencilIndexStrideTerm {
+                dimension: 0,
+                stride: 5,
+            },
+            AffineStencilIndexStrideTerm {
+                dimension: 1,
+                stride: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        map.output_indices(&domain).expect("map enumerates"),
+        outputs
+    );
+}
+
+#[test]
+fn output_map_from_non_affine_outputs_is_refused() {
+    let domain = grid_domain((1, 2), (1, 2));
+    // The fourth point breaks the affine relation of the first three.
+    let outputs = [0, 1, 10, 12];
+    assert_eq!(
+        TensorOutputMap::from_outputs(&domain, &outputs).expect("small grid fits"),
+        None
+    );
+    // A count that differs from the domain size has no map either.
+    assert_eq!(
+        TensorOutputMap::from_outputs(&domain, &outputs[..3]).expect("small grid fits"),
+        None
+    );
 }

@@ -123,6 +123,7 @@ impl TryFrom<&modelica_grammar_trait::SomeEquation> for rumoca_ir_ast::Equation 
                 Ok(rumoca_ir_ast::Equation::Connect {
                     lhs: eq.connect_equation.component_reference.clone(),
                     rhs: eq.connect_equation.component_reference0.clone(),
+                    annotation: crate::elements::extract_annotation(&ast.description)?,
                 })
             }
             modelica_grammar_trait::SomeEquationOption::ForEquation(eq) => {
@@ -174,6 +175,7 @@ fn convert_for_indices(
     let first_idx = &for_indices.for_index;
     let range = required_for_index_range(first_idx)?;
     indices.push(rumoca_ir_ast::ForIndex {
+        binder: None,
         ident: first_idx.ident.clone(),
         range,
     });
@@ -183,6 +185,7 @@ fn convert_for_indices(
         let idx = &idx_item.for_index;
         let range = required_for_index_range(idx)?;
         indices.push(rumoca_ir_ast::ForIndex {
+            binder: None,
             ident: idx.ident.clone(),
             range,
         });

@@ -57,7 +57,7 @@ pub(super) struct ExpressionRebuilder<'source, 'borrow, 'storage, 'target> {
     pub(super) facts: &'borrow DifferentiationFacts,
     pub(super) auxiliary_functions: &'borrow super::auxiliary_blocks::AuxiliaryFunctions<'target>,
     pub(super) auxiliary_expressions: std::collections::BTreeMap<
-        (u32, u8, bool),
+        (u32, u8, bool, Option<u32>),
         super::auxiliary_blocks::AuxiliaryExpression<'target>,
     >,
     pub(super) candidate: Option<DirectStateConstraint>,
@@ -73,6 +73,7 @@ pub(super) struct ExpressionRebuilder<'source, 'borrow, 'storage, 'target> {
     literal_expressions:
         &'borrow [Option<std::sync::Arc<super::evaluable_parameters::FoldedValue>>],
     rebuilt: &'borrow mut [Option<dae::ExprId<'target>>],
+    pub(super) transforming_model_arm: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -180,6 +181,7 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
             inline_calls: &[],
             literal_expressions: &[],
             rebuilt,
+            transforming_model_arm: false,
         }
     }
 
@@ -219,8 +221,30 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
         &mut self,
         source_id: dae::ExprId<'source>,
     ) -> Result<dae::ExprId<'target>, dae::DaeConstructionError> {
+        let source = self
+            .source
+            .expression(source_id)
+            .expect("finalized expression identity resolves");
         let index = source_id.index() as usize;
-        if let Some(rebuilt) = self.rebuilt[index] {
+        if self.transforming_model_arm {
+            if let Some(value) = self.rebuilt[index]
+                && self
+                    .target
+                    .model_arm_of(value, source.provenance())?
+                    .is_none()
+            {
+                return Ok(value);
+            }
+            return self.rebuild_model_arm_value(source_id, source);
+        }
+        // A value first rebuilt inside an arm stays memoized for that arm and
+        // its descendants; a use the arm cannot reach rebuilds it here.
+        let memoized = self.rebuilt[index];
+        if let Some(rebuilt) = memoized
+            && self
+                .target
+                .model_arm_visible(rebuilt, source.provenance())?
+        {
             return Ok(rebuilt);
         }
         if let Some(owner) = self.source.runtime_quotient_owner(source_id) {
@@ -231,7 +255,8 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
                 .provenance();
             return Err(dae::DaeConstructionError::IncompleteDefinition {
                 kind: match owner.kind() {
-                    dae::RuntimeQuotientOwnerKind::ModelEvent { .. } => {
+                    dae::RuntimeQuotientOwnerKind::ModelEvent { .. }
+                    | dae::RuntimeQuotientOwnerKind::StructuredModelEvent { .. } => {
                         "runtime quotient model owner replay"
                     }
                     dae::RuntimeQuotientOwnerKind::FunctionBody { .. } => {
@@ -242,10 +267,6 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
                 span: provenance.span(),
             });
         }
-        let source = self
-            .source
-            .expression(source_id)
-            .expect("finalized expression identity resolves");
         let provenance = source.provenance();
         let rebuilt = match self.literal_expressions.get(index).cloned().flatten() {
             Some(value) => {
@@ -256,7 +277,55 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
                 self.rebuild_operation(source_id, source.operation(), provenance, value_type)?
             }
         };
-        self.rebuilt[index] = Some(rebuilt);
+        if memoized.is_none() || self.target.model_arm_of(rebuilt, provenance)?.is_none() {
+            self.rebuilt[index] = Some(rebuilt);
+        }
+        Ok(rebuilt)
+    }
+
+    /// A source arm occurrence is rebuilt under the fresh issued arm; the
+    /// global source mapping continues to name the original closed occurrence.
+    fn rebuild_model_arm_value(
+        &mut self,
+        source_id: dae::ExprId<'source>,
+        source: dae::ExpressionView<'source>,
+    ) -> Result<dae::ExprId<'target>, dae::DaeConstructionError> {
+        let key = self.scoped_reconstruction_key(source_id, 0, source.provenance());
+        if let Some(value) = self.scoped_cache.model_values.get(&key).copied() {
+            return Ok(value);
+        }
+        let value_type = self.types[source.value_type_id().index() as usize];
+        let value = self.rebuild_operation(
+            source_id,
+            source.operation(),
+            source.provenance(),
+            value_type,
+        )?;
+        self.scoped_cache.model_values.insert(key, value);
+        Ok(value)
+    }
+
+    /// Replay an exact guard operation selected by its model conditional owner.
+    /// STRUCT-T10 may settle its operands, but the owner's parent/arm authority
+    /// still consumes this canonical operation, not its selected value.
+    pub(super) fn rebuild_model_guard(
+        &mut self,
+        source_id: dae::ExprId<'source>,
+    ) -> Result<dae::ExprId<'target>, dae::DaeConstructionError> {
+        let source = self
+            .source
+            .expression(source_id)
+            .expect("issued model guard");
+        let rebuilt = match source.operation() {
+            dae::ExpressionOperation::Conditional(operands) => {
+                self.rebuild_conditional_arms(operands, source.provenance())?
+            }
+            operation => {
+                let value_type = self.types[source.value_type_id().index() as usize];
+                self.rebuild_operation(source_id, operation, source.provenance(), value_type)?
+            }
+        };
+        self.rebuilt[source_id.index() as usize] = Some(rebuilt);
         Ok(rebuilt)
     }
 
@@ -545,6 +614,7 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
                 }
             }
             dae::ExpressionOperation::FunctionValue { .. }
+            | dae::ExpressionOperation::FunctionConditionalOutput { .. }
             | dae::ExpressionOperation::FunctionFoldParameter { .. }
             | dae::ExpressionOperation::FunctionFoldOutput { .. } => {
                 unreachable!("function-owner reconstruction seeds scoped expression identities")
@@ -656,6 +726,15 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
         operands: dae::ExpressionOperands<'source>,
         provenance: dae::DaeProvenance,
     ) -> Result<dae::ExprId<'target>, dae::DaeConstructionError> {
+        if self.transforming_model_arm
+            && let Some(owner) = self.source.model_conditional_of(conditional)
+        {
+            return self.materialize_owned_conditional(
+                owner,
+                super::differentiation::conditionals::BranchTransform::Rebuild,
+                provenance,
+            );
+        }
         let mut selected = operands
             .get(operands.len() - 1)
             .expect("checked conditional has a fallback");
@@ -736,8 +815,26 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
                 let folded = self.variables[parameter.index() as usize]
                     .folded
                     .as_deref()?;
-                match (folded.scalar, &*folded.values) {
-                    (dae::ScalarType::Boolean, [value]) => Some(*value != 0.0),
+                match (
+                    folded.scalar,
+                    folded.values.len(),
+                    folded.values.runs().next(),
+                ) {
+                    (
+                        dae::ScalarType::Boolean,
+                        1,
+                        Some(rumoca_eval_dae::NumericInitialRun::Repeat {
+                            value: rumoca_eval_dae::NumericSourceScalar::Boolean(value),
+                            ..
+                        }),
+                    ) => Some(value),
+                    (
+                        dae::ScalarType::Boolean,
+                        1,
+                        Some(rumoca_eval_dae::NumericInitialRun::Literal(
+                            [rumoca_eval_dae::NumericSourceScalar::Boolean(value)],
+                        )),
+                    ) => Some(*value),
                     _ => None,
                 }
             }
@@ -906,14 +1003,20 @@ impl<'source, 'borrow, 'storage, 'target> ExpressionRebuilder<'source, 'borrow, 
         self.target.at(provenance).coordinate(coordinate)
     }
 
-    /// Read a STRUCT-T09 derivative alias, a STRUCT-T10(a) folded parameter
-    /// as its value, or an eliminated STRUCT-T02 alias member through its
-    /// class representative, keeping the source occurrence's provenance.
+    /// Read a STRUCT-T04 inert derivative as zero, a STRUCT-T09 derivative
+    /// alias, a STRUCT-T10(a) folded parameter as its value, or an eliminated
+    /// STRUCT-T02 alias member through its class representative, keeping the
+    /// source occurrence's provenance.
     fn rebuild_coordinate_alias(
         &mut self,
         coordinate: dae::CoordinateView<'source>,
         provenance: dae::DaeProvenance,
     ) -> Option<Result<dae::ExprId<'target>, dae::DaeConstructionError>> {
+        if let dae::CoordinateView::Derivative(state) = coordinate
+            && self.variables[state.index() as usize].inert_derivative
+        {
+            return Some(self.zero_for_demoted_state(state.index(), provenance));
+        }
         if let dae::CoordinateView::Derivative(state) = coordinate
             && let Some(alias) = self.variables[state.index() as usize].derivative_alias
         {

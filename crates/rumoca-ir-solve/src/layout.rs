@@ -1,9 +1,12 @@
+mod identity;
+mod scalar_views;
+
 use indexmap::IndexMap;
 use rumoca_core::{ComponentReference, Span, Subscript, VarName};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 
-const F64_BYTES: usize = std::mem::size_of::<f64>();
+pub(crate) const F64_BYTES: usize = std::mem::size_of::<f64>();
 
 fn intern_key_map<T>(values: IndexMap<String, T>) -> IndexMap<VarName, T> {
     values
@@ -270,16 +273,35 @@ impl VarLayout {
         y_scalars: usize,
         p_scalars: usize,
     ) -> Result<Self, VarLayoutShapeContractError> {
-        let bindings = intern_key_map(bindings);
-        let shapes = intern_key_map(shapes);
-        let shape_spans = intern_key_map(shape_spans);
-        let indexed_bindings =
-            indexed_bindings_from_shapes(&bindings, &shapes, &shape_spans, y_scalars, p_scalars)?;
+        Self::from_interned_parts_with_shapes_and_spans(
+            intern_key_map(bindings),
+            intern_key_map(shapes),
+            intern_key_map(shape_spans),
+            y_scalars,
+            p_scalars,
+        )
+    }
+
+    /// [`Self::from_parts_with_shapes_and_spans`] for parts whose names are
+    /// already interned, so a compilation names each scalar once instead of
+    /// spelling the whole binding table a second time as text.
+    ///
+    /// A shaped variable's element slots are not stored: they follow from its
+    /// base slot and shape and are derived on demand by
+    /// [`Self::indexed_slots`], so the layout holds one run per variable
+    /// rather than an index vector per scalar.
+    pub fn from_interned_parts_with_shapes_and_spans(
+        bindings: IndexMap<VarName, ScalarSlot>,
+        shapes: IndexMap<VarName, Vec<usize>>,
+        shape_spans: IndexMap<VarName, Span>,
+        y_scalars: usize,
+        p_scalars: usize,
+    ) -> Result<Self, VarLayoutShapeContractError> {
         Self::checked(
             bindings,
             shapes,
             shape_spans,
-            indexed_bindings,
+            IndexMap::new(),
             y_scalars,
             p_scalars,
         )
@@ -369,8 +391,32 @@ impl VarLayout {
         &self.bindings
     }
 
-    pub fn indexed_bindings(&self) -> &IndexMap<ComponentReferenceKey, Vec<IndexedScalarSlot>> {
-        &self.indexed_bindings
+    /// The element slots of shaped variable `name`, each with its one-based
+    /// subscripts in row-major order.
+    ///
+    /// A Y or P array occupies a contiguous run, so its slots follow from the
+    /// base slot and the shape (the construction contract proved the run lies
+    /// inside the layout); only an array that holds distinct constants carries
+    /// explicit entries.
+    pub fn indexed_slots(&self, name: &str) -> Option<Vec<IndexedScalarSlot>> {
+        let name = VarName::intern(name);
+        if let Some(entries) = self
+            .shape_indexed_keys
+            .get(&name)
+            .and_then(|key| self.indexed_bindings.get(key))
+        {
+            return Some(entries.clone());
+        }
+        let shape = self.shapes.get(&name)?;
+        let slot = self.bindings.get(&name).copied()?;
+        let count = shape.iter().product::<usize>();
+        (0..count)
+            .map(|flat| {
+                let indices = flat_index_to_subscripts(name.as_str(), shape, flat, None).ok()??;
+                let slot = offset_contiguous_slot(slot, flat)?;
+                Some(IndexedScalarSlot { indices, slot })
+            })
+            .collect()
     }
 
     pub fn binding(&self, name: &str) -> Option<ScalarSlot> {
@@ -390,7 +436,7 @@ impl VarLayout {
     /// concrete element name like `x[2,3]` (1-based, row-major). Returns `None` when
     /// the name is not a subscripted element, the base has no contiguous slot, or any
     /// subscript is out of bounds.
-    fn derive_array_element_binding(&self, name: &str) -> Option<ScalarSlot> {
+    pub fn derive_array_element_binding(&self, name: &str) -> Option<ScalarSlot> {
         let scalar = rumoca_core::parse_scalar_name(name)?;
         let base = VarName::intern(scalar.base);
         let root = self.bindings.get(&base).copied()?;
@@ -409,6 +455,17 @@ impl VarLayout {
 
     pub fn y_scalars(&self) -> usize {
         self.y_scalars
+    }
+
+    /// This layout with `extra` unnamed Y slots after the existing ones: the
+    /// private work slots a value schedule computes and reads but never
+    /// binds to a name.
+    #[must_use]
+    pub fn with_private_y(&self, extra: usize) -> Option<Self> {
+        Some(Self {
+            y_scalars: self.y_scalars.checked_add(extra)?,
+            ..self.clone()
+        })
     }
 
     pub fn p_scalars(&self) -> usize {
@@ -483,6 +540,20 @@ fn validate_shape_contract(
                 start,
                 count,
                 available,
+                span,
+            });
+        }
+        // Every element slot carries its byte offset, so the last one must
+        // have a representable offset: the element slots derived on demand
+        // from this run are then proven at construction.
+        let last = start + count - 1;
+        let largest = usize::MAX / F64_BYTES;
+        if last > largest {
+            return Err(VarLayoutShapeContractError::ShapeOutOfBounds {
+                variable: name.to_string(),
+                start: start.max(largest + 1),
+                count: 1,
+                available: largest,
                 span,
             });
         }
@@ -621,77 +692,6 @@ fn generated_shape_indexed_keys(
         .collect()
 }
 
-fn indexed_bindings_from_shapes(
-    bindings: &IndexMap<VarName, ScalarSlot>,
-    shapes: &IndexMap<VarName, Vec<usize>>,
-    shape_spans: &IndexMap<VarName, Span>,
-    y_scalars: usize,
-    p_scalars: usize,
-) -> Result<IndexMap<ComponentReferenceKey, Vec<IndexedScalarSlot>>, VarLayoutShapeContractError> {
-    let mut indexed_bindings =
-        indexed_binding_map_with_capacity(shapes.len(), "indexed binding map")?;
-    for (name, shape) in shapes {
-        let span = shape_span(name, shape_spans)?;
-        let Some(slot) = bindings.get(name).copied() else {
-            continue;
-        };
-        let Some((start, available)) = slot_start_and_available(slot, y_scalars, p_scalars) else {
-            continue;
-        };
-        let count = shape_scalar_count(name, shape, span)?;
-        if slot_range_end(start, count).is_none_or(|end| end > available) {
-            return Err(VarLayoutShapeContractError::ShapeOutOfBounds {
-                variable: name.to_string(),
-                start,
-                count,
-                available,
-                span,
-            });
-        }
-        let mut entries = shape_vec_with_capacity(count, name.as_str(), span)?;
-        for flat_index in 0..count {
-            let Some(indices) = flat_index_to_subscripts(name.as_str(), shape, flat_index, span)?
-            else {
-                continue;
-            };
-            let offset = start.checked_add(flat_index).ok_or_else(|| {
-                VarLayoutShapeContractError::ShapeOutOfBounds {
-                    variable: name.to_string(),
-                    start,
-                    count,
-                    available: start,
-                    span,
-                }
-            })?;
-            let Some(slot) = slot_with_checked_index(slot, offset, name.as_str(), span)? else {
-                continue;
-            };
-            entries.push(IndexedScalarSlot { indices, slot });
-        }
-        if !entries.is_empty() {
-            indexed_bindings.insert(ComponentReferenceKey::generated(name.as_str()), entries);
-        }
-    }
-    Ok(indexed_bindings)
-}
-
-fn indexed_binding_map_with_capacity<K, V>(
-    capacity: usize,
-    variable: &str,
-) -> Result<IndexMap<K, V>, VarLayoutShapeContractError>
-where
-    K: std::hash::Hash + Eq,
-{
-    let mut values = IndexMap::new();
-    values
-        .try_reserve(capacity)
-        .map_err(|_| VarLayoutShapeContractError::ShapeSizeOverflow {
-            variable: variable.to_string(),
-            span: None,
-        })?;
-    Ok(values)
-}
-
 fn shape_vec_with_capacity<T>(
     capacity: usize,
     variable: &str,
@@ -705,40 +705,6 @@ fn shape_vec_with_capacity<T>(
         }
     })?;
     Ok(values)
-}
-
-fn slot_with_checked_index(
-    slot: ScalarSlot,
-    index: usize,
-    name: &str,
-    span: Option<Span>,
-) -> Result<Option<ScalarSlot>, VarLayoutShapeContractError> {
-    let byte_offset = index.checked_mul(F64_BYTES).ok_or_else(|| {
-        VarLayoutShapeContractError::ShapeOutOfBounds {
-            variable: name.to_string(),
-            start: index,
-            count: 1,
-            available: usize::MAX / F64_BYTES,
-            span,
-        }
-    })?;
-    Ok(match slot {
-        ScalarSlot::Y { .. } => Some(ScalarSlot::Y { index, byte_offset }),
-        ScalarSlot::P { .. } => Some(ScalarSlot::P { index, byte_offset }),
-        ScalarSlot::Time | ScalarSlot::Constant(_) => None,
-    })
-}
-
-fn slot_start_and_available(
-    slot: ScalarSlot,
-    y_scalars: usize,
-    p_scalars: usize,
-) -> Option<(usize, usize)> {
-    match slot {
-        ScalarSlot::Y { index, .. } => Some((index, y_scalars)),
-        ScalarSlot::P { index, .. } => Some((index, p_scalars)),
-        ScalarSlot::Time | ScalarSlot::Constant(_) => None,
-    }
 }
 
 fn flat_index_to_subscripts(
@@ -811,7 +777,7 @@ pub fn scalar_slot_p(index: usize) -> ScalarSlot {
 mod tests {
     use super::*;
 
-    fn layout_source_span(source: u64, start: usize, end: usize) -> Span {
+    pub(super) fn layout_source_span(source: u64, start: usize, end: usize) -> Span {
         let source_name = format!("ir_solve_layout_source_{source}.mo");
         Span::from_offsets(
             rumoca_core::SourceId::from_source_name(&source_name),
@@ -931,10 +897,7 @@ mod tests {
             .expect("shape matches y scalar extent");
 
         assert_eq!(layout.validate_shape_contract(), Ok(()));
-        assert_eq!(
-            layout.indexed_bindings()[&ComponentReferenceKey::generated("x")].len(),
-            6
-        );
+        assert_eq!(layout.indexed_slots("x").map(|slots| slots.len()), Some(6));
     }
 
     #[test]
@@ -964,11 +927,7 @@ mod tests {
 
         assert_eq!(layout.shape("x"), Some([0].as_slice()));
         assert_eq!(layout.binding("x"), None);
-        assert!(
-            !layout
-                .indexed_bindings()
-                .contains_key(&ComponentReferenceKey::generated("x"))
-        );
+        assert_eq!(layout.indexed_slots("x"), None);
     }
 
     #[test]
@@ -1164,5 +1123,47 @@ mod tests {
         .expect("constant array shape is represented by indexed constant slots");
 
         assert_eq!(layout.validate_shape_contract(), Ok(()));
+    }
+
+    #[test]
+    fn solver_range_projection_refuses_noncontiguous_indexed_y_declaration() {
+        let layout = VarLayout::from_parts_with_shapes_and_indexed_bindings(
+            [("state".to_string(), scalar_slot_y(0))].into(),
+            [("state".to_string(), vec![2])].into(),
+            [(
+                ComponentReferenceKey::generated("state"),
+                vec![
+                    IndexedScalarSlot {
+                        indices: vec![1],
+                        slot: scalar_slot_y(1),
+                    },
+                    IndexedScalarSlot {
+                        indices: vec![2],
+                        slot: scalar_slot_y(0),
+                    },
+                ],
+            )]
+            .into(),
+            2,
+            0,
+        )
+        .unwrap();
+        assert_eq!(layout.validate_shape_contract(), Ok(()));
+        let slots = layout.indexed_slots("state").unwrap();
+        assert_eq!(slots[0].indices, vec![1]);
+        assert_eq!(slots[0].slot, scalar_slot_y(1));
+        assert_eq!(slots[1].indices, vec![2]);
+        assert_eq!(slots[1].slot, scalar_slot_y(0));
+        assert!(layout.y_declaration_ranges().is_err());
+        assert!(layout.validate_named_y_coverage(2).is_err());
+        let problem = crate::SolveProblem {
+            layout,
+            solve_layout: crate::SolveLayout {
+                state_scalar_count: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(problem.solver_declaration_range("state"), None);
     }
 }

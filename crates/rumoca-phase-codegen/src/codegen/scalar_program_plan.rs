@@ -4,6 +4,7 @@
 //! references. It validates and attaches each `StoreOutput` to its checked
 //! output slot, but deliberately contains no target-language text.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use minijinja::Value;
@@ -14,7 +15,7 @@ use crate::errors::CodegenError;
 
 #[derive(Debug)]
 struct ProgramMetadata {
-    output_targets: Vec<Option<Box<[usize]>>>,
+    output_targets: Vec<Option<Range<usize>>>,
     output_count: usize,
     temporary_count: usize,
 }
@@ -114,13 +115,27 @@ impl Object for PlanProgramValue {
                 .program_span(self.index)
                 .map(Value::from_serialize),
             "output_count" => Some(Value::from(metadata.output_count)),
+            "output_indices" => Some(Value::from_serialize(
+                metadata
+                    .output_targets
+                    .iter()
+                    .flatten()
+                    .flat_map(|range| self.block.output_indices()[range.clone()].iter().copied())
+                    .collect::<Vec<_>>(),
+            )),
             "temporary_count" => Some(Value::from(metadata.temporary_count)),
             _ => None,
         }
     }
 
     fn enumerate(self: &Arc<Self>) -> Enumerator {
-        Enumerator::Str(&["ops", "span", "output_count", "temporary_count"])
+        Enumerator::Str(&[
+            "ops",
+            "span",
+            "output_count",
+            "output_indices",
+            "temporary_count",
+        ])
     }
 }
 
@@ -173,9 +188,22 @@ impl Object for PlanOpValue {
     }
 
     fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        if key.as_str()? == "output_span" {
+            let span = self
+                .block
+                .program_output_span(self.program_index, self.op_index)?;
+            return Some(minijinja::context! {
+                start => span.start(),
+                stride => span.stride(),
+                descending => span.descending(),
+                count => span.count(),
+            });
+        }
         op_field(
             self.op(),
-            self.metadata[self.program_index].output_targets[self.op_index].as_deref(),
+            self.metadata[self.program_index].output_targets[self.op_index]
+                .as_ref()
+                .map(|range| &self.block.output_indices()[range.clone()]),
             key.as_str()?,
         )
     }
@@ -245,28 +273,21 @@ fn take_output_target(
     output_indices: &[usize],
     output_ordinal: &mut usize,
     output_count: &mut usize,
-) -> Result<Option<Box<[usize]>>, CodegenError> {
-    let count = match op {
-        solve::LinearOp::StoreOutput { .. } => 1,
-        solve::LinearOp::StoreOutputRange { count, .. } => *count,
-        _ => 0,
-    };
+) -> Result<Option<Range<usize>>, CodegenError> {
+    let count = output_arity(op);
     if count == 0 {
         return no_output_target();
     }
     let end = output_ordinal
         .checked_add(count)
         .ok_or_else(|| CodegenError::template("scalar program plan output ordinal overflow"))?;
-    let targets = output_indices
-        .get(*output_ordinal..end)
-        .ok_or_else(|| {
-            CodegenError::template(format!(
-                "scalar program plan is missing output mappings #{}..{}",
-                *output_ordinal, end
-            ))
-        })?
-        .to_vec()
-        .into_boxed_slice();
+    output_indices.get(*output_ordinal..end).ok_or_else(|| {
+        CodegenError::template(format!(
+            "scalar program plan is missing output mappings #{}..{}",
+            *output_ordinal, end
+        ))
+    })?;
+    let targets = *output_ordinal..end;
     *output_ordinal = end;
     *output_count = output_count
         .checked_add(count)
@@ -274,7 +295,26 @@ fn take_output_target(
     Ok(Some(targets))
 }
 
-fn no_output_target() -> Result<Option<Box<[usize]>>, CodegenError> {
+/// Width of one checked output instruction, shared by blocks and nested regions.
+pub(super) fn output_arity(op: &solve::LinearOp) -> usize {
+    match op {
+        solve::LinearOp::StoreOutput { .. } => 1,
+        solve::LinearOp::StoreOutputRange { count, .. }
+        | solve::LinearOp::StoreOutputFunctionFold { count, .. } => *count,
+        solve::LinearOp::StoreOutputFoldTensorUpdate {
+            dimensions, lanes, ..
+        } => {
+            dimensions
+                .iter()
+                .map(|extent| *extent as usize)
+                .product::<usize>()
+                * lanes
+        }
+        _ => 0,
+    }
+}
+
+fn no_output_target() -> Result<Option<Range<usize>>, CodegenError> {
     Ok(Option::None)
 }
 
@@ -296,10 +336,27 @@ pub(super) fn op_field(
     match key {
         "kind" => return Some(Value::from(op.kind_name())),
         "dst" => return op.dst_register().map(|value| Value::from(value as usize)),
+        // First region-local output a multi-output fold store writes.
+        "output_start" => {
+            return output_targets
+                .and_then(<[usize]>::first)
+                .map(|v| Value::from(*v));
+        }
         _ => {}
+    }
+    if key == "output_indices" && output_arity(op) > 0 {
+        return output_targets.map(Value::from_serialize);
     }
     load_field(op, key)
         .or_else(|| match op {
+            solve::LinearOp::PureCallObservation {
+                input_starts, site, ..
+            } => match key {
+                "input_starts" => Some(Value::from_serialize(input_starts)),
+                "owner" => Some(Value::from(site.value_site().owner().index())),
+                "predicate_outputs" => Some(Value::from_serialize(site.predicate_outputs())),
+                _ => None,
+            },
             solve::LinearOp::PureCall {
                 input_starts, site, ..
             } => match key {
@@ -432,7 +489,8 @@ fn load_field(op: &solve::LinearOp, key: &str) -> Option<Value> {
             "capture_count" => Some(Value::from(program.capture_count)),
             "register_count" => Some(Value::from(program.register_count)),
             "domain" => Some(Value::from_serialize(&program.domain)),
-            "update" => Some(Value::from_serialize(&program.update)),
+            "update" => Some(super::scalar_region_plan::fold_update_value(program)),
+            "continuation" => Some(super::scalar_region_plan::fold_continuation_value(program)),
             _ => None,
         },
         LinearOp::GuardedFunctionFold {
@@ -449,7 +507,8 @@ fn load_field(op: &solve::LinearOp, key: &str) -> Option<Value> {
             "capture_count" => Some(Value::from(program.capture_count)),
             "register_count" => Some(Value::from(program.register_count)),
             "domain" => Some(Value::from_serialize(&program.domain)),
-            "update" => Some(Value::from_serialize(&program.update)),
+            "update" => Some(super::scalar_region_plan::fold_update_value(program)),
+            "continuation" => Some(super::scalar_region_plan::fold_continuation_value(program)),
             _ => None,
         },
         LinearOp::FunctionConditional {
@@ -506,7 +565,8 @@ fn load_field(op: &solve::LinearOp, key: &str) -> Option<Value> {
             "capture_count" => Some(Value::from(program.capture_count)),
             "register_count" => Some(Value::from(program.register_count)),
             "domain" => Some(Value::from_serialize(&program.domain)),
-            "update" => Some(Value::from_serialize(&program.update)),
+            "update" => Some(super::scalar_region_plan::fold_update_value(program)),
+            "continuation" => Some(super::scalar_region_plan::fold_continuation_value(program)),
             "result_base" => Some(Value::from(result_base)),
             "count" => Some(Value::from(count)),
             "condition" => condition.map(|condition| Value::from(condition as usize)),
@@ -917,9 +977,14 @@ pub(super) fn op_keys(op: &solve::LinearOp) -> &'static [&'static str] {
         }
         LinearOp::Select { .. } => &["kind", "dst", "cond", "if_true", "if_false"],
         LinearOp::StoreOutput { .. } => &["kind", "src", "output_index"],
-        LinearOp::StoreOutputRange { .. } => {
-            &["kind", "start", "count", "stride", "output_indices"]
-        }
+        LinearOp::StoreOutputRange { .. } => &[
+            "kind",
+            "start",
+            "count",
+            "stride",
+            "output_indices",
+            "output_span",
+        ],
         LinearOp::TableBounds { .. } => &["kind", "dst", "table_id", "max"],
         LinearOp::TableLookup { .. } | LinearOp::TableLookupSlope { .. } => {
             &["kind", "dst", "table_id", "column", "input"]
@@ -956,6 +1021,7 @@ pub(super) fn op_keys(op: &solve::LinearOp) -> &'static [&'static str] {
             "register_count",
             "domain",
             "update",
+            "continuation",
         ],
         LinearOp::GuardedFunctionFold { .. } => &[
             "kind",
@@ -968,6 +1034,7 @@ pub(super) fn op_keys(op: &solve::LinearOp) -> &'static [&'static str] {
             "register_count",
             "domain",
             "update",
+            "continuation",
         ],
         LinearOp::FunctionConditional { .. } => &[
             "kind",
@@ -980,11 +1047,15 @@ pub(super) fn op_keys(op: &solve::LinearOp) -> &'static [&'static str] {
             "fallback_register_count",
             "fallback",
         ],
+        LinearOp::PureCallObservation { .. } => {
+            &["kind", "dst", "input_starts", "owner", "predicate_outputs"]
+        }
         LinearOp::PureCall { .. } | LinearOp::PureCallDirectional { .. } => {
             &["kind", "dst", "input_starts", "owner"]
         }
         LinearOp::StoreOutputFoldTensorUpdate { .. } => &[
             "kind",
+            "output_start",
             "source_base",
             "source_stride",
             "dimensions",
@@ -992,9 +1063,11 @@ pub(super) fn op_keys(op: &solve::LinearOp) -> &'static [&'static str] {
             "nodes",
             "result",
             "lanes",
+            "output_indices",
         ],
         LinearOp::StoreOutputFunctionFold { .. } => &[
             "kind",
+            "output_start",
             "initial",
             "capture_start",
             "carried_count",
@@ -1002,10 +1075,12 @@ pub(super) fn op_keys(op: &solve::LinearOp) -> &'static [&'static str] {
             "register_count",
             "domain",
             "update",
+            "continuation",
             "result_base",
             "count",
             "condition",
             "nested_when_true",
+            "output_indices",
         ],
     }
 }

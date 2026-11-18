@@ -7,7 +7,9 @@
 
 mod diagnostics;
 mod entry;
+#[cfg(any(feature = "fmi", feature = "solver-diffsol", feature = "solver-rk45"))]
 mod fmi;
+mod linearization;
 mod overrides;
 mod probe;
 mod structure_report;
@@ -17,10 +19,20 @@ mod structure_report;
 pub use rumoca_phase_structural::{BlockReport, StructuralReport, TearingReport};
 pub use rumoca_solver::{EvalAtReport, EvalAtSlot, JacobianReport};
 
-pub use diagnostics::SimulationDiagnosticError;
-pub use entry::{lower_dae_for_gpu_preparation, lower_dae_for_simulation};
+// The parameter-selection decision is owned by the Solve lowering phase.
+pub use rumoca_ir_solve::{ExcludedParameter, ExclusionReason, ParameterClassification};
+pub use rumoca_phase_solve::{independent_tunable_parameters, select_sensitivity_parameters};
+
+pub use diagnostics::{
+    EX010_SESSION_PROTOCOL_VERSION, EX011_SESSION_MALFORMED_COMMAND,
+    EX012_SESSION_INVALID_ARGUMENT, SimulationDiagnosticError,
+};
+pub use entry::{
+    lower_dae_for_gpu_preparation, lower_dae_for_native_preparation, lower_dae_for_simulation,
+};
 #[cfg(feature = "fmi")]
-pub use fmi::lower_fmi_component;
+pub use fmi::{lower_fmi_c_export_component, lower_fmi_component, lower_fmi_export_component};
+pub use linearization::{Linearization, linearization_for_dae};
 pub use probe::{
     EvalAtProbe, JacobianProbe, ObjectiveGradientProbe, ParameterJacobianProbe,
     StateAndParameterJacobianProbe, SteadyStateSensitivityProbe, eval_dae_at, jacobian_for_dae,
@@ -40,6 +52,7 @@ pub(crate) use fmi::{finish_runtime_fmi_artifact, lower_runtime_fmi_artifact};
 #[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
 pub(crate) use overrides::{apply_correlated_simulation_overrides, tunable_param_overrides};
 pub use overrides::{
+    lower_correlated_for_native_execution_with_overrides,
     lower_correlated_for_simulation_with_overrides, lower_for_differentiation_with_overrides,
     lower_for_simulation_with_overrides,
 };

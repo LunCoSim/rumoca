@@ -1,4 +1,5 @@
 use indexmap::IndexMap;
+use rumoca_core::VarName;
 use rumoca_ir_dae as dae;
 use rumoca_ir_solve as solve;
 
@@ -7,6 +8,9 @@ use crate::lower::call_scoped_actions::CallScopedActionCollector;
 
 mod relation_memory;
 use relation_memory::BufferedRelations;
+mod quotient_memory;
+use quotient_memory::BufferedQuotients;
+pub(crate) use quotient_memory::{QuotientMemory, quotient_step_operator};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum StorageClass {
@@ -28,6 +32,7 @@ pub(crate) struct LoweredLayout<'dae> {
     pub(crate) previous_values: Vec<usize>,
     pub(crate) condition_memory: Vec<usize>,
     pub(crate) buffered_relations: BufferedRelations<'dae>,
+    pub(crate) buffered_quotients: BufferedQuotients<'dae>,
     pub(crate) clock_activations: Vec<usize>,
     pub(crate) delay_values: Vec<usize>,
     pub(crate) layout: solve::VarLayout,
@@ -36,12 +41,42 @@ pub(crate) struct LoweredLayout<'dae> {
     /// Exact pure-call owners issued atomically at the DAE expression boundary.
     pub(crate) pure_calls:
         std::cell::RefCell<crate::lower::typed_functions::PureCallRegistry<'dae>>,
+    /// Whether a call-scoped assertion owns an event root, decided once for
+    /// the model's product.
+    pub(crate) assertion_roots: AssertionRoots,
+    /// The execution family the model is lowered for.
+    pub(crate) refresh_profile: crate::RefreshProfile,
     pub(crate) marker: std::marker::PhantomData<&'dae mut &'dae ()>,
+}
+
+/// Who raises an error-level call assertion of one model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AssertionRoots {
+    /// A continuous solver with event iteration localizes the failing crossing
+    /// through an event root.
+    Event,
+    /// The stateless native assignment schedule has no solver and no event
+    /// iteration: the typed owners' value rows record the failed assertion and
+    /// the publication boundary raises it, so no relation root exists.
+    StatusChannel,
+}
+
+impl AssertionRoots {
+    /// The owner of the decision: the native product of a model with no
+    /// continuous states.
+    pub(crate) fn of_product(profile: crate::RefreshProfile, state_scalars: usize) -> Self {
+        if profile == crate::RefreshProfile::NativeCompact && state_scalars == 0 {
+            Self::StatusChannel
+        } else {
+            Self::Event
+        }
+    }
 }
 
 struct RuntimeLayout<'dae> {
     condition_memory: Vec<usize>,
     buffered_relations: BufferedRelations<'dae>,
+    buffered_quotients: BufferedQuotients<'dae>,
     clock_activations: Vec<usize>,
     delay_values: Vec<usize>,
     initial_event_parameter_index: Option<usize>,
@@ -90,11 +125,11 @@ pub(crate) fn lower_layout<'dae>(
         &mut shape_spans,
         &mut variables,
     )?;
-    let pre = append_pre_variables(view, &variables, p.names.len())?;
+    let pre = append_pre_variables(view, &variables, p.scalar_count)?;
 
-    let y_scalars = y.names.len();
-    let runtime = append_runtime_layout(view, p.names.len(), pre.scalar_count)?;
-    let layout = solve::VarLayout::from_parts_with_shapes_and_spans(
+    let y_scalars = y.scalar_count;
+    let runtime = append_runtime_layout(view, p.scalar_count, pre.scalar_count)?;
+    let layout = solve::VarLayout::from_interned_parts_with_shapes_and_spans(
         bindings,
         shapes,
         shape_spans,
@@ -109,21 +144,21 @@ pub(crate) fn lower_layout<'dae>(
                 .unwrap_or_else(|| first_model_span(view)),
         )
     })?;
-    let solver_maps = solve::SolverNameIndexMaps {
-        name_to_idx: y
-            .names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| (name.clone(), index))
-            .collect(),
-        base_to_indices: solver_base_indices(view, &variables),
-        names: y.names,
-    };
+    for (_, variable) in view.variables() {
+        if layout
+            .derive_array_element_binding(variable.name().as_str())
+            .is_some()
+        {
+            return Err(LowerError::contract(
+                format!("duplicate scalar layout name `{}`", variable.name()),
+                variable.declaration().span(),
+            ));
+        }
+    }
     let causal_definitions = rumoca_phase_structural::CausalDefinitions::derive(view);
     let (variable_storage_runs, variable_declarations) =
         solve_variable_declarations(view, &variables, &causal_definitions)?;
     let solve_layout = solve::SolveLayout {
-        solver_maps,
         variable_storage_runs,
         variable_declarations,
         state_scalar_count: y.state_count,
@@ -147,12 +182,15 @@ pub(crate) fn lower_layout<'dae>(
         previous_values: pre.previous_values,
         condition_memory: runtime.condition_memory,
         buffered_relations: runtime.buffered_relations,
+        buffered_quotients: runtime.buffered_quotients,
         clock_activations: runtime.clock_activations,
         delay_values: runtime.delay_values,
         layout,
         solve_layout,
         call_scoped_actions: std::cell::RefCell::default(),
         pure_calls: std::cell::RefCell::new(crate::lower::typed_functions::PureCallRegistry::new()),
+        assertion_roots: AssertionRoots::Event,
+        refresh_profile: crate::RefreshProfile::default(),
         marker: std::marker::PhantomData,
     })
 }
@@ -256,10 +294,17 @@ fn append_runtime_layout<'dae>(
         .ok_or_else(|| LowerError::contract("parameter layout overflow", first_model_span(view)))?;
     let (delay_values, after_delays) = append_delay_values(view, after_clocks)?;
     let buffered_relations = BufferedRelations::construct(view, after_delays)?;
-    let flags = append_runtime_flags(view, buffered_relations.end())?;
+    let buffered_quotients =
+        BufferedQuotients::construct(view, buffered_relations.end(), &buffered_relations)?;
+    let flags = append_runtime_flags(
+        view,
+        buffered_quotients.end(),
+        buffered_relations.continuous_root_count() != 0,
+    )?;
     Ok(RuntimeLayout {
         condition_memory,
         buffered_relations,
+        buffered_quotients,
         clock_activations,
         delay_values,
         initial_event_parameter_index: flags.initial_event_parameter_index,
@@ -296,10 +341,12 @@ fn append_delay_values(
 fn append_runtime_flags(
     view: dae::DaeView<'_>,
     first_index: usize,
+    has_buffered_relations: bool,
 ) -> Result<RuntimeFlags, LowerError> {
-    let has_initial = view
-        .conditions()
-        .any(|(_, condition)| matches!(condition.operation(), dae::ConditionOperation::Initial));
+    let has_initial = has_buffered_relations
+        || view.conditions().any(|(_, condition)| {
+            matches!(condition.operation(), dae::ConditionOperation::Initial)
+        });
     let after_initial = first_index
         .checked_add(usize::from(has_initial))
         .ok_or_else(|| LowerError::contract("parameter layout overflow", first_model_span(view)))?;
@@ -587,7 +634,7 @@ fn previous_schedule<'dae>(
 }
 
 struct YColumns {
-    names: Vec<String>,
+    scalar_count: usize,
     state_count: usize,
     algebraic_count: usize,
     output_count: usize,
@@ -595,13 +642,13 @@ struct YColumns {
 
 fn append_y_variables(
     view: dae::DaeView<'_>,
-    bindings: &mut IndexMap<String, solve::ScalarSlot>,
-    shapes: &mut IndexMap<String, Vec<usize>>,
-    shape_spans: &mut IndexMap<String, rumoca_core::Span>,
+    bindings: &mut IndexMap<VarName, solve::ScalarSlot>,
+    shapes: &mut IndexMap<VarName, Vec<usize>>,
+    shape_spans: &mut IndexMap<VarName, rumoca_core::Span>,
     slots: &mut [VariableSlot],
 ) -> Result<YColumns, LowerError> {
     let mut columns = YColumns {
-        names: Vec::new(),
+        scalar_count: 0,
         state_count: 0,
         algebraic_count: 0,
         output_count: 0,
@@ -615,14 +662,14 @@ fn append_y_variables(
             .variables()
             .filter(|(_, variable)| variable.role() == role)
         {
-            let base = columns.names.len();
-            insert_scalar_bindings(
-                bindings,
-                &mut columns.names,
-                variable,
-                StorageClass::Y,
-                base,
-            )?;
+            let base = columns.scalar_count;
+            columns.scalar_count = base.checked_add(variable.scalar_count()).ok_or_else(|| {
+                LowerError::contract(
+                    "Y layout scalar extent overflow",
+                    variable.declaration().span(),
+                )
+            })?;
+            insert_scalar_bindings(bindings, |_| {}, variable, StorageClass::Y, base)?;
             record_shape(shapes, shape_spans, variable);
             slots[id.index() as usize] = VariableSlot {
                 storage: StorageClass::Y,
@@ -643,24 +690,25 @@ fn append_y_variables(
 }
 
 struct PColumns {
-    names: Vec<String>,
+    /// The number of scalar columns; the names live in the layout bindings.
+    scalar_count: usize,
     parameter_count: usize,
-    input_names: Vec<String>,
+    input_names: solve::SolveScalarNames,
     discrete_real_names: Vec<String>,
     discrete_value_names: Vec<String>,
 }
 
 fn append_p_variables(
     view: dae::DaeView<'_>,
-    bindings: &mut IndexMap<String, solve::ScalarSlot>,
-    shapes: &mut IndexMap<String, Vec<usize>>,
-    shape_spans: &mut IndexMap<String, rumoca_core::Span>,
+    bindings: &mut IndexMap<VarName, solve::ScalarSlot>,
+    shapes: &mut IndexMap<VarName, Vec<usize>>,
+    shape_spans: &mut IndexMap<VarName, rumoca_core::Span>,
     slots: &mut [VariableSlot],
 ) -> Result<PColumns, LowerError> {
     let mut columns = PColumns {
-        names: Vec::new(),
+        scalar_count: 0,
         parameter_count: 0,
-        input_names: Vec::new(),
+        input_names: solve::SolveScalarNames::default(),
         discrete_real_names: Vec::new(),
         discrete_value_names: Vec::new(),
     };
@@ -675,20 +723,15 @@ fn append_p_variables(
             .variables()
             .filter(|(_, variable)| variable.role() == role)
         {
-            let base = columns.names.len();
-            insert_scalar_bindings(
-                bindings,
-                &mut columns.names,
-                variable,
-                StorageClass::P,
-                base,
-            )?;
+            let base = columns.scalar_count;
+            insert_scalar_bindings(bindings, |_| {}, variable, StorageClass::P, base)?;
             record_shape(shapes, shape_spans, variable);
             slots[id.index() as usize] = VariableSlot {
                 storage: StorageClass::P,
                 base,
                 count: variable.scalar_count(),
             };
+            columns.scalar_count += variable.scalar_count();
             append_parameter_role_names(&mut columns, variable)?;
         }
     }
@@ -699,16 +742,27 @@ fn append_parameter_role_names(
     columns: &mut PColumns,
     variable: dae::VariableView<'_>,
 ) -> Result<(), LowerError> {
-    let names = variable_scalar_names(variable)?;
-    if variable.causality() == dae::VariableCausality::Input {
-        columns.input_names.extend(names);
+    if variable.causality() != dae::VariableCausality::Input
+        && matches!(
+            variable.role(),
+            dae::VariableRole::Parameter | dae::VariableRole::Constant
+        )
+    {
+        // A plain parameter is only counted; the bindings already name it.
+        columns.parameter_count += variable.scalar_count();
         return Ok(());
     }
+    if variable.causality() == dae::VariableCausality::Input
+        || variable.role() == dae::VariableRole::Input
+    {
+        return push_input_declaration(columns, variable);
+    }
+    let names = variable_scalar_names(variable)?;
     match variable.role() {
         dae::VariableRole::Parameter | dae::VariableRole::Constant => {
-            columns.parameter_count += names.len();
+            unreachable!("plain parameters return above")
         }
-        dae::VariableRole::Input => columns.input_names.extend(names),
+        dae::VariableRole::Input => {}
         dae::VariableRole::DiscreteReal => columns.discrete_real_names.extend(names),
         dae::VariableRole::DiscreteValue => columns.discrete_value_names.extend(names),
         dae::VariableRole::State | dae::VariableRole::Algebraic | dae::VariableRole::Output => {
@@ -719,8 +773,8 @@ fn append_parameter_role_names(
 }
 
 fn insert_scalar_bindings(
-    bindings: &mut IndexMap<String, solve::ScalarSlot>,
-    names: &mut Vec<String>,
+    bindings: &mut IndexMap<VarName, solve::ScalarSlot>,
+    mut keep_name: impl FnMut(String),
     variable: dae::VariableView<'_>,
     storage: StorageClass,
     base: usize,
@@ -730,12 +784,13 @@ fn insert_scalar_bindings(
             StorageClass::Y => solve::scalar_slot_y(base),
             StorageClass::P => solve::scalar_slot_p(base),
         };
-        if bindings.insert(variable.name().to_string(), slot).is_some() {
+        if bindings.insert(variable.name().clone(), slot).is_some() {
             return Err(LowerError::contract(
                 format!("duplicate aggregate layout name `{}`", variable.name()),
                 variable.declaration().span(),
             ));
         }
+        return Ok(());
     }
     for scalar in 0..variable.scalar_count() {
         let name = variable.scalar_name(scalar).ok_or_else(|| {
@@ -757,26 +812,26 @@ fn insert_scalar_bindings(
             StorageClass::Y => solve::scalar_slot_y(index),
             StorageClass::P => solve::scalar_slot_p(index),
         };
-        if bindings.insert(name.clone(), slot).is_some() {
+        if bindings.insert(VarName::intern(&name), slot).is_some() {
             return Err(LowerError::contract(
                 format!("duplicate scalar layout name `{name}`"),
                 variable.declaration().span(),
             ));
         }
-        names.push(name);
+        keep_name(name);
     }
     Ok(())
 }
 
 fn record_shape(
-    shapes: &mut IndexMap<String, Vec<usize>>,
-    spans: &mut IndexMap<String, rumoca_core::Span>,
+    shapes: &mut IndexMap<VarName, Vec<usize>>,
+    spans: &mut IndexMap<VarName, rumoca_core::Span>,
     variable: dae::VariableView<'_>,
 ) {
     if variable.value_type().is_scalar() {
         return;
     }
-    let name = variable.name().to_string();
+    let name = variable.name().clone();
     shapes.insert(
         name.clone(),
         variable
@@ -789,6 +844,31 @@ fn record_shape(
     spans.insert(name, variable.declaration().span());
 }
 
+/// Retain one name and shape for the declaration; scalar names derive from them.
+fn push_input_declaration(
+    columns: &mut PColumns,
+    variable: dae::VariableView<'_>,
+) -> Result<(), LowerError> {
+    let span = variable.declaration().span();
+    if variable.scalar_count() != 0 && variable.scalar_name(0).is_none() {
+        return Err(LowerError::contract(
+            format!(
+                "checked variable `{}` has no scalar name at ordinal 0",
+                variable.name()
+            ),
+            span,
+        ));
+    }
+    let run = solve::SolveScalarNameRun::new(
+        variable.name().to_string(),
+        variable.value_type().dimensions().to_vec(),
+    );
+    columns
+        .input_names
+        .push_run(run)
+        .map_err(|error| LowerError::contract(error.to_string(), span))
+}
+
 fn variable_scalar_names(variable: dae::VariableView<'_>) -> Result<Vec<String>, LowerError> {
     (0..variable.scalar_count())
         .map(|scalar| {
@@ -799,23 +879,6 @@ fn variable_scalar_names(variable: dae::VariableView<'_>) -> Result<Vec<String>,
                         variable.name()
                     ),
                     variable.declaration().span(),
-                )
-            })
-        })
-        .collect()
-}
-
-fn solver_base_indices(
-    view: dae::DaeView<'_>,
-    variables: &[VariableSlot],
-) -> IndexMap<String, Vec<usize>> {
-    view.variables()
-        .filter_map(|(id, variable)| {
-            let slot = variables[id.index() as usize];
-            matches!(slot.storage, StorageClass::Y).then(|| {
-                (
-                    variable.name().to_string(),
-                    (slot.base..slot.base + slot.count).collect(),
                 )
             })
         })

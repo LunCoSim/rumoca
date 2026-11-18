@@ -14,6 +14,8 @@
 mod selected_tests;
 
 use nalgebra::DMatrix;
+
+use super::BlockJacobian;
 #[cfg(test)]
 use rumoca_eval_solve::dense_basis::DenseStageMatrix;
 use rumoca_ir_solve as solve;
@@ -65,7 +67,7 @@ pub(crate) trait ManifoldProjectionModel {
     fn manifold_projection_block_structure(
         &self,
         _block_index: usize,
-    ) -> Option<&solve::JacobianStructure> {
+    ) -> Option<&solve::ColoredJacobianStructure> {
         None
     }
 
@@ -258,7 +260,7 @@ fn validate_manifold_projection_plan(
     }
     let mut rows_seen = vec![false; residual_len];
     let mut states_seen = vec![false; state_count];
-    for block in &plan.blocks {
+    for block in plan.blocks.scalar_blocks() {
         if block.rows.is_empty()
             || block.y_indices.is_empty()
             || block.rows.len() > block.y_indices.len()
@@ -314,7 +316,7 @@ fn project_state_manifold_inner<M: ManifoldProjectionModel>(
     for _ in 0..max_iters {
         let mut settled = true;
         let mut changed = false;
-        for (block_index, block) in plan.blocks.iter().enumerate() {
+        for (block_index, block) in plan.blocks.scalar_blocks().iter().enumerate() {
             let update = project_manifold_block(model, y, p, t, block, block_index, tol)?;
             settled &= update.settled;
             changed |= update.changed;
@@ -344,7 +346,7 @@ fn project_state_manifold_inner<M: ManifoldProjectionModel>(
 struct ManifoldBlockEvaluation {
     full_residual: Vec<f64>,
     residual: Vec<f64>,
-    jacobian: DMatrix<f64>,
+    jacobian: BlockJacobian,
     row_scales: Vec<f64>,
     variable_scales: Vec<f64>,
 }
@@ -368,7 +370,7 @@ fn evaluate_manifold_block<M: ManifoldProjectionModel>(
     let jacobian = manifold_block_jacobian(model, y, p, t, block, block_index)?;
     let structure = model
         .manifold_projection_block_structure(block_index)
-        .map(solve::JacobianStructure::pattern);
+        .map(solve::ColoredJacobianStructure::pattern);
     let (row_scales, variable_scales) = manifold_block_scales(model, block, &jacobian, structure);
     Ok(ManifoldBlockEvaluation {
         full_residual,
@@ -386,11 +388,11 @@ fn manifold_block_jacobian<M: ManifoldProjectionModel>(
     t: f64,
     block: &solve::AlgebraicProjectionBlock,
     block_index: usize,
-) -> Result<DMatrix<f64>, RuntimeSolveError> {
+) -> Result<BlockJacobian, RuntimeSolveError> {
     if let Some(structure) = model.manifold_projection_block_structure(block_index)
         && let Some(jacobian) = selected_manifold_jacobian(model, y, p, t, block, structure)?
     {
-        return Ok(jacobian);
+        return Ok(BlockJacobian::dense(jacobian));
     }
     let mut jacobian = DMatrix::zeros(block.rows.len(), block.y_indices.len());
     let mut seed = vec![0.0; y.len()];
@@ -404,7 +406,7 @@ fn manifold_block_jacobian<M: ManifoldProjectionModel>(
         seed[state] = 0.0;
         jvp.fill(0.0);
     }
-    Ok(jacobian)
+    Ok(BlockJacobian::dense(jacobian))
 }
 
 fn selected_manifold_jacobian<M: ManifoldProjectionModel>(
@@ -413,7 +415,7 @@ fn selected_manifold_jacobian<M: ManifoldProjectionModel>(
     p: &[f64],
     t: f64,
     block: &solve::AlgebraicProjectionBlock,
-    structure: &solve::JacobianStructure,
+    structure: &solve::ColoredJacobianStructure,
 ) -> Result<Option<DMatrix<f64>>, RuntimeSolveError> {
     let mut jacobian = DMatrix::zeros(block.rows.len(), block.y_indices.len());
     let column_rows = structure.column_rows();
@@ -459,7 +461,13 @@ pub(crate) fn certify_state_manifold<M: ManifoldProjectionModel>(
     t: f64,
     tol: f64,
 ) -> Result<(), RuntimeSolveError> {
-    for (index, block) in model.manifold_projection_plan().blocks.iter().enumerate() {
+    for (index, block) in model
+        .manifold_projection_plan()
+        .blocks
+        .scalar_blocks()
+        .iter()
+        .enumerate()
+    {
         let evaluated = evaluate_manifold_block(model, y, p, t, block, index)?;
         if !scaled_residual_converged(&evaluated.residual, &evaluated.row_scales, tol) {
             return Err(RuntimeSolveError::solve_ir(format!(
@@ -488,7 +496,7 @@ fn project_manifold_block<M: ManifoldProjectionModel>(
     } = evaluate_manifold_block(model, y, p, t, block, block_index)?;
     let structure = model
         .manifold_projection_block_structure(block_index)
-        .map(solve::JacobianStructure::pattern);
+        .map(solve::ColoredJacobianStructure::pattern);
     if scaled_residual_converged(&residual, &row_scales, tol) {
         return Ok(ProjectionBlockUpdate {
             changed: false,
@@ -497,6 +505,7 @@ fn project_manifold_block<M: ManifoldProjectionModel>(
     }
     let before = scaled_residual_norm(&residual, &row_scales);
     let Some(delta) = scaled_newton_delta(ScaledNewtonSystem {
+        revision: None,
         jacobian: &jacobian,
         residual: &residual,
         row_scales: &row_scales,
@@ -562,7 +571,7 @@ fn project_manifold_block<M: ManifoldProjectionModel>(
 fn manifold_block_scales<M: ManifoldProjectionModel>(
     model: &M,
     block: &solve::AlgebraicProjectionBlock,
-    jacobian: &DMatrix<f64>,
+    jacobian: &BlockJacobian,
     structure: Option<&solve::StructuralPattern>,
 ) -> (Vec<f64>, Vec<f64>) {
     let variable_scales = block
@@ -654,7 +663,7 @@ mod conditioning_tests {
     fn model() -> CircleChartManifold {
         CircleChartManifold {
             plan: solve::AlgebraicProjectionPlan {
-                blocks: vec![circle_block()],
+                blocks: (vec![circle_block()]).into(),
             },
         }
     }

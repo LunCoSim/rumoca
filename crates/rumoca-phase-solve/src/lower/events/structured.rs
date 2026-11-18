@@ -1,8 +1,11 @@
+mod selected_indices;
+
 use super::*;
+use std::collections::HashMap;
 
 pub(super) fn lower_discrete_value_owners<'dae>(
     view: dae::DaeView<'dae>,
-    layout: &LoweredLayout<'dae>,
+    layout: &EventCompilationContext<'_, 'dae>,
     clocks: &LoweredClocks<'dae>,
     rows: &mut DiscreteRows<'dae>,
 ) -> Result<(), LowerError> {
@@ -33,7 +36,7 @@ pub(super) fn lower_discrete_value_owners<'dae>(
                 ));
             }
             (_, Some(tick)) => {
-                lower_triggered_discrete_value_owner(view, layout, rows, owner, tick)?;
+                lower_triggered_discrete_value_owner(view, layout, clocks, rows, owner, tick)?;
             }
             (dae::DiscreteBranchActivation::Always, None) => {
                 lower_unconditional_discrete_value_owner(view, layout, clocks, rows, owner)?;
@@ -59,7 +62,7 @@ pub(super) fn lower_discrete_value_owners<'dae>(
 #[allow(clippy::too_many_lines)]
 fn lower_unconditional_discrete_value_owner<'dae>(
     view: dae::DaeView<'dae>,
-    layout: &LoweredLayout<'dae>,
+    layout: &EventCompilationContext<'_, 'dae>,
     clocks: &LoweredClocks<'dae>,
     rows: &mut DiscreteRows<'dae>,
     owner: dae::DiscreteValueOwnerView<'dae>,
@@ -107,40 +110,45 @@ fn lower_unconditional_discrete_value_owner<'dae>(
     // program whenever no member observes another member on the tick. Where a
     // member *does* observe another, the members stay separate producers and
     // the SOLVE-C57 issued order sequences them.
-    let fusable = || {
-        SameTickExchange::new(
+    let fusable = || -> Result<bool, LowerError> {
+        Ok(SameTickExchange::new(
             &owner_values
                 .iter()
-                .map(|entry| SameTickExchangeMember {
-                    targets: vec![entry.3.index()],
-                    entry_reads: BTreeSet::new(),
-                    reads: if entry.5 {
-                        BTreeSet::new()
-                    } else {
-                        rows.same_tick_definitions.read_closure(
-                            view,
-                            std::slice::from_ref(&entry.1),
-                            &[],
-                        )
-                    },
+                .map(|entry| {
+                    Ok(SameTickExchangeMember {
+                        event_reads: None,
+                        targets: vec![entry.3.index()],
+                        entry_reads: BTreeSet::new(),
+                        reads: if entry.5 {
+                            BTreeSet::new()
+                        } else {
+                            rows.same_tick_definitions.read_closure(
+                                view,
+                                std::slice::from_ref(&entry.1),
+                                &[],
+                            )?
+                        },
+                    })
                 })
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>, LowerError>>()?,
         )
-        .all_fusable()
+        .all_fusable())
     };
     if let Some((clock_id, solve_clock)) = owner_values.first().and_then(|entry| entry.4)
         && total_outputs > 1
-        && fusable()
+        && fusable()?
         && owner_values
             .iter()
             .all(|entry| entry.4 == Some((clock_id, solve_clock)) && entry.5 == owner_values[0].5)
     {
         let sampled = owner_values[0].5;
-        let program = ScalarCompiler::new(view, layout, None).clocked_aggregate_programs(
-            clock_id,
-            owner_values.iter().map(|entry| entry.1),
-            sampled,
-        )?;
+        let program = layout
+            .scalar_compiler(view, None)
+            .clocked_aggregate_programs(
+                clock_id,
+                owner_values.iter().map(|entry| entry.1),
+                sampled,
+            )?;
         let mut outputs = Vec::with_capacity(total_outputs);
         for &(_, value, span, variable, _, _, scalar_count) in &owner_values {
             let pre_mode = expression_pre_mode(view, value, sampled);
@@ -165,26 +173,61 @@ fn lower_unconditional_discrete_value_owner<'dae>(
             Vec::new(),
             owner_values[0].2,
         );
-        return rows.push_clocked_owner_group(
+        return rows.push_owner_group(
             program,
             &outputs,
             owner_values[0].2,
             solve::DiscreteRowRole::Equation,
-            solve_clock,
+            Some(solve_clock),
         );
     }
-    for (target, value, span, variable, clock, sampled, scalar_count) in owner_values {
+    let projected = if owner_values
+        .iter()
+        .any(|entry| entry.0.scalar_selection().is_some())
+    {
+        vec![false; owner_values.len()]
+    } else {
+        lower_call_projection_values(
+            view,
+            layout,
+            rows,
+            owner.observed(),
+            &owner_values
+                .iter()
+                .map(|entry| CallProjectionValue {
+                    value: entry.1,
+                    span: entry.2,
+                    variable: entry.3,
+                    scalar_count: entry.6,
+                    unclocked: entry.4.is_none(),
+                })
+                .collect::<Vec<_>>(),
+        )?
+    };
+    for (index, (target, value, span, variable, clock, sampled, scalar_count)) in
+        owner_values.into_iter().enumerate()
+    {
+        if projected[index] {
+            continue;
+        }
         if let Some((clock_id, solve_clock)) = clock
             && scalar_count > 1
         {
-            let compiler = ScalarCompiler::new(view, layout, None);
+            let compiler = layout.scalar_compiler(view, None);
             let program = if sampled {
                 compiler.sampled_aggregate_program(clock_id, value)?
             } else {
                 compiler.clocked_aggregate_program(clock_id, value)?
             };
             let targets = (0..scalar_count)
-                .map(|scalar| variable_scalar_slot(layout, target.index(), scalar, span))
+                .map(|scalar| {
+                    variable_scalar_slot(
+                        layout,
+                        target.index(),
+                        target.scalar_selection().unwrap_or(0) as usize + scalar,
+                        span,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let start_row = rows.targets.len();
             rows.record_clocked_producer(
@@ -213,15 +256,23 @@ fn lower_unconditional_discrete_value_owner<'dae>(
         }
         let first_row = rows.targets.len();
         for scalar in 0..scalar_count {
-            let program =
-                match clock {
-                    Some((clock, _)) if sampled => ScalarCompiler::new(view, layout, None)
-                        .sampled_program(clock, value, scalar)?,
-                    Some((clock, _)) => ScalarCompiler::new(view, layout, None)
-                        .clocked_program(clock, value, scalar)?,
-                    None => ScalarCompiler::new(view, layout, None).program(value, scalar)?,
-                };
-            let target = variable_scalar_slot(layout, target.index(), scalar, span)?;
+            let program = match clock {
+                Some((clock, _)) if sampled => layout
+                    .scalar_compiler(view, None)
+                    .sampled_program(clock, value, scalar)?,
+                Some((clock, _)) => layout
+                    .scalar_compiler(view, None)
+                    .clocked_program(clock, value, scalar)?,
+                None => layout
+                    .discrete_scalar_compiler(view, None)
+                    .program(value, scalar)?,
+            };
+            let target = variable_scalar_slot(
+                layout,
+                target.index(),
+                target.scalar_selection().unwrap_or(0) as usize + scalar,
+                span,
+            )?;
             rows.claim_scalar_event_owner(variable, target, span)?;
             let pre_mode = expression_pre_mode(view, value, sampled);
             if clock.is_none() && pre_mode == solve::DiscreteEventPreMode::FollowCurrent {
@@ -256,9 +307,89 @@ fn lower_unconditional_discrete_value_owner<'dae>(
     Ok(())
 }
 
+/// One value of an unconditional B.1c owner, as the call-projection lowering reads it.
+struct CallProjectionValue<'dae> {
+    value: dae::ExprId<'dae>,
+    span: Span,
+    variable: dae::VariableId<'dae>,
+    scalar_count: usize,
+    unclocked: bool,
+}
+
+/// Lower the unclocked values that project one pure call occurrence together.
+///
+/// A call occurrence is one evaluation of its callee. The values of an owner
+/// that read fields of the same occurrence are therefore one program that
+/// evaluates the call once and stores every projected scalar, wherever the
+/// values sit in the owner; a row program per scalar would evaluate the callee
+/// once per scalar. A program that calls a typed pure function reads storage
+/// the root-refresh dependency proof does not model, so these rows are never
+/// root-refresh candidates and need no per-scalar program for one.
+///
+/// Returns, per value, whether it was lowered here.
+fn lower_call_projection_values<'dae>(
+    view: dae::DaeView<'dae>,
+    layout: &EventCompilationContext<'_, 'dae>,
+    rows: &mut DiscreteRows<'dae>,
+    observed: bool,
+    values: &[CallProjectionValue<'dae>],
+) -> Result<Vec<bool>, LowerError> {
+    let mut handled = vec![false; values.len()];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of = HashMap::new();
+    for (index, entry) in values.iter().enumerate() {
+        if !entry.unclocked {
+            continue;
+        }
+        let Some(call) = crate::lower::pure_call_projection_root(view, entry.value) else {
+            continue;
+        };
+        let group = *group_of.entry(call).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[group].push(index);
+    }
+    for members in groups {
+        let scalars: usize = members
+            .iter()
+            .map(|&index| values[index].scalar_count)
+            .sum();
+        if scalars <= 1 {
+            continue;
+        }
+        let program = layout
+            .discrete_scalar_compiler(view, None)
+            .aggregate_program(members.iter().map(|&index| values[index].value))?;
+        let mut outputs = Vec::with_capacity(scalars);
+        for &index in &members {
+            let entry = &values[index];
+            let pre_mode = expression_pre_mode(view, entry.value, false);
+            for scalar in 0..entry.scalar_count {
+                let target =
+                    variable_scalar_slot(layout, entry.variable.index(), scalar, entry.span)?;
+                outputs.push((entry.variable, target, pre_mode));
+            }
+            handled[index] = true;
+        }
+        let first_row = rows.targets.len();
+        if observed {
+            rows.observed_rows.extend(first_row..first_row + scalars);
+        }
+        rows.push_owner_group(
+            program,
+            &outputs,
+            values[members[0]].span,
+            solve::DiscreteRowRole::Equation,
+            None,
+        )?;
+    }
+    Ok(handled)
+}
+
 fn lower_structured_discrete_value_owner<'dae>(
     view: dae::DaeView<'dae>,
-    layout: &LoweredLayout<'dae>,
+    layout: &EventCompilationContext<'_, 'dae>,
     clocks: &LoweredClocks<'dae>,
     rows: &mut DiscreteRows<'dae>,
     owner: dae::DiscreteValueOwnerView<'dae>,
@@ -298,6 +429,7 @@ fn lower_structured_discrete_value_owner<'dae>(
             structured_map_program(StructuredMapProgramInput {
                 view,
                 layout,
+                derivatives: layout.derivatives,
                 domain_id: structure.domain(),
                 domain: &domain,
                 scalar_view: structure.scalar_view(),
@@ -359,6 +491,7 @@ fn lower_structured_discrete_value_owner<'dae>(
 struct StructuredMapProgramInput<'scope, 'dae> {
     view: dae::DaeView<'dae>,
     layout: &'scope LoweredLayout<'dae>,
+    derivatives: &'scope super::super::ContinuousRowIndex<'dae>,
     domain_id: dae::DomainId<'dae>,
     domain: &'scope rumoca_core::StructuredIndexDomain,
     scalar_view: rumoca_core::ComprehensionScalarView,
@@ -368,7 +501,7 @@ struct StructuredMapProgramInput<'scope, 'dae> {
     span: Span,
 }
 
-type AffineProgramCertificate = (
+pub(in crate::lower) type AffineProgramCertificate = (
     Vec<solve::LinearOp>,
     Vec<solve::AffineStencilLoadStride>,
     Vec<solve::AffineStencilConstStride>,
@@ -412,8 +545,10 @@ fn structured_map_program(
             .ok_or_else(|| {
                 LowerError::contract("structured B.1c scalar view overflow", input.span)
             })?;
-        let compiler =
-            ScalarCompiler::new(input.view, input.layout, Some((input.domain_id, values)));
+        let mut compiler =
+            ScalarCompiler::new(input.view, input.layout, Some((input.domain_id, values)))
+                .with_derivative_definitions(input.derivatives);
+        compiler.bind_symbolic_domain(input.domain_id, Some(values), input.span)?;
         programs.push(match input.clock {
             Some((clock, _)) if input.sampled => {
                 compiler.sampled_program(clock, input.value, scalar)?
@@ -422,12 +557,14 @@ fn structured_map_program(
             None => compiler.program(input.value, scalar)?,
         });
     }
+    // The complete family comes from this exact issued source value/domain/view.
+    // Capture plumbing exposes index leaves; the unchanged certificate checks every point.
+    selected_indices::expose_selected_indices(&mut programs, input.span)?;
     derive_affine_program_certificate(input.domain, base_point, &points, &programs, input.span)
 }
 
 pub(in crate::lower) fn unclocked_structured_program<'dae>(
-    view: dae::DaeView<'dae>,
-    layout: &LoweredLayout<'dae>,
+    context: super::super::ContinuousContext<'_, 'dae>,
     domain_id: dae::DomainId<'dae>,
     domain: &rumoca_core::StructuredIndexDomain,
     scalar_view: rumoca_core::ComprehensionScalarView,
@@ -435,8 +572,9 @@ pub(in crate::lower) fn unclocked_structured_program<'dae>(
     span: Span,
 ) -> Result<AffineProgramCertificate, LowerError> {
     structured_map_program(StructuredMapProgramInput {
-        view,
-        layout,
+        view: context.view,
+        layout: context.layout,
+        derivatives: context.derivatives,
         domain_id,
         domain,
         scalar_view,
@@ -447,7 +585,10 @@ pub(in crate::lower) fn unclocked_structured_program<'dae>(
     })
 }
 
-fn derive_affine_program_certificate(
+/// The compact program of a family whose per-point `programs` (in domain
+/// order) are one base program with affine load and constant strides; every
+/// point is checked against the derived strides.
+pub(in crate::lower) fn derive_affine_program_certificate(
     domain: &rumoca_core::StructuredIndexDomain,
     base_point: &[i64],
     points: &[Vec<i64>],
@@ -455,8 +596,20 @@ fn derive_affine_program_certificate(
     span: Span,
 ) -> Result<AffineProgramCertificate, LowerError> {
     let base = &programs[0];
-    if programs.iter().any(|program| program.len() != base.len()) {
-        return Err(non_affine_structured_program(span));
+    if let Some((point, program)) = programs
+        .iter()
+        .enumerate()
+        .find(|(_, program)| program.len() != base.len())
+    {
+        return Err(LowerError::non_computable(
+            format!(
+                "structured B.1c body does not have one proven affine scalar program: \
+                 point {point} has {} operations; base has {}",
+                program.len(),
+                base.len()
+            ),
+            span,
+        ));
     }
     let offsets = points
         .iter()
@@ -481,11 +634,18 @@ fn derive_affine_program_certificate(
             if !terms.is_empty() {
                 const_strides.push(solve::AffineStencilConstStride { op_position, terms });
             }
-        } else if programs
+        } else if let Some((point, program)) = programs
             .iter()
-            .any(|program| program[op_position] != *base_op)
+            .enumerate()
+            .find(|(_, program)| program[op_position] != *base_op)
         {
-            return Err(non_affine_structured_program(span));
+            return Err(non_affine_structured_operation(
+                point,
+                op_position,
+                base_op,
+                &program[op_position],
+                span,
+            ));
         }
     }
     Ok((base.clone(), load_strides, const_strides))
@@ -674,6 +834,58 @@ fn infer_const_terms(
         .collect())
 }
 
+fn non_affine_structured_operation(
+    point: usize,
+    position: usize,
+    base: &solve::LinearOp,
+    actual: &solve::LinearOp,
+    span: Span,
+) -> LowerError {
+    let detail = match (base, actual) {
+        (
+            solve::LinearOp::PureCall {
+                input_starts: base_inputs,
+                site: base_site,
+                ..
+            },
+            solve::LinearOp::PureCall {
+                input_starts: actual_inputs,
+                site: actual_site,
+                ..
+            },
+        ) => format!(
+            "call owners {:?}/{:?}, input counts {}/{}, first differing input {:?}",
+            base_site.owner(),
+            actual_site.owner(),
+            base_inputs.len(),
+            actual_inputs.len(),
+            base_inputs
+                .iter()
+                .zip(actual_inputs.iter())
+                .position(|(base, actual)| base != actual)
+        ),
+        (
+            solve::LinearOp::StoreOutput { src: base },
+            solve::LinearOp::StoreOutput { src: actual },
+        ) => format!("output registers {base}/{actual}"),
+        _ => String::new(),
+    };
+    LowerError::non_computable(
+        format!(
+            "structured B.1c body does not have one proven affine scalar program: \
+             point {point}, operation {position}: {}/{}, destinations {:?}/{:?}, \
+             widths {}/{}; {detail}",
+            base.kind_name(),
+            actual.kind_name(),
+            base.dst_register(),
+            actual.dst_register(),
+            base.dst_register_count(),
+            actual.dst_register_count(),
+        ),
+        span,
+    )
+}
+
 fn non_affine_structured_program(span: Span) -> LowerError {
     LowerError::non_computable(
         "structured B.1c body does not have one proven affine scalar program",
@@ -683,19 +895,31 @@ fn non_affine_structured_program(span: Span) -> LowerError {
 
 fn lower_conditional_discrete_value_owner<'dae>(
     view: dae::DaeView<'dae>,
-    layout: &LoweredLayout<'dae>,
+    layout: &EventCompilationContext<'_, 'dae>,
     clocks: &LoweredClocks<'dae>,
     rows: &mut DiscreteRows<'dae>,
     owner: dae::DiscreteValueOwnerView<'dae>,
 ) -> Result<(), LowerError> {
     let mut lowered = Vec::new();
+    let common_clock = common_periodic_clock(
+        view,
+        owner
+            .branches()
+            .iter()
+            .map(|branch| match branch.activation() {
+                dae::DiscreteBranchActivation::When { guard, .. } => {
+                    condition_clock_owner(view, guard)
+                }
+                dae::DiscreteBranchActivation::Always => None,
+            }),
+    );
     for (target_ordinal, target) in owner.targets().iter().enumerate() {
         let target_variable = dae::VariableId::from(target);
         let variable = view
             .variable(target_variable)
             .expect("checked B.1c target resolves");
         for branch in owner.branches().iter() {
-            let branch = lower_checked_discrete_value_branch(
+            let mut branch = lower_checked_discrete_value_branch(
                 view,
                 layout,
                 clocks,
@@ -703,28 +927,29 @@ fn lower_conditional_discrete_value_owner<'dae>(
                 target_ordinal,
                 branch,
             )?;
+            if is_ordinary_target(clocks, target_variable) && common_clock.is_none() {
+                branch.clock = None;
+            }
             record_guarded_target(
                 &mut lowered,
                 GuardedTargetMetadata {
                     variable: dae::VariableId::from(target),
                     target_base: branch.target_base,
-                    width: variable.scalar_count(),
+                    width: target
+                        .scalar_selection()
+                        .map_or_else(|| variable.scalar_count(), |_| 1),
                     pre_mode: branch.pre_mode,
                     span: branch.span,
                     event_clock: None,
+                    sampled: false,
                 },
                 branch.assignment,
                 branch.clock,
             )?;
         }
     }
-    lower_guarded_targets(
-        view,
-        layout,
-        rows,
-        &mut lowered,
-        solve::DiscreteRowRole::Equation,
-    )
+    rows.guarded_equation_targets.extend(lowered);
+    Ok(())
 }
 
 /// Lowers an always-active B.1c owner of an MLS §16.3 event clock: its
@@ -732,7 +957,8 @@ fn lower_conditional_discrete_value_owner<'dae>(
 /// guarded update whose trigger and guard are the tick condition.
 fn lower_triggered_discrete_value_owner<'dae>(
     view: dae::DaeView<'dae>,
-    layout: &LoweredLayout<'dae>,
+    layout: &EventCompilationContext<'_, 'dae>,
+    clocks: &LoweredClocks<'dae>,
     rows: &mut DiscreteRows<'dae>,
     owner: dae::DiscreteValueOwnerView<'dae>,
     (event_clock, tick): (dae::ClockId<'dae>, dae::ConditionId<'dae>),
@@ -758,28 +984,39 @@ fn lower_triggered_discrete_value_owner<'dae>(
     for (target, (value, provenance)) in owner.targets().iter().zip(branch.values().iter()) {
         let variable = dae::VariableId::from(target);
         let span = provenance.span();
+        let sampled = clocks.variable_is_sampled(variable);
         let pre_mode = merge_pre_mode(
-            expression_pre_mode(view, value, false),
+            expression_pre_mode(view, value, sampled),
             condition_pre_mode(view, tick),
         );
         record_guarded_target(
             &mut lowered,
             GuardedTargetMetadata {
                 variable,
-                target_base: variable_scalar_slot(layout, target.index(), 0, span)?,
-                width: view
-                    .variable(variable)
-                    .expect("checked B.1c target resolves")
-                    .scalar_count(),
+                target_base: variable_scalar_slot(
+                    layout,
+                    target.index(),
+                    target.scalar_selection().unwrap_or(0) as usize,
+                    span,
+                )?,
+                width: target.scalar_selection().map_or_else(
+                    || {
+                        view.variable(variable)
+                            .expect("checked B.1c target resolves")
+                            .scalar_count()
+                    },
+                    |_| 1,
+                ),
                 pre_mode,
                 span,
                 event_clock: Some(event_clock),
+                sampled,
             },
             (tick, tick, value, condition_memory(layout, tick, span)?),
             None,
         )?;
     }
-    rows.event_clock_targets.extend(lowered);
+    rows.guarded_equation_targets.extend(lowered);
     Ok(())
 }
 
@@ -793,9 +1030,9 @@ struct LoweredDiscreteValueBranch<'dae> {
 
 fn lower_checked_discrete_value_branch<'dae>(
     view: dae::DaeView<'dae>,
-    layout: &LoweredLayout<'dae>,
+    layout: &EventCompilationContext<'_, 'dae>,
     clocks: &LoweredClocks<'dae>,
-    target: dae::DiscreteValueId<'dae>,
+    target: dae::DiscreteValueTarget<'dae>,
     target_ordinal: usize,
     branch: dae::DiscreteValueBranchView<'dae>,
 ) -> Result<LoweredDiscreteValueBranch<'dae>, LowerError> {
@@ -807,7 +1044,12 @@ fn lower_checked_discrete_value_branch<'dae>(
         .get(target_ordinal)
         .expect("checked B.1c branch arity matches its target set");
     let span = provenance.span();
-    let target_base = variable_scalar_slot(layout, target.index(), 0, span)?;
+    let target_base = variable_scalar_slot(
+        layout,
+        target.index(),
+        target.scalar_selection().unwrap_or(0) as usize,
+        span,
+    )?;
     let clock = condition_clock_owner(view, guard)
         .map(|clock| clocks.clock(clock).map(|solve| (clock, solve)))
         .transpose()?;

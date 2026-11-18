@@ -49,7 +49,8 @@ fn compute_contains_function_fold_projection<'dae>(
         }
         dae::for_each_expression(view, root, |_, node| match node.operation() {
             dae::ExpressionOperation::FunctionFoldParameter { .. }
-            | dae::ExpressionOperation::FunctionFoldOutput { .. } => found = true,
+            | dae::ExpressionOperation::FunctionFoldOutput { .. }
+            | dae::ExpressionOperation::FunctionConditionalOutput { .. } => found = true,
             dae::ExpressionOperation::FunctionValue { definition, .. } => {
                 pending.push(definition.rhs());
             }
@@ -166,7 +167,7 @@ fn selection_upper_bound(condition: &gast::Expression) -> Option<(String, i64)> 
 
 /// Split `<loop index>`, `<loop index> + k`, or `<loop index> - k` into the
 /// iterator name and the literal offset applied to it.
-fn linear_index_term(expression: &gast::Expression) -> Option<(String, i64)> {
+pub(super) fn linear_index_term(expression: &gast::Expression) -> Option<(String, i64)> {
     match expression {
         gast::Expression::Paren(inner) => linear_index_term(inner),
         gast::Expression::Ref(gast::Reference::Local(part)) if part.subscripts.is_empty() => {
@@ -610,6 +611,7 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
         &mut self,
         elements: dae::ExpressionOperands<'dae>,
         indices: &[gast::Expression],
+        scalar_type: gast::ScalarType,
         span: Span,
     ) -> Result<TypedExpression, GalecTargetError> {
         let (first, rest) = indices.split_first().ok_or_else(|| {
@@ -633,7 +635,12 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
                     span,
                 )
             })?;
-            return self.lower_at(element, rest);
+            // MLS §10.4/§10.6.13: the constructor's common element type
+            // also applies when a constant index selects an Integer operand.
+            return Ok(TypedExpression {
+                expression: coerce(self.lower_at(element, rest)?, scalar_type, span)?,
+                scalar_type,
+            });
         }
         let extent = u32::try_from(elements.len()).map_err(|_| {
             unsupported(
@@ -663,35 +670,34 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
             let prefix_start = self.pending_prefix_statements.len();
             let value = self.lower_at(element, rest);
             self.conditional_activation_path.pop();
-            let value = value?;
+            // SPEC_0042 T5: GALEC has no implicit numeric promotion. Each
+            // branch must use the checked array's common element type before
+            // constructing the selection, including the fallback branch.
+            let value = coerce(value?, scalar_type, span)?;
             selected.push((
                 ordinal + 1,
                 SelectionValue {
                     prefix: self.pending_prefix_statements.split_off(prefix_start),
-                    expression: value.expression,
+                    expression: value,
                 },
-                value.scalar_type,
             ));
         }
-        let (_, fallback, scalar_type) = selected
+        let (_, fallback) = selected
             .pop()
             .expect("checked array constructor is nonempty");
         let branches = selected
             .into_iter()
-            .map(|(ordinal, value, branch_type)| {
-                debug_assert_eq!(branch_type, scalar_type);
-                SelectionBranch {
-                    condition_prefix: Vec::new(),
-                    condition: gast::Expression::binary(
-                        gast::BinaryOp::Eq,
-                        first.clone(),
-                        gast::Expression::Integer(
-                            i64::try_from(ordinal)
-                                .expect("checked array ordinal fits the GALEC index type"),
-                        ),
+            .map(|(ordinal, value)| SelectionBranch {
+                condition_prefix: Vec::new(),
+                condition: gast::Expression::binary(
+                    gast::BinaryOp::Eq,
+                    first.clone(),
+                    gast::Expression::Integer(
+                        i64::try_from(ordinal)
+                            .expect("checked array ordinal fits the GALEC index type"),
                     ),
-                    value,
-                }
+                ),
+                value,
             })
             .collect();
         Ok(self.lower_lazy_selection(branches, fallback, scalar_type, span))
@@ -763,12 +769,14 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
             return self.lower_at(operand, &projection);
         }
         if builtin == dae::PureBuiltin::Zeros || builtin == dae::PureBuiltin::Ones {
+            let element = i64::from(builtin == dae::PureBuiltin::Ones);
+            // MLS 3.7 §10.3.3: an Integer array unless a Real context converts it.
+            let expression = match scalar_type {
+                gast::ScalarType::Integer => gast::Expression::Integer(element),
+                _ => gast::Expression::Real(element as f64),
+            };
             return Ok(TypedExpression {
-                expression: gast::Expression::Real(if builtin == dae::PureBuiltin::Ones {
-                    1.0
-                } else {
-                    0.0
-                }),
+                expression,
                 scalar_type,
             });
         }
@@ -957,6 +965,7 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
         builtin: dae::PureBuiltin,
         arguments: dae::ExpressionOperands<'dae>,
         scalar_type: gast::ScalarType,
+        span: Span,
     ) -> Result<TypedExpression, GalecTargetError> {
         let operand = arguments.get(0).expect("checked reduction operand");
         let dimensions = self
@@ -978,10 +987,30 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
                 .collect::<Vec<_>>();
             values.push(self.lower_at(operand, &indices)?.expression);
         }
-        let expression = values
-            .into_iter()
-            .reduce(|lhs, rhs| gast::Expression::binary(operator, lhs, rhs))
+        let mut values = values.into_iter();
+        let mut expression = values
+            .next()
             .unwrap_or_else(|| reduction_identity(builtin, scalar_type));
+        for (index, value) in values.enumerate() {
+            expression = gast::Expression::binary(operator, expression, value);
+            // Keep the original left-to-right grouping (GAL trap T6), but
+            // checkpoint it into scalar locals before recursive AST consumers
+            // inherit a stack frame per array element. Small trees stay exact.
+            // A materializing lowerer keeps prefix statements inside their
+            // conditional branch; an inline `if` branch has nowhere to put
+            // them, so a checkpoint there would run even when the branch is
+            // not taken. Outside such branches every lowerer checkpoints.
+            if (self.materialize_function_values || self.inline_conditional_depth == 0)
+                && (index + 1) % 64 == 0
+            {
+                expression = self.materialize_aggregate_function_argument(
+                    expression,
+                    &[],
+                    scalar_type,
+                    span,
+                )?;
+            }
+        }
         Ok(TypedExpression {
             expression,
             scalar_type,
@@ -1585,7 +1614,15 @@ fn lower_bounded_reference_selection(
     dimensions: &[u32],
     span: Span,
 ) -> Result<gast::Expression, GalecTargetError> {
-    gast::IfExpression::bounded_selection(reference, dimensions.to_vec())
-        .map(gast::Expression::If)
-        .map_err(|error| unsupported("dynamic-array-index", error.to_string(), span))
+    let selection = gast::IfExpression::bounded_selection(reference, dimensions.to_vec())
+        .map_err(|error| unsupported("dynamic-array-index", error.to_string(), span))?;
+    // Every runtime subscript ranges over a single element (an axis of
+    // extent one), so the one candidate is the selection: it is the value a
+    // longer selection gives as its fallback, and a conditional with no
+    // branch is not Algorithm Code (EG009).
+    Ok(if selection.branches.is_empty() {
+        *selection.else_value
+    } else {
+        gast::Expression::If(selection)
+    })
 }

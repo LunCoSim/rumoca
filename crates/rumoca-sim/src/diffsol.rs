@@ -1,13 +1,15 @@
 use rumoca_core::{maybe_elapsed_seconds, maybe_start_timer};
 use std::cell::RefCell;
 
-#[cfg(feature = "scheduled-sim")]
-use indexmap::IndexMap;
+scheduled_executor_items! {
+    use indexmap::IndexMap;
+}
 use rumoca_ir_dae as dae;
 
 use crate::BuildSimulationTimings;
-#[cfg(feature = "scheduled-sim")]
-use crate::SimulationSessionApi;
+scheduled_executor_items! {
+    use crate::SimulationSessionApi;
+}
 use crate::me_backend::{
     BackendSimulationSession, batch_options, instance_config, plugin_for_host,
 };
@@ -70,7 +72,7 @@ pub(crate) fn assess_bdf_capability(
     };
     let retained = rumoca_solver::fmi_me::session::MeRetainedComponent::instantiate(
         artifact.source(),
-        &instance_config("bdf", opts, Some(opts.t_end))?,
+        &instance_config("bdf", opts)?,
         execution_backend,
     )?;
     let prepared = PreparedSimulation {
@@ -221,7 +223,23 @@ pub fn build_simulation_with_stage_timing_and_lowered_model(
     ))
 }
 
+/// A prepared simulation for repeated runs: instantiated, with every lazily
+/// compiled native owner compiled now by one warm-up initialization, so no run
+/// pays a compile. The warm-up's own outcome is dropped, because the run that
+/// meets a failing initialization reports it.
 fn build_simulation_artifact(
+    artifact: rumoca_solver::fmi_me::MeModelArtifact,
+    opts: &rumoca_solver::SimOptions,
+    execution_backend: Option<rumoca_solver::fmi_me::MeExecutionBackend>,
+) -> Result<PreparedSimulation, SimError> {
+    let prepared = instantiate_prepared_simulation(artifact, opts, execution_backend)?;
+    drop(check_prepared_component(&prepared));
+    Ok(prepared)
+}
+
+/// A prepared simulation that has not initialized its component: the one-shot
+/// path simulates it at once, and its run compiles what it needs.
+fn instantiate_prepared_simulation(
     artifact: rumoca_solver::fmi_me::MeModelArtifact,
     opts: &rumoca_solver::SimOptions,
     execution_backend: Option<rumoca_solver::fmi_me::MeExecutionBackend>,
@@ -230,7 +248,7 @@ fn build_simulation_artifact(
         rumoca_solver::fmi_me::admit_execution_backend(opts.execution_policy, execution_backend)?;
     let retained = rumoca_solver::fmi_me::session::MeRetainedComponent::instantiate(
         artifact.source(),
-        &instance_config("bdf", opts, Some(opts.t_end))?,
+        &instance_config("bdf", opts)?,
         execution_backend,
     )?;
     let prepared = PreparedSimulation {
@@ -238,7 +256,6 @@ fn build_simulation_artifact(
         root_location: artifact.root_location(),
         retained: RefCell::new(retained),
     };
-    drop(check_prepared_component(&prepared));
     Ok(prepared)
 }
 
@@ -247,7 +264,7 @@ pub(crate) fn simulate_artifact(
     opts: &rumoca_solver::SimOptions,
     execution_backend: Option<rumoca_solver::fmi_me::MeExecutionBackend>,
 ) -> Result<rumoca_solver::SimResult, SimError> {
-    let prepared = build_simulation_artifact(artifact, opts, execution_backend)
+    let prepared = instantiate_prepared_simulation(artifact, opts, execution_backend)
         .map_err(|error| error.at_stage(SimFailureStage::BackendBuild))?;
     simulate_prepared(&prepared)
 }
@@ -349,7 +366,7 @@ impl SimulationSession {
         execution_backend: Option<rumoca_solver::fmi_me::MeExecutionBackend>,
     ) -> Result<Self, SimulationDiagnosticError> {
         let inner = BackendSimulationSession::new(
-            artifact.source(),
+            &artifact,
             &opts,
             execution_backend,
             "diffsol",
@@ -368,6 +385,10 @@ impl SimulationSession {
     }
 
     pub(crate) fn ensure_end_time(&mut self, _target_time: f64) {}
+
+    pub(crate) fn execution_receipt(&self) -> rumoca_solver::SimExecutionReceipt {
+        self.inner.execution_receipt()
+    }
 
     pub(crate) fn step(&mut self, dt: f64) -> Result<(), SimError> {
         if dt <= 0.0 {
@@ -395,9 +416,10 @@ impl SimulationSession {
         })
     }
 
-    #[cfg(feature = "scheduled-sim")]
-    pub(crate) fn values_for(&self, names: &[String]) -> Result<IndexMap<String, f64>, SimError> {
-        self.inner.values_for(names)
+    scheduled_executor_items! {
+        pub(crate) fn values_for(&self, names: &[String]) -> Result<IndexMap<String, f64>, SimError> {
+            self.inner.values_for(names)
+        }
     }
 
     pub(crate) fn input_names(&self) -> &[String] {
@@ -408,9 +430,10 @@ impl SimulationSession {
         self.inner.variable_names()
     }
 
-    #[cfg(feature = "scheduled-sim")]
-    pub(crate) fn max_schedule_advance_dt(&self) -> Option<f64> {
-        None
+    scheduled_executor_items! {
+        pub(crate) fn max_schedule_advance_dt(&self) -> Option<f64> {
+            None
+        }
     }
 }
 
@@ -442,36 +465,37 @@ fn diagnostic_failure_stage(err: &SimulationDiagnosticError) -> SimFailureStage 
     }
 }
 
-#[cfg(feature = "scheduled-sim")]
-impl SimulationSessionApi for SimulationSession {
-    type Error = SimError;
+scheduled_executor_items! {
+    impl SimulationSessionApi for SimulationSession {
+        type Error = SimError;
 
-    fn reset(&mut self, t_start: f64) -> Result<(), Self::Error> {
-        Self::reset(self, t_start)
-    }
+        fn reset(&mut self, t_start: f64) -> Result<(), Self::Error> {
+            Self::reset(self, t_start)
+        }
 
-    fn set_inputs(&mut self, inputs: &[(&str, f64)]) -> Result<(), Self::Error> {
-        Self::set_inputs(self, inputs)
-    }
+        fn set_inputs(&mut self, inputs: &[(&str, f64)]) -> Result<(), Self::Error> {
+            Self::set_inputs(self, inputs)
+        }
 
-    fn ensure_end_time(&mut self, target_time: f64) {
-        Self::ensure_end_time(self, target_time);
-    }
+        fn ensure_end_time(&mut self, target_time: f64) {
+            Self::ensure_end_time(self, target_time);
+        }
 
-    fn advance_to(&mut self, target_time: f64) -> Result<(), Self::Error> {
-        Self::advance_to(self, target_time)
-    }
+        fn advance_to(&mut self, target_time: f64) -> Result<(), Self::Error> {
+            Self::advance_to(self, target_time)
+        }
 
-    fn time(&self) -> f64 {
-        Self::time(self)
-    }
+        fn time(&self) -> f64 {
+            Self::time(self)
+        }
 
-    fn get(&self, name: &str) -> Result<Option<f64>, Self::Error> {
-        Self::get(self, name)
-    }
+        fn get(&self, name: &str) -> Result<Option<f64>, Self::Error> {
+            Self::get(self, name)
+        }
 
-    fn max_schedule_advance_dt(&self) -> Option<f64> {
-        Self::max_schedule_advance_dt(self)
+        fn max_schedule_advance_dt(&self) -> Option<f64> {
+            Self::max_schedule_advance_dt(self)
+        }
     }
 }
 
@@ -484,18 +508,19 @@ impl SimulationSessionApi for SimulationSession {
 /// would be contraband anywhere in `rumoca-solver-diffsol`.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod native_policy_tests {
+    mod heat_seed_work;
     use std::cell::Cell;
     use std::rc::Rc;
 
     use rumoca_compile::compile::{Session, SessionConfig};
     use rumoca_ir_solve as solve;
     use rumoca_solver::{
-        CompiledSolveAssignmentSchedule, CompiledSolveEventTransaction, CompiledSolveExpression,
-        CompiledSolveJacobianExpression, SimExecutionPolicy, SimOptions, SolveExecutionBackend,
-        fmi_me::MeExecutionBackend,
+        CompileRefusal, CompiledSolveAssignmentSchedule, CompiledSolveEventTransaction,
+        CompiledSolveExpression, CompiledSolveJacobianExpression, SimExecutionPolicy, SimOptions,
+        SolveExecutionBackend, fmi_me::MeExecutionBackend,
     };
 
-    use super::{build_simulation_artifact, simulate_artifact};
+    use super::{build_simulation_artifact, instantiate_prepared_simulation, simulate_artifact};
     use crate::SimError;
     use crate::native_execution::admitted_native_execution_backend;
 
@@ -615,7 +640,7 @@ mod native_policy_tests {
             t: f64,
             external_tables: &[rumoca_core::ExternalTableData],
             out: &mut [f64],
-        ) -> Result<(), String> {
+        ) -> Result<(), rumoca_solver::RuntimeSolveError> {
             let result = self.inner.call(y, p, t, external_tables, out);
             self.counters.expression.observe(&result);
             result
@@ -627,7 +652,43 @@ mod native_policy_tests {
         counters: Rc<NativeCallCounters>,
     }
 
+    struct CountingProgramsCommitting {
+        inner: Rc<dyn rumoca_solver::CompiledProgramsCommitting>,
+        counters: Rc<NativeCallCounters>,
+    }
+
+    impl rumoca_solver::CompiledProgramsCommitting for CountingProgramsCommitting {
+        fn call_selected_programs_committing(
+            &self,
+            programs: &[usize],
+            inputs: (&[f64], &[f64], f64),
+            seed: &mut [f64],
+            external_tables: &[rumoca_core::ExternalTableData],
+            commit: &mut rumoca_solver::ProgramOutputCommit<'_>,
+        ) -> Result<(), rumoca_solver::RuntimeSolveError> {
+            let result = self.inner.call_selected_programs_committing(
+                programs,
+                inputs,
+                seed,
+                external_tables,
+                commit,
+            );
+            self.counters.jacobian.observe(&result);
+            result
+        }
+    }
+
     impl CompiledSolveJacobianExpression for CountingJacobian {
+        fn programs_committing(
+            self: std::rc::Rc<Self>,
+        ) -> Option<std::rc::Rc<dyn rumoca_solver::CompiledProgramsCommitting>> {
+            let inner = Rc::clone(&self.inner).programs_committing()?;
+            Some(Rc::new(CountingProgramsCommitting {
+                inner,
+                counters: self.counters.clone(),
+            }))
+        }
+
         fn call_program_output(
             &self,
             coordinate: (usize, usize),
@@ -636,7 +697,7 @@ mod native_policy_tests {
             t: f64,
             seed: &[f64],
             external_tables: &[rumoca_core::ExternalTableData],
-        ) -> Result<Option<f64>, String> {
+        ) -> Result<Option<f64>, rumoca_solver::RuntimeSolveError> {
             let result = self
                 .inner
                 .call_program_output(coordinate, y, p, t, seed, external_tables);
@@ -654,11 +715,64 @@ mod native_policy_tests {
             seed: &[f64],
             external_tables: &[rumoca_core::ExternalTableData],
             out: &mut [f64],
-        ) -> Result<(), String> {
+        ) -> Result<(), rumoca_solver::RuntimeSolveError> {
             let result = self.inner.call(y, p, t, seed, external_tables, out);
             self.counters.jacobian.observe(&result);
             result
         }
+    }
+
+    #[test]
+    fn counting_decorator_preserves_committing_execution_and_failure_accounting() {
+        let model = state_fixture(&sim_opts(SimExecutionPolicy::Auto));
+        let (backend, counters, _handle) = counting_handle(&model);
+        let span = rumoca_core::Span::from_offsets(
+            rumoca_core::SourceId::from_source_name("counted_committing.mo"),
+            1,
+            2,
+        );
+        let source = solve::ScalarProgramBlock::with_source_span(
+            vec![vec![
+                solve::LinearOp::LoadSeed { dst: 0, index: 0 },
+                solve::LinearOp::StoreOutput { src: 0 },
+            ]],
+            span.require_provenance("counted committing fixture")
+                .unwrap(),
+        )
+        .unwrap();
+        let compiled = backend.compile_jacobian_expression(&source).unwrap();
+        let committing = compiled.programs_committing().unwrap();
+        let mut seed = [3.0];
+        let mut observed = Vec::new();
+        committing
+            .call_selected_programs_committing(
+                &[0, 0],
+                (&[], &[], 0.0),
+                &mut seed,
+                &[],
+                &mut |program, outputs, seed| {
+                    assert_eq!(program, 0);
+                    observed.push(outputs[0]);
+                    seed[0] = outputs[0] + 1.0;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(observed, [3.0, 4.0]);
+        assert_eq!(seed, [5.0]);
+        let error = committing
+            .call_selected_programs_committing(
+                &[0],
+                (&[], &[], 0.0),
+                &mut seed,
+                &[],
+                &mut |_, _, _| Err("injected committing failure".into()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("injected committing failure"));
+        assert_eq!(counters.jacobian.attempted.get(), 2);
+        assert_eq!(counters.jacobian.succeeded.get(), 1);
+        assert_eq!(counters.jacobian.failed.get(), 1);
     }
 
     struct CountingAssignment {
@@ -673,7 +787,7 @@ mod native_policy_tests {
             p: &[f64],
             t: f64,
             external_tables: &[rumoca_core::ExternalTableData],
-        ) -> Result<(), String> {
+        ) -> Result<(), rumoca_solver::RuntimeSolveError> {
             let result = self.inner.call(y, p, t, external_tables);
             self.counters.assignment.observe(&result);
             result
@@ -686,7 +800,11 @@ mod native_policy_tests {
     }
 
     impl CompiledSolveEventTransaction for CountingEventTransaction {
-        fn call(&self, input: &[f64], output: &mut [f64]) -> Result<(), String> {
+        fn call(
+            &self,
+            input: &[f64],
+            output: &mut [f64],
+        ) -> Result<(), rumoca_solver::RuntimeSolveError> {
             let result = self.inner.call(input, output);
             self.counters.event_transaction.observe(&result);
             result
@@ -697,7 +815,7 @@ mod native_policy_tests {
         fn compile_expression(
             &self,
             block: &solve::ScalarProgramBlock,
-        ) -> Result<Rc<dyn CompiledSolveExpression>, String> {
+        ) -> Result<Rc<dyn CompiledSolveExpression>, CompileRefusal> {
             NativeCallCounters::bump(&self.counters.expression_compiles);
             self.inner.compile_expression(block).map(|inner| {
                 Rc::new(CountingExpression {
@@ -710,7 +828,7 @@ mod native_policy_tests {
         fn compile_jacobian_expression(
             &self,
             block: &solve::ScalarProgramBlock,
-        ) -> Result<Rc<dyn CompiledSolveJacobianExpression>, String> {
+        ) -> Result<Rc<dyn CompiledSolveJacobianExpression>, CompileRefusal> {
             NativeCallCounters::bump(&self.counters.jacobian_compiles);
             self.inner.compile_jacobian_expression(block).map(|inner| {
                 Rc::new(CountingJacobian {
@@ -722,11 +840,13 @@ mod native_policy_tests {
 
         fn compile_assignment_schedule(
             &self,
-            schedule: &solve::SharedAssignmentSchedule,
+            source: &solve::ComputeBlock,
+            owners: &solve::ContinuousRefreshOwners,
+            schedule: &solve::ExactRefreshAssignmentSchedule,
         ) -> Result<Rc<dyn CompiledSolveAssignmentSchedule>, String> {
             NativeCallCounters::bump(&self.counters.assignment_compiles);
             self.inner
-                .compile_assignment_schedule(schedule)
+                .compile_assignment_schedule(source, owners, schedule)
                 .map(|inner| {
                     Rc::new(CountingAssignment {
                         inner,
@@ -765,7 +885,7 @@ mod native_policy_tests {
     impl ModelFixture {
         fn component(&self) -> solve::fmi::FmiComponent {
             let mut deserializer = serde_json::Deserializer::from_str(&self.component_wire);
-            rumoca_phase_solve::fmi::deserialize_fmi_component(&mut deserializer)
+            rumoca_eval_solve::fmi_wire::deserialize_fmi_component(&mut deserializer)
                 .expect("fixture FMI component replays")
         }
 
@@ -784,10 +904,13 @@ mod native_policy_tests {
             .expect("fixture compiles through checked ToDAE")
             .dae;
         let lowered =
-            crate::solve_lowering::lower_correlated_for_simulation_with_overrides(&dae, opts)
+            crate::solve_lowering::lower_correlated_for_native_execution_with_overrides(&dae, opts)
                 .expect("fixture lowers to a correlated Solve model");
         let model = lowered.model().clone();
-        let wire = rumoca_phase_solve::fmi::fmi_component_wire(&lowered)
+        let component = rumoca_phase_solve::fmi::finish_fmi_component(lowered)
+            .expect("fixture FMI component constructs");
+        let root = component.runtime_view().retain_assertion_root();
+        let wire = rumoca_eval_solve::fmi_wire::retained_fmi_component_wire(&root)
             .expect("fixture FMI wire constructs");
         let component_wire = serde_json::to_string(&wire).expect("fixture FMI wire serializes");
         ModelFixture {
@@ -817,6 +940,36 @@ mod native_policy_tests {
                 "end NativeDiscriminator;\n",
             ),
             "NativeDiscriminator",
+            opts,
+        )
+    }
+
+    /// A sampled `when` that calls a user function: its event update is an
+    /// event-transaction program with a pure-call site.
+    fn event_fixture(opts: &SimOptions) -> ModelFixture {
+        lower(
+            r#"
+function increment
+  input Real value;
+  output Real result;
+algorithm
+  result := value + 1;
+end increment;
+
+model DeclinedEvent
+  Real x(start = 0, fixed = true);
+  Real z;
+  discrete Real n(start = 0, fixed = true);
+equation
+  der(x) = 1;
+  z = 0.5 * x + cos(time);
+algorithm
+  when sample(0.1, 0.1) then
+    n := increment(pre(n));
+  end when;
+end DeclinedEvent;
+"#,
+            "DeclinedEvent",
             opts,
         )
     }
@@ -890,12 +1043,13 @@ mod native_policy_tests {
         Rc<NativeCallCounters>,
         MeExecutionBackend,
     ) {
-        counting_handle_over(crate::native_execution::backend(&model.pure_calls))
+        counting_handle_over(crate::native_execution::backend(&model.pure_calls).unwrap())
     }
 
     /// Mutation fixture: a backend whose compiles succeed but whose every
-    /// compiled call returns `Err`. Exact projection must propagate the error,
-    /// and the success/failure accounting must expose the failed execution.
+    /// compiled call returns `Err`. The error of whichever compiled call runs
+    /// first must propagate, and the success/failure accounting must expose the
+    /// failed execution.
     struct FailingCompiled;
 
     impl CompiledSolveExpression for FailingCompiled {
@@ -906,12 +1060,18 @@ mod native_policy_tests {
             _t: f64,
             _external_tables: &[rumoca_core::ExternalTableData],
             _out: &mut [f64],
-        ) -> Result<(), String> {
-            Err("injected native expression failure".to_string())
+        ) -> Result<(), rumoca_solver::RuntimeSolveError> {
+            Err("injected native expression failure".into())
         }
     }
 
     impl CompiledSolveJacobianExpression for FailingCompiled {
+        fn programs_committing(
+            self: std::rc::Rc<Self>,
+        ) -> Option<std::rc::Rc<dyn rumoca_solver::CompiledProgramsCommitting>> {
+            None
+        }
+
         fn call(
             &self,
             _y: &[f64],
@@ -920,8 +1080,8 @@ mod native_policy_tests {
             _seed: &[f64],
             _external_tables: &[rumoca_core::ExternalTableData],
             _out: &mut [f64],
-        ) -> Result<(), String> {
-            Err("injected native JVP failure".to_string())
+        ) -> Result<(), rumoca_solver::RuntimeSolveError> {
+            Err("injected native JVP failure".into())
         }
     }
 
@@ -932,14 +1092,18 @@ mod native_policy_tests {
             _p: &[f64],
             _t: f64,
             _external_tables: &[rumoca_core::ExternalTableData],
-        ) -> Result<(), String> {
-            Err("injected native assignment failure".to_string())
+        ) -> Result<(), rumoca_solver::RuntimeSolveError> {
+            Err("injected native assignment failure".into())
         }
     }
 
     impl CompiledSolveEventTransaction for FailingCompiled {
-        fn call(&self, _input: &[f64], _output: &mut [f64]) -> Result<(), String> {
-            Err("injected native event-transaction failure".to_string())
+        fn call(
+            &self,
+            _input: &[f64],
+            _output: &mut [f64],
+        ) -> Result<(), rumoca_solver::RuntimeSolveError> {
+            Err("injected native event-transaction failure".into())
         }
     }
 
@@ -949,20 +1113,22 @@ mod native_policy_tests {
         fn compile_expression(
             &self,
             _block: &solve::ScalarProgramBlock,
-        ) -> Result<Rc<dyn CompiledSolveExpression>, String> {
+        ) -> Result<Rc<dyn CompiledSolveExpression>, CompileRefusal> {
             Ok(Rc::new(FailingCompiled))
         }
 
         fn compile_jacobian_expression(
             &self,
             _block: &solve::ScalarProgramBlock,
-        ) -> Result<Rc<dyn CompiledSolveJacobianExpression>, String> {
+        ) -> Result<Rc<dyn CompiledSolveJacobianExpression>, CompileRefusal> {
             Ok(Rc::new(FailingCompiled))
         }
 
         fn compile_assignment_schedule(
             &self,
-            _schedule: &solve::SharedAssignmentSchedule,
+            _source: &solve::ComputeBlock,
+            _owners: &solve::ContinuousRefreshOwners,
+            _schedule: &solve::ExactRefreshAssignmentSchedule,
         ) -> Result<Rc<dyn CompiledSolveAssignmentSchedule>, String> {
             Ok(Rc::new(FailingCompiled))
         }
@@ -972,6 +1138,103 @@ mod native_policy_tests {
             _program: &solve::EventTransactionProgram,
         ) -> Result<Rc<dyn CompiledSolveEventTransaction>, String> {
             Ok(Rc::new(FailingCompiled))
+        }
+    }
+
+    /// The production backend for every compile except event transactions,
+    /// whose compiled calls always fail.
+    struct FailingEventTransactionBackend {
+        inner: Rc<dyn SolveExecutionBackend>,
+    }
+
+    impl SolveExecutionBackend for FailingEventTransactionBackend {
+        fn compile_expression(
+            &self,
+            block: &solve::ScalarProgramBlock,
+        ) -> Result<Rc<dyn CompiledSolveExpression>, CompileRefusal> {
+            self.inner.compile_expression(block)
+        }
+
+        fn compile_jacobian_expression(
+            &self,
+            block: &solve::ScalarProgramBlock,
+        ) -> Result<Rc<dyn CompiledSolveJacobianExpression>, CompileRefusal> {
+            self.inner.compile_jacobian_expression(block)
+        }
+
+        fn compile_assignment_schedule(
+            &self,
+            source: &solve::ComputeBlock,
+            owners: &solve::ContinuousRefreshOwners,
+            schedule: &solve::ExactRefreshAssignmentSchedule,
+        ) -> Result<Rc<dyn CompiledSolveAssignmentSchedule>, String> {
+            self.inner
+                .compile_assignment_schedule(source, owners, schedule)
+        }
+
+        fn compile_event_transaction(
+            &self,
+            _program: &solve::EventTransactionProgram,
+        ) -> Result<Rc<dyn CompiledSolveEventTransaction>, String> {
+            Ok(Rc::new(FailingCompiled))
+        }
+    }
+
+    /// A backend that declines every compile request.
+    struct DecliningBackend;
+
+    const FORCED_DECLINE: &str = "forced decline";
+
+    impl SolveExecutionBackend for DecliningBackend {
+        fn compile_expression(
+            &self,
+            _block: &solve::ScalarProgramBlock,
+        ) -> Result<Rc<dyn CompiledSolveExpression>, CompileRefusal> {
+            Err(FORCED_DECLINE.to_string().into())
+        }
+
+        fn compile_jacobian_expression(
+            &self,
+            _block: &solve::ScalarProgramBlock,
+        ) -> Result<Rc<dyn CompiledSolveJacobianExpression>, CompileRefusal> {
+            Err(FORCED_DECLINE.to_string().into())
+        }
+
+        fn compile_assignment_schedule(
+            &self,
+            _source: &solve::ComputeBlock,
+            _owners: &solve::ContinuousRefreshOwners,
+            _schedule: &solve::ExactRefreshAssignmentSchedule,
+        ) -> Result<Rc<dyn CompiledSolveAssignmentSchedule>, String> {
+            Err(FORCED_DECLINE.to_string())
+        }
+
+        fn compile_event_transaction(
+            &self,
+            _program: &solve::EventTransactionProgram,
+        ) -> Result<Rc<dyn CompiledSolveEventTransaction>, String> {
+            Err(FORCED_DECLINE.to_string())
+        }
+    }
+
+    /// A required program refusal rejects the session before lifecycle entry.
+    #[test]
+    fn a_declined_required_program_rejects_session_preparation() {
+        for policy in [SimExecutionPolicy::NativeRequired, SimExecutionPolicy::Auto] {
+            let opts = sim_opts(policy);
+            let model = event_fixture(&opts);
+            let handle = MeExecutionBackend::new(Rc::new(DecliningBackend));
+            let error =
+                super::SimulationSession::from_artifact(model.artifact(), opts, Some(handle))
+                    .err()
+                    .expect("a declined required program must not construct a session");
+            assert!(error.to_string().contains(FORCED_DECLINE), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("required compiled program `implicit_rhs`"),
+                "{error}"
+            );
         }
     }
 
@@ -1034,9 +1297,8 @@ mod native_policy_tests {
         let error = simulate_artifact(model.artifact(), &opts, Some(handle))
             .expect_err("native exact projection errors must reach the caller");
         assert!(
-            error
-                .to_string()
-                .contains("injected native assignment failure")
+            error.to_string().contains("injected native"),
+            "the first failing compiled call reaches the caller: {error}"
         );
         assert!(
             counters.total_failed() > 0,
@@ -1050,6 +1312,63 @@ mod native_policy_tests {
         assert!(
             !native_success_evidence_holds(&counters),
             "silent interpreter fallback must not satisfy the native-success evidence"
+        );
+    }
+
+    /// The compiled event transaction of a pure-call update executes natively
+    /// and its result is the one the session publishes.
+    #[test]
+    fn auto_native_bdf_path_executes_the_compiled_event_transaction() {
+        let opts = sim_opts(SimExecutionPolicy::Auto);
+        let model = event_fixture(&opts);
+        let (_backend, counters, handle) = counting_handle(&model);
+        let result = simulate_artifact(model.artifact(), &opts, Some(handle))
+            .expect("native event run succeeds");
+        let counter = &counters.event_transaction;
+        assert!(
+            counter.succeeded.get() > 0,
+            "attempted={}",
+            counter.attempted.get()
+        );
+        assert_eq!(counter.failed.get(), 0);
+        let n = result
+            .names
+            .iter()
+            .position(|name| name == "n")
+            .expect("n is recorded");
+        let last = result.data[n].last().copied().expect("n has samples");
+        assert_eq!(last, 5.0, "five sample events fall in [0, 0.5]");
+    }
+
+    /// A compiled event transaction that fails reaches the caller.
+    #[test]
+    fn failing_native_event_transaction_reaches_the_caller() {
+        let opts = sim_opts(SimExecutionPolicy::Auto);
+        let model = event_fixture(&opts);
+        let (_backend, counters, handle) = counting_handle_over(Rc::new(FailingBackend));
+        let error = simulate_artifact(model.artifact(), &opts, Some(handle))
+            .expect_err("a failed compiled call must not fall back silently");
+        assert!(error.to_string().contains("injected native"), "{error}");
+        assert!(counters.total_failed() > 0);
+    }
+
+    /// When every other compiled call succeeds, a failing compiled event
+    /// transaction is the error the caller sees.
+    #[test]
+    fn a_failing_compiled_event_transaction_is_the_error_the_caller_sees() {
+        let opts = sim_opts(SimExecutionPolicy::Auto);
+        let model = event_fixture(&opts);
+        let backend = Rc::new(FailingEventTransactionBackend {
+            inner: crate::native_execution::backend(&model.pure_calls).unwrap(),
+        });
+        let handle = MeExecutionBackend::new(backend);
+        let error = simulate_artifact(model.artifact(), &opts, Some(handle))
+            .expect_err("a failed compiled event transaction must not fall back silently");
+        assert!(
+            error
+                .to_string()
+                .contains("injected native event-transaction failure"),
+            "{error}"
         );
     }
 
@@ -1156,12 +1475,16 @@ mod native_policy_tests {
         let opts = sim_opts(SimExecutionPolicy::Interpreter);
         let model = state_fixture(&opts);
         assert!(
-            admitted_native_execution_backend(&opts, &model).is_none(),
+            admitted_native_execution_backend(&opts, &model)
+                .unwrap()
+                .is_none(),
             "the interpreter policy must withhold the native execution backend"
         );
         let auto_opts = sim_opts(SimExecutionPolicy::Auto);
         assert!(
-            admitted_native_execution_backend(&auto_opts, &model).is_some(),
+            admitted_native_execution_backend(&auto_opts, &model)
+                .unwrap()
+                .is_some(),
             "the auto policy must compose a native execution backend for a state-carrying model"
         );
         let result = simulate_artifact(model.artifact(), &opts, None)
@@ -1256,23 +1579,36 @@ mod native_policy_tests {
         );
     }
 
-    /// Both state-carrying and algebraic/discrete components admit their
-    /// native evaluator. Only an explicit Interpreter policy withholds it.
+    /// Under Auto only the state-carrying fixture receives the native backend.
     #[cfg(feature = "solver-rk45")]
     #[test]
-    fn rk45_native_composition_is_independent_of_continuous_state_count() {
+    fn rk45_zero_state_composition_constructs_no_backend() {
         let opts = sim_opts(SimExecutionPolicy::Auto);
         let zero_model = zero_state_discrete_fixture(&opts);
-        assert_eq!(zero_model.state_scalar_count(), 0);
-        let handle = admitted_native_execution_backend(&opts, &zero_model)
-            .expect("the zero-state component admits its native evaluator");
+        assert_eq!(
+            zero_model.state_scalar_count(),
+            0,
+            "fixture must be zero-state"
+        );
+        assert!(
+            admitted_native_execution_backend(&opts, &zero_model)
+                .unwrap()
+                .is_none(),
+            "the shared admission gate must withhold the backend for a zero-state model \
+             under Auto — no backend may even be constructed"
+        );
         let state_model = state_fixture(&opts);
-        assert!(admitted_native_execution_backend(&opts, &state_model).is_some());
-        let interpreter = sim_opts(SimExecutionPolicy::Interpreter);
-        assert!(admitted_native_execution_backend(&interpreter, &zero_model).is_none());
-        assert!(admitted_native_execution_backend(&interpreter, &state_model).is_none());
-        crate::rk45::SimulationSession::from_artifact(zero_model.artifact(), opts, Some(handle))
-            .expect("the rk-like zero-state session builds with its native evaluator");
+        assert!(
+            admitted_native_execution_backend(&opts, &state_model)
+                .unwrap()
+                .is_some(),
+            "the same gate must compose a backend for a state-carrying model under Auto, \
+             or the zero-state assertion above is vacuous"
+        );
+        // Building through the real rk45 composition call site proves the
+        // automatically withheld path still completes.
+        crate::rk45::SimulationSession::from_artifact(zero_model.artifact(), opts, None)
+            .expect("the rk-like zero-state session builds with the backend withheld");
     }
 
     /// Supplied component evaluators execute discrete/algebraic programs and
@@ -1526,7 +1862,7 @@ mod native_policy_tests {
         // both), wrapped into one opaque handle per model.
         let counters = Rc::new(NativeCallCounters::default());
         let factory = Rc::new(CountingBackend {
-            inner: crate::native_execution::backend(&model_a.pure_calls),
+            inner: crate::native_execution::backend(&model_a.pure_calls).unwrap(),
             counters: counters.clone(),
         });
         let handle_a = MeExecutionBackend::new(factory.clone() as Rc<dyn SolveExecutionBackend>);
@@ -1602,8 +1938,10 @@ mod native_policy_tests {
         let model = zero_state_fixture(&opts);
         assert_eq!(model.state_scalar_count(), 0, "fixture must be zero-state");
         assert!(
-            admitted_native_execution_backend(&opts, &model).is_some(),
-            "zero continuous states must not disable the component's algebraic evaluator"
+            admitted_native_execution_backend(&opts, &model)
+                .unwrap()
+                .is_none(),
+            "a zero-state model must not pay for a native backend it cannot use"
         );
         let (backend, counters, handle) = counting_handle(&model);
         let result = simulate_artifact(model.artifact(), &opts, Some(handle))
@@ -1622,5 +1960,25 @@ mod native_policy_tests {
             1,
             "the zero-state path retained its supplied evaluator after completion"
         );
+    }
+
+    /// A one-shot simulation initializes its component once, in its run, and
+    /// never to validate it first; a prepared build spends exactly one warm-up
+    /// initialization, whatever refresh phases an initialization itself
+    /// executes, and every run after it is one more.
+    #[test]
+    fn a_one_shot_run_initializes_once_and_a_prepared_build_warms_once() {
+        let opts = sim_opts(SimExecutionPolicy::Auto);
+        let model = zero_state_fixture(&opts);
+        let one_shot = instantiate_prepared_simulation(model.artifact(), &opts, None)
+            .expect("zero-state simulation instantiates");
+        assert_eq!(one_shot.retained.borrow().lease_count(), 0);
+        one_shot.run().expect("zero-state run succeeds");
+        assert_eq!(one_shot.retained.borrow().lease_count(), 1);
+        let prepared = build_simulation_artifact(model.artifact(), &opts, None)
+            .expect("zero-state simulation builds");
+        assert_eq!(prepared.retained.borrow().lease_count(), 1);
+        prepared.run().expect("a prepared run repeats");
+        assert_eq!(prepared.retained.borrow().lease_count(), 2);
     }
 }

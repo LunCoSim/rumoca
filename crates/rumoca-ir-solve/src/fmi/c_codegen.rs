@@ -6,7 +6,7 @@ use serde::ser::{SerializeMap, Serializer};
 
 #[derive(Debug, thiserror::Error)]
 #[error("FMI C profile: {0}")]
-pub struct FmiCCodegenError(&'static str);
+pub struct FmiCCodegenError(pub(super) &'static str);
 
 #[derive(Debug)]
 enum Profile {
@@ -29,46 +29,81 @@ enum Profile {
 #[derive(Debug)]
 pub struct FmiCCodegenView {
     profile: Profile,
+    deployment: super::FmiDeploymentCapabilities,
     /// The dependency order of the parameter-binding programs.
     update_order: Vec<usize>,
+    /// Whole-program evaluation and lifecycle-specific commits share one owner.
+    binding_execution: super::binding_execution::BindingExecution,
     /// The dependency levels of the parameter bindings.
     update_levels: usize,
+    /// Per published declaration: whether a source event may reset its state.
+    state_reinitializations: Vec<bool>,
     /// The evaluation orders of the parameter-determined discrete rows.
     discrete_order: super::static_assertions::DiscreteOrder,
 }
 
 impl FmiCodegenView {
     pub fn try_c(self) -> Result<FmiCCodegenView, FmiCCodegenError> {
-        validate_variables(&self.metadata)?;
-        let (update_order, update_levels) =
-            super::parameter_updates::validate(&self.model.problem, &self.model.pure_calls)
-                .map_err(FmiCCodegenError)?;
+        self.try_deployment(super::FmiDeploymentCapabilities::default())
+            .map_err(|error| FmiCCodegenError(error.0))?
+            .try_c()
+    }
+
+    /// The narrowest profile that executes the component's events: none,
+    /// events fixed between parameter changes, or the event iteration.
+    fn profile(
+        self,
+    ) -> Result<(Profile, super::static_assertions::DiscreteOrder), FmiCCodegenError> {
+        let no_order = super::static_assertions::DiscreteOrder::default;
         if !self.event_indicators.sources().is_empty() {
-            let events = super::scalar_events::validate(&self.model).map_err(FmiCCodegenError)?;
-            return Ok(FmiCCodegenView {
-                profile: Profile::ScalarEvents(self, Box::new(events)),
-                update_order,
-                update_levels,
-                discrete_order: super::static_assertions::DiscreteOrder::default(),
-            });
+            return self.scalar_events().map(|profile| (profile, no_order()));
         }
         if crate::solve_event_class(&self.model.problem).is_none() {
             return self
                 .try_event_free()
-                .map(|value| FmiCCodegenView {
-                    profile: Profile::EventFree(value),
-                    update_order,
-                    update_levels,
-                    discrete_order: super::static_assertions::DiscreteOrder::default(),
-                })
+                .map(|value| (Profile::EventFree(value), no_order()))
                 .map_err(|_| FmiCCodegenError("event-free narrowing failed"));
         }
-        let discrete_order =
-            super::static_assertions::validate(&self.model).map_err(FmiCCodegenError)?;
-        Ok(FmiCCodegenView {
-            profile: Profile::StaticAssertions(self),
+        match super::static_assertions::validate(&self.model) {
+            Ok(order) => Ok((Profile::StaticAssertions(self), order)),
+            // Events that follow time, states, or inputs, and the discrete
+            // rows that follow them, run through the event iteration even
+            // when no continuous indicator monitors them.
+            Err(super::static_assertions::StaticRefusal::EventIteration(_)) => {
+                self.scalar_events().map(|profile| (profile, no_order()))
+            }
+            Err(refusal) => Err(FmiCCodegenError(refusal.message())),
+        }
+    }
+
+    fn scalar_events(self) -> Result<Profile, FmiCCodegenError> {
+        let events = super::scalar_events::validate(&self.model).map_err(FmiCCodegenError)?;
+        Ok(Profile::ScalarEvents(self, Box::new(events)))
+    }
+}
+
+impl FmiCCodegenView {
+    pub(super) fn from_deployment(
+        deployment: super::FmiDeploymentView,
+    ) -> Result<Self, FmiCCodegenError> {
+        let (view, deployment) = deployment.into_parts();
+        let (update_order, update_levels) = admit_kernel(&view.model, &view.metadata)?;
+        let binding_execution = super::binding_execution::BindingExecution::checked(
+            view.model.problem.initialization.update_rhs(),
+            view.model.problem.initialization.update_targets(),
+            &update_order,
+        )
+        .map_err(FmiCCodegenError)?;
+        let state_reinitializations =
+            super::state_event_access::derive(&view.model.problem, view.metadata.variables());
+        let (profile, discrete_order) = view.profile()?;
+        Ok(Self {
+            profile,
+            deployment,
             update_order,
+            binding_execution,
             update_levels,
+            state_reinitializations,
             discrete_order,
         })
     }
@@ -77,27 +112,104 @@ impl FmiCodegenView {
 impl TryFrom<FmiEventFreeCodegenView> for FmiCCodegenView {
     type Error = FmiCCodegenError;
     fn try_from(value: FmiEventFreeCodegenView) -> Result<Self, Self::Error> {
-        validate_variables(&value.metadata)?;
-        let (update_order, update_levels) =
-            super::parameter_updates::validate(value.problem(), value.pure_calls())
-                .map_err(FmiCCodegenError)?;
+        let deployment = super::FmiDeploymentCapabilities::default()
+            .admit(&value.metadata)
+            .map_err(|error| FmiCCodegenError(error.0))?;
+        let (update_order, update_levels) = admit_kernel(&value.model, &value.metadata)?;
+        let binding_execution = super::binding_execution::BindingExecution::checked(
+            value.model.problem.initialization.update_rhs(),
+            value.model.problem.initialization.update_targets(),
+            &update_order,
+        )
+        .map_err(FmiCCodegenError)?;
+        let state_reinitializations =
+            super::state_event_access::derive(&value.model.problem, value.metadata.variables());
         Ok(Self {
             profile: Profile::EventFree(value),
+            deployment,
             update_order,
+            binding_execution,
             update_levels,
+            state_reinitializations,
             discrete_order: super::static_assertions::DiscreteOrder::default(),
         })
     }
 }
 
+fn admit_kernel(
+    model: &crate::SolveModel,
+    metadata: &FmiMetadata,
+) -> Result<(Vec<usize>, usize), FmiCCodegenError> {
+    super::initial_mode::validate(model).map_err(FmiCCodegenError)?;
+    validate_initial_values(model)?;
+    validate_variables(metadata)?;
+    refuse_recursive_groups(&model.pure_calls)?;
+    super::parameter_updates::validate(&model.problem, &model.pure_calls).map_err(FmiCCodegenError)
+}
+
+fn validate_initial_values(model: &crate::SolveModel) -> Result<(), FmiCCodegenError> {
+    for values in [&model.initial_y, &model.parameters] {
+        values
+            .require_finite()
+            .map_err(|_| FmiCCodegenError("non-finite initialization value"))?;
+    }
+    if model.initial_y.len() != model.problem.layout.y_scalars()
+        || model.parameters.len() != model.problem.layout.p_scalars()
+    {
+        return Err(FmiCCodegenError(
+            "initial-value owners disagree with checked storage capacity",
+        ));
+    }
+    Ok(())
+}
+
+/// The C profile emits no recursive call or depth-carrying frame, so a
+/// SOLVE-C62 recursive owner group is refused before any C is generated.
+fn refuse_recursive_groups(table: &crate::SolvePureCallTable) -> Result<(), FmiCCodegenError> {
+    if table.recursive_groups().is_empty() {
+        Ok(())
+    } else {
+        Err(FmiCCodegenError(
+            "recursive function calls (SOLVE-C62 recursive owner groups) are not supported by the C FMI profile",
+        ))
+    }
+}
+
 /// Every public variable has one FMI value type the generated component
-/// reads and writes through its storage: Real as Float64, Integer and
-/// enumeration ordinals as Int32 (FMI 2 Integer), Boolean as Boolean, all
+/// reads and writes through its storage: Real as Float64, Integer as Int64
+/// (FMI 2 Integer), an enumeration ordinal as Int64 (FMI 2 Integer; the
+/// ordinal range is its type's literal count), Boolean as Boolean, all
 /// held in the numeric storage run; a String parameter or constant as its
 /// literal text, which no numeric program reads.
 fn validate_variables(metadata: &FmiMetadata) -> Result<(), FmiCCodegenError> {
     use crate::{SolveVariableStorageRole as Role, SolveVariableValueKind as Kind};
     for variable in metadata.variables() {
+        if variable.instantiation_start().is_missing()
+            && matches!(
+                variable.value_kind(),
+                Kind::Integer | Kind::Boolean | Kind::Enumeration
+            )
+        {
+            return Err(FmiCCodegenError(
+                "a typed C variable needs source-issued exact initialization",
+            ));
+        }
+        if let crate::SolveDeclarationStart::Integer(values)
+        | crate::SolveDeclarationStart::Enumeration(values) = variable.instantiation_start()
+        {
+            let representable =
+                |value: &i64| rumoca_core::integer_within_binary64_exact_range(*value);
+            if !values.runs().all(|run| match run {
+                crate::SolveExactInitialRun::Repeat { value, .. } => representable(value),
+                crate::SolveExactInitialRun::Literal { values, .. } => {
+                    values.iter().all(representable)
+                }
+            }) {
+                return Err(FmiCCodegenError(
+                    "exact Integer initialization is outside the C numerical storage profile",
+                ));
+            }
+        }
         match variable.value_kind() {
             Kind::Real => {}
             Kind::Integer | Kind::Boolean | Kind::Enumeration => {
@@ -142,7 +254,7 @@ impl FmiCCodegenView {
             Profile::ScalarEvents(v, _) => &v.model,
         }
     }
-    fn metadata(&self) -> &FmiMetadata {
+    pub(super) fn metadata(&self) -> &FmiMetadata {
         match &self.profile {
             Profile::EventFree(v) => &v.metadata,
             Profile::StaticAssertions(v) => &v.metadata,
@@ -184,17 +296,104 @@ impl FmiCCodegenView {
     }
 }
 
-impl Serialize for FmiCCodegenView {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+/// Named, read-only instantiation buffers of the retained checked kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FmiInstantiationBuffer {
+    Solver,
+    Parameters,
+}
+
+impl FmiInstantiationBuffer {
+    pub const ALL: [Self; 2] = [Self::Solver, Self::Parameters];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Solver => "initial_y",
+            Self::Parameters => "initial_parameters",
+        }
+    }
+}
+
+impl FmiCCodegenView {
+    /// Borrow the declaration inventory admitted by this exact C profile.
+    pub fn variables(&self) -> &[super::FmiVariable] {
+        self.metadata().variables()
+    }
+
+    /// Discrete value rows recomputed by the admitted public getter.
+    /// Other profiles emit no observation refresh; root metadata alone does
+    /// not authorize differentiating a row the public getter never executes.
+    pub fn public_observation_rows(&self) -> &[bool] {
+        match &self.profile {
+            Profile::ScalarEvents(_, events) => events.public_observation_rows(),
+            _ => &[],
+        }
+    }
+
+    /// Whether initialization requires the scalar-event transaction owner.
+    pub fn requires_event_iteration(&self) -> bool {
+        matches!(self.profile, Profile::ScalarEvents(..))
+    }
+
+    /// Exact dependency order of the admitted initialization binding programs.
+    /// The shared execution projection owns lifecycle-specific output commits;
+    /// neither a backend nor a numerical consumer may split source programs.
+    pub fn parameter_binding_programs(&self) -> &[usize] {
+        &self.update_order
+    }
+
+    /// The exact source allocation retained by the admitted binding projection.
+    pub fn parameter_binding_source(&self) -> &crate::ScalarProgramBlock {
+        self.binding_execution.source()
+    }
+
+    /// Whole programs in dependency order, with constructor-issued commit rows.
+    pub fn parameter_binding_execution(&self) -> &[super::FmiBindingProgram] {
+        self.binding_execution.programs()
+    }
+
+    /// Exact parameter-determined discrete programs the C refresh executes.
+    /// These are program identities, not row ordinals or event-memory owners.
+    pub fn parameter_discrete_programs(&self) -> &[usize] {
+        &self.discrete_order.equations
+    }
+
+    pub fn instantiation_values(
+        &self,
+        buffer: FmiInstantiationBuffer,
+    ) -> &crate::SolveInitialValues {
+        match buffer {
+            FmiInstantiationBuffer::Solver => &self.model().initial_y,
+            FmiInstantiationBuffer::Parameters => &self.model().parameters,
+        }
+    }
+
+    /// Project one checked declaration through the canonical template field issuer.
+    pub fn serialize_variable_entries<M: SerializeMap>(
+        &self,
+        index: usize,
+        entries: &mut M,
+    ) -> Result<(), M::Error> {
+        let variable = self.metadata().variables().get(index).ok_or_else(|| {
+            <M::Error as serde::ser::Error>::custom("FMI variable ordinal is out of bounds")
+        })?;
+        super::metadata_projection::SerializedFmiVariable(variable).serialize_entries(entries)
+    }
+
+    /// The single field inventory for serde and read-only template projections.
+    pub fn serialize_entries<M: SerializeMap>(&self, entries: &mut M) -> Result<(), M::Error> {
         let metadata = self.metadata();
-        let mut entries = serializer.serialize_map(Some(13))?;
-        entries.serialize_entry("initial_y", &self.model().initial_y)?;
-        entries.serialize_entry("initial_parameters", &self.model().parameters)?;
+        entries.serialize_entry("deployment", &self.deployment)?;
+        for buffer in FmiInstantiationBuffer::ALL {
+            entries.serialize_entry(buffer.name(), self.instantiation_values(buffer))?;
+        }
         entries.serialize_entry(
             "variables",
-            &super::metadata::SerializedFmiVariables::borrowing(metadata.variables()),
+            &super::metadata_projection::SerializedFmiVariables::borrowing(metadata.variables()),
         )?;
+        entries.serialize_entry("enumerations", &metadata.enumerations())?;
         entries.serialize_entry("state_variable_indices", metadata.state_variable_indices())?;
+        entries.serialize_entry("state_reinitializations", &self.state_reinitializations)?;
         entries.serialize_entry(
             "derivative_value_reference_base_fmi3",
             &metadata.derivative_value_reference_base_fmi3(),
@@ -223,8 +422,17 @@ impl Serialize for FmiCCodegenView {
             },
         )?;
         entries.serialize_entry("update_order", &self.update_order)?;
+        entries.serialize_entry("binding_execution", self.binding_execution.programs())?;
         entries.serialize_entry("discrete_equations", &self.discrete_order.equations)?;
         entries.serialize_entry("discrete_memories", &self.discrete_order.memories)?;
+        Ok(())
+    }
+}
+
+impl Serialize for FmiCCodegenView {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut entries = serializer.serialize_map(Some(16))?;
+        self.serialize_entries(&mut entries)?;
         entries.end()
     }
 }

@@ -10,7 +10,7 @@ use super::{ParamEvalContext, ParamEvaluator, Value};
 pub(super) struct DimensionScope<'a, 'b> {
     parameters: &'a ParamEvalContext<'b>,
     evaluator: Rc<OnceCell<RefCell<ParamEvaluator<'b>>>>,
-    indices: Vec<String>,
+    indices: Vec<(rumoca_core::IndexBinderProvenance, String)>,
 }
 
 impl<'a, 'b> std::ops::Deref for DimensionScope<'a, 'b> {
@@ -29,15 +29,15 @@ impl<'a, 'b> DimensionScope<'a, 'b> {
         }
     }
 
-    pub(super) fn bind_index(&mut self, name: &str) {
-        self.indices.push(name.to_owned());
+    pub(super) fn bind_index(&mut self, index: &ComprehensionIndex) {
+        self.indices.push((index.binder, index.name.clone()));
     }
 
     pub(super) fn is_index(&self, reference: &Reference) -> bool {
         is_lexical_index(reference, &self.indices)
     }
 
-    fn value(&self, expr: &Expression) -> Option<Value> {
+    pub(super) fn value_of(&self, expr: &Expression) -> Option<Value> {
         if !self.indices.is_empty() {
             let mut reads = IndexReads {
                 indices: self.indices.clone(),
@@ -55,30 +55,34 @@ impl<'a, 'b> DimensionScope<'a, 'b> {
     }
 
     pub(super) fn integer(&self, expr: &Expression) -> Option<i64> {
-        self.value(expr)?.as_integer()
-    }
-
-    pub(super) fn real(&self, expr: &Expression) -> Option<f64> {
-        self.value(expr)?.to_real()
+        self.value_of(expr)?.as_integer()
     }
 
     pub(super) fn boolean(&self, expr: &Expression) -> Option<bool> {
-        self.value(expr)?.as_bool()
+        self.value_of(expr)?.as_bool()
     }
 
     pub(super) fn has_scalar_value(&self, expr: &Expression) -> bool {
-        self.value(expr)
+        self.value_of(expr)
             .is_some_and(|value| !matches!(value, Value::Array(_)))
     }
 }
 
 struct IndexReads {
-    indices: Vec<String>,
+    indices: Vec<(rumoca_core::IndexBinderProvenance, String)>,
     found: bool,
 }
 
-fn is_lexical_index(reference: &Reference, indices: &[String]) -> bool {
-    reference.instance_id().is_none() && indices.iter().any(|index| index == reference.as_str())
+fn is_lexical_index(
+    reference: &Reference,
+    indices: &[(rumoca_core::IndexBinderProvenance, String)],
+) -> bool {
+    indices.iter().any(|(binder, name)| match binder {
+        rumoca_core::IndexBinderProvenance::Source(id) => reference.target_def_id() == Some(*id),
+        rumoca_core::IndexBinderProvenance::Generated => {
+            reference.is_generated() && name == reference.as_str()
+        }
+    })
 }
 
 impl ExpressionVisitor for IndexReads {
@@ -94,9 +98,13 @@ impl ExpressionVisitor for IndexReads {
         filter: Option<&Expression>,
     ) {
         let outer = self.indices.clone();
-        for index in indices {
+        for index in indices.iter().rev() {
             self.visit_expression(&index.range);
-            self.indices.retain(|name| name != &index.name);
+            self.indices.retain(|(binder, name)| {
+                *binder != index.binder
+                    || (*binder == rumoca_core::IndexBinderProvenance::Generated
+                        && name != &index.name)
+            });
         }
         self.visit_expression(expr);
         if let Some(filter) = filter {

@@ -108,9 +108,7 @@ pub(super) fn mark_member_function_calls_in_equation(
             lhs: marker.transform_expression(lhs),
             rhs: marker.transform_expression(rhs),
         },
-        rumoca_ir_ast::Equation::Connect { lhs, rhs } => {
-            rumoca_ir_ast::Equation::Connect { lhs, rhs }
-        }
+        connect @ rumoca_ir_ast::Equation::Connect { .. } => connect,
         rumoca_ir_ast::Equation::For { indices, equations } => rumoca_ir_ast::Equation::For {
             indices: indices
                 .into_iter()

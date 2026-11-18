@@ -2,7 +2,12 @@
 //! shared-value segments (SPEC_0043 §6a): the construction the JIT and the
 //! generated C also execute, each segment committing its targets before the
 //! next runs.
+//!
+//! A selected backend must lower every issued schedule at construction. Only
+//! explicit reference execution prepares interpreter schedules. Nothing is
+//! prepared or decided while the runtime runs.
 
+use super::ScalarExecutionView;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -10,21 +15,23 @@ use rumoca_eval_solve::{EvalSolveError, PreparedEvaluationBlock};
 use rumoca_ir_solve as solve;
 use rustc_hash::FxHashMap;
 
-use super::SolveRuntime;
+use super::{CompiledSolveAssignmentSchedule, SolveExecutionBackend};
 use crate::RuntimeSolveError;
 
 /// One schedule prepared for the interpreter: its segments as programs and
 /// the solver slot of every output, in segment order.
 pub(crate) struct InterpretedSchedule {
-    sequence: solve::RefreshSequenceId,
-    block: PreparedEvaluationBlock,
-    shared: solve::SharedAssignmentSchedule,
+    pub(super) block: PreparedEvaluationBlock,
+    pub(super) targets: Vec<usize>,
 }
 
-/// The prepared schedules of one runtime, by refresh sequence. Construction
-/// proves each distinct ordered program identity once and shares it across
-/// issued sequences for interpreter and native preparation. A sequence without
-/// an issued schedule has no entry.
+/// The compiled schedules the backend admitted, by refresh sequence.
+pub(crate) type CompiledSchedules =
+    FxHashMap<solve::RefreshSequenceId, Rc<dyn CompiledSolveAssignmentSchedule>>;
+
+/// The interpreter copies of the schedules no compiled form executes, by
+/// refresh sequence. A sequence without an issued schedule, or whose schedule
+/// the backend admitted, has no entry.
 #[derive(Default)]
 pub(crate) struct InterpretedSchedules {
     prepared: FxHashMap<solve::RefreshSequenceId, Rc<InterpretedSchedule>>,
@@ -42,65 +49,59 @@ impl Clone for InterpretedSchedules {
 }
 
 impl InterpretedSchedules {
-    /// The first issued sequence with this exact ordered program identity.
-    pub(super) fn canonical_sequence(
-        &self,
-        sequence: solve::RefreshSequenceId,
-    ) -> Option<solve::RefreshSequenceId> {
-        self.prepared
-            .get(&sequence)
-            .map(|schedule| schedule.sequence)
-    }
-
-    pub(super) fn shared(
-        &self,
-        sequence: solve::RefreshSequenceId,
-    ) -> Option<&solve::SharedAssignmentSchedule> {
-        self.prepared
-            .get(&sequence)
-            .map(|schedule| &schedule.shared)
-    }
-
-    /// Prove and prepare every issued exact assignment schedule of `model`.
-    pub(crate) fn construct(model: &solve::SolveModel) -> Result<Self, EvalSolveError> {
+    /// Resolve every issued exact assignment schedule of `model` to its one
+    /// executor: a required compiled schedule for the selected backend, or a
+    /// proved interpreter copy for explicit reference execution.
+    pub(crate) fn construct(
+        model: &solve::SolveModel,
+        backend: Option<&dyn SolveExecutionBackend>,
+    ) -> Result<(CompiledSchedules, Self), EvalSolveError> {
         let continuous = &model.problem.continuous;
         let owners = &continuous.refresh_owners;
+        let mut compiled = CompiledSchedules::default();
         let mut prepared = FxHashMap::default();
-        // Program IDs bind source, targets and provenance within these owners.
-        // Equal ordered IDs therefore need one construction proof and one
-        // native preparation, while each issued sequence retains its lookup.
-        let mut unique = FxHashMap::<
-            &[solve::ExactRefreshAssignmentProgramId],
-            Rc<InterpretedSchedule>,
-        >::default();
         for schedule in owners.exact_assignment_schedules() {
-            let interpreted = match unique.entry(schedule.program_ids()) {
-                std::collections::hash_map::Entry::Occupied(entry) => Rc::clone(entry.get()),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let interpreted = Rc::new(prepare_schedule(
-                        schedule,
-                        &continuous.implicit_rhs,
-                        owners,
-                    )?);
-                    entry.insert(Rc::clone(&interpreted));
-                    interpreted
-                }
-            };
-            prepared.insert(schedule.sequence_id(), interpreted);
+            let sequence = schedule.sequence_id();
+            if let Some(backend) = backend {
+                let admitted =
+                    compile_schedule(backend, &continuous.implicit_rhs, owners, schedule)?;
+                compiled.insert(sequence, admitted);
+                continue;
+            }
+            let interpreted = prepare_schedule(schedule, &continuous.implicit_rhs, owners)?;
+            prepared.insert(sequence, Rc::new(interpreted));
         }
-        Ok(Self {
-            prepared,
-            outputs: RefCell::default(),
-        })
+        Ok((
+            compiled,
+            Self {
+                prepared,
+                outputs: RefCell::default(),
+            },
+        ))
     }
 }
 
-impl SolveRuntime {
-    /// How many issued exact assignment sequences have prepared execution
-    /// in this runtime. Identical ordered program IDs share preparation.
+/// A required schedule is either lowered completely or preparation fails.
+fn compile_schedule(
+    backend: &dyn SolveExecutionBackend,
+    source: &solve::ComputeBlock,
+    owners: &solve::ContinuousRefreshOwners,
+    schedule: &solve::ExactRefreshAssignmentSchedule,
+) -> Result<Rc<dyn CompiledSolveAssignmentSchedule>, EvalSolveError> {
+    super::required_compiled(
+        "assignment_schedule",
+        &[],
+        backend.compile_assignment_schedule(source, owners, schedule),
+    )
+}
+
+impl ScalarExecutionView<'_> {
+    /// How many issued exact assignment schedules the interpreter proved and
+    /// prepared when this runtime was built: those no compiled schedule
+    /// executes.
     #[must_use]
     pub fn interpreted_schedule_count(&self) -> usize {
-        self.interpreted_assignment_schedules.prepared.len()
+        self.scalar.interpreted_assignment_schedules.prepared.len()
     }
 
     /// Run the issued schedule of `sequence` through the interpreter; `false`
@@ -112,15 +113,13 @@ impl SolveRuntime {
         solver_y: &mut [f64],
         params: &[f64],
     ) -> Result<bool, RuntimeSolveError> {
-        let Some(schedule) = self
-            .interpreted_assignment_schedules
-            .prepared
-            .get(&sequence)
-        else {
+        let schedules = &self.scalar.interpreted_assignment_schedules;
+        let Some(schedule) = schedules.prepared.get(&sequence) else {
             return Ok(false);
         };
-        let mut outputs = self.interpreted_assignment_schedules.outputs.borrow_mut();
-        for (row, targets) in schedule.shared.target_rows().iter().enumerate() {
+        let mut outputs = schedules.outputs.borrow_mut();
+        let mut target = 0;
+        for row in 0..schedule.block.block().row_count() {
             schedule.block.eval_row_outputs_unchecked_with_context(
                 row,
                 solver_y,
@@ -129,15 +128,15 @@ impl SolveRuntime {
                 self.row_eval_context(),
                 &mut outputs,
             )?;
-            for (&target, &value) in targets.iter().zip(outputs.iter()) {
-                solver_y[target] = value;
+            for &value in outputs.iter() {
+                solver_y[schedule.targets[target]] = value;
+                target += 1;
             }
         }
         Ok(true)
     }
 }
-
-fn prepare_schedule(
+pub(super) fn prepare_schedule(
     schedule: &solve::ExactRefreshAssignmentSchedule,
     source: &solve::ComputeBlock,
     owners: &solve::ContinuousRefreshOwners,
@@ -150,10 +149,7 @@ fn prepare_schedule(
         Ok(shared) => shared,
         Err(error) => return Err(invalid(error.to_string())),
     };
+    let targets = shared.target_rows().iter().flatten().copied().collect();
     let block = PreparedEvaluationBlock::new(shared.block().clone())?;
-    Ok(InterpretedSchedule {
-        sequence: schedule.sequence_id(),
-        block,
-        shared,
-    })
+    Ok(InterpretedSchedule { block, targets })
 }

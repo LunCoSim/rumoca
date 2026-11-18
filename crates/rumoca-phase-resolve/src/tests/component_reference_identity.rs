@@ -353,7 +353,7 @@ equation
 end Top;
 "#;
     let tree = resolve_tree_source(source).into_inner();
-    let rumoca_ir_ast::Equation::Connect { lhs, rhs } =
+    let rumoca_ir_ast::Equation::Connect { lhs, rhs, .. } =
         &tree.definitions.classes["Top"].equations[0]
     else {
         panic!("fixture equation must be a connect");

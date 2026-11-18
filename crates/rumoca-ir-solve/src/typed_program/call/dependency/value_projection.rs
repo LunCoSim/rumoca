@@ -28,12 +28,12 @@ impl ValueProjections {
             let elements = projection.input_elements(
                 output.value_type(),
                 output_element,
-                inputs.get(projection.input)?,
+                inputs.get(projection.first_input())?,
             )?;
             let [element] = elements.as_slice() else {
                 return None;
             };
-            return Some((projection.input, *element));
+            return Some((projection.first_input(), *element));
         }
         None
     }
@@ -53,16 +53,15 @@ pub(in crate::typed_program) fn derive(
     }
     let mut slots = vec![None; body.slots().len()];
     for (index, slot) in slots.iter_mut().take(input_count).enumerate() {
-        *slot = Some(ValueProjection(SolveCallDependency {
-            input: index,
-            coordinates: Some(Coordinates::identity(
-                body.slots()[index].value_type().dimensions().len(),
-            )),
-        }));
+        *slot = Some(ValueProjection(SolveCallDependency::exact(
+            index,
+            Coordinates::identity(body.slots()[index].value_type().dimensions().len()),
+        )));
     }
     let mut registers = vec![None; body.register_types().len()];
     for spanned in body.operations() {
         match spanned.operation() {
+            SolveOperation::CheckAssertion { .. } => return None,
             SolveOperation::Load { destination, slot } => {
                 registers[destination.index()] = slots[slot.index()].clone();
             }
@@ -74,6 +73,7 @@ pub(in crate::typed_program) fn derive(
                 owner,
                 arguments,
                 destinations,
+                ..
             } => substitute_call(
                 available.get(owner.index() as usize)?.projections?,
                 arguments,
@@ -112,7 +112,7 @@ fn substitute_call(
     for (destination, projection) in destinations.iter().zip(&summary.0) {
         let result = match projection {
             Some(ValueProjection(input)) => {
-                let argument = arguments.get(input.input)?;
+                let argument = arguments.get(input.first_input())?;
                 remap(
                     &registers[argument.index()],
                     input.coordinates.as_ref()?,
@@ -149,9 +149,52 @@ fn remap(
     access: &Coordinates,
     provenance: Span,
 ) -> Option<Option<ValueProjection>> {
+    // An exact projection is never widened. One too large to compose within
+    // the budgets returns the outer `None`, which every caller propagates
+    // with `?`, so the whole ValueProjections certificate is declined; an
+    // output entry is never set to `None`, which would claim a constant.
+    if projection
+        .as_ref()
+        .is_some_and(|projection| projection.0.composition_exceeds_budget(access))
+    {
+        return None;
+    }
     projection
         .as_ref()
         .map(|projection| projection.0.remap(access, provenance).map(ValueProjection))
         .transpose()
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rumoca_core::SourceId;
+
+    fn span() -> Span {
+        Span::from_offsets(SourceId::from_source_name("projection.alg"), 0, 1)
+    }
+
+    fn projection(guards: usize) -> Option<ValueProjection> {
+        Some(ValueProjection(SolveCallDependency::exact(
+            0,
+            Coordinates::with_terms(0, 1, 1, 0, guards),
+        )))
+    }
+
+    #[test]
+    fn an_exact_projection_past_the_budget_declines_the_whole_certificate() {
+        let access = Coordinates::with_terms(0, 1, 1, 0, 0);
+        assert!(
+            matches!(remap(&projection(32), &access, span()), Some(Some(_))),
+            "within the budget the projection composes"
+        );
+        assert_eq!(
+            remap(&projection(33), &access, span()),
+            None,
+            "past it the OUTER None declines the certificate"
+        );
+        // A constant entry stays a constant: never widened, never declined.
+        assert_eq!(remap(&None, &access, span()), Some(None));
+    }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::TargetClosure;
 use crate::source_spans::required_location_span;
 use std::sync::Arc;
 
@@ -57,15 +58,49 @@ impl<'a> OverlayScopeIndex<'a> {
     }
 }
 
-pub(crate) fn initialize_flat_metadata(flat: &mut flat::Model, overlay: &ast::InstanceOverlay) {
+pub(crate) fn initialize_flat_metadata(
+    flat: &mut flat::Model,
+    overlay: &ast::InstanceOverlay,
+    closure: &TargetClosure,
+) {
     // MLS §4.7: Propagate partial status and class type from overlay
     flat.effective_types = overlay.effective_types.clone();
     flat.enumeration_types = overlay.enumeration_types.clone();
     flat.type_ids_by_def_id = overlay.type_ids_by_def_id.clone();
     flat.enumeration_type_roots = overlay.enumeration_type_roots.clone();
+    restrict_type_identities_to_closure(flat, overlay, closure);
     flat.is_partial = overlay.is_partial;
     flat.class_type = overlay.class_type.clone();
     flat.model_description = overlay.root_description.clone();
+}
+
+/// Drop the nominal type identities of classes outside the target closure, and
+/// the enumeration roots only those classes own.
+fn restrict_type_identities_to_closure(
+    flat: &mut flat::Model,
+    overlay: &ast::InstanceOverlay,
+    closure: &TargetClosure,
+) {
+    if closure.is_whole_tree() {
+        return;
+    }
+    let root_of = |type_id: &rumoca_core::TypeId| {
+        overlay.type_roots.get(type_id).copied().unwrap_or(*type_id)
+    };
+    let mut retained_roots = rustc_hash::FxHashSet::default();
+    let mut outside_roots = rustc_hash::FxHashSet::default();
+    flat.type_ids_by_def_id.retain(|def_id, type_id| {
+        let inside = closure.contains(*def_id);
+        let roots = if inside {
+            &mut retained_roots
+        } else {
+            &mut outside_roots
+        };
+        roots.insert(root_of(type_id));
+        inside
+    });
+    flat.enumeration_type_roots
+        .retain(|root| retained_roots.contains(root) || !outside_roots.contains(root));
 }
 
 pub(crate) fn variable_import_context_for_instance<'tree>(
@@ -858,8 +893,14 @@ fn track_top_level_component_markers(flat: &mut flat::Model, instance_data: &ast
     if instance_data.is_connector_type {
         flat.top_level_connectors.insert(name.clone());
     }
-    if matches!(&instance_data.causality, rumoca_core::Causality::Input(_)) {
-        flat.top_level_input_components.insert(name.clone());
+    match &instance_data.causality {
+        rumoca_core::Causality::Input(_) => {
+            flat.top_level_input_components.insert(name.clone());
+        }
+        rumoca_core::Causality::Output(_) => {
+            flat.top_level_output_components.insert(name.clone());
+        }
+        rumoca_core::Causality::Empty => {}
     }
 }
 
@@ -906,6 +947,12 @@ pub(crate) fn prepare_context_for_equation_flattening(
     // declaration defaults (MLS §7.2.3/§7.2.4, §8.3.3 structural ranges).
     ctx.build_parameter_lookup(flat, tree);
     inject_referenced_qualified_class_constants(tree, class_index, model_name, flat, overlay, ctx)?;
+    // MLS 3.7 §5.3: a binding names a package constant through any enclosing
+    // scope, up to the unnamed top level. A package outside the model's own
+    // enclosing classes is injected only by the referenced-scope pass above,
+    // so the parameters reading it are evaluated again before a dimension
+    // reads them.
+    ctx.build_parameter_lookup(flat, tree);
     if ctx.recompute_symbolic_component_dimensions(flat, overlay, tree)? {
         ctx.build_parameter_lookup(flat, tree);
     }
@@ -918,6 +965,8 @@ pub(crate) fn prepare_context_for_equation_flattening(
     // array-natively from the comprehension template).
     ctx.param_variability_families =
         crate::param_variability::prove_parameter_variability_families(overlay);
+    ctx.continuous_algebraic_targets =
+        crate::continuous_algebraic::ContinuousAlgebraicTargets::prove(overlay, &tree.type_table);
 
     let vcg_data = vcg::pre_collect_vcg_data(overlay, ctx)?;
     let optional_edges = vcg::derive_optional_edges(overlay, &vcg_data)?;
@@ -968,6 +1017,7 @@ pub(crate) struct FinalizeFlatModelInput<'a, 'tree> {
     pub(crate) tree: &'a ast::ClassTree,
     pub(crate) class_index: &'a ast::ClassDefIndex<'tree>,
     pub(crate) model_name: &'a str,
+    pub(crate) closure: &'a TargetClosure,
     pub(crate) options: FlattenOptions,
     pub(crate) flatten_graph: &'a FlattenGraphData,
     pub(crate) component_override_map: &'a ComponentOverrideMap,
@@ -983,6 +1033,7 @@ pub(crate) fn finalize_flat_model(
         tree,
         class_index,
         model_name,
+        closure,
         options,
         flatten_graph,
         component_override_map,
@@ -994,10 +1045,7 @@ pub(crate) fn finalize_flat_model(
         flatten_graph,
     )?;
 
-    seed_flat_functions_from_context(ctx, flat);
-    functions::collect_functions(flat, overlay, tree, class_index, Some(model_name))?;
-    rewrite_function_extends_aliases_in_flat_functions(flat, tree, class_index)?;
-    functions::collect_functions(flat, overlay, tree, class_index, Some(model_name))?;
+    collect_flat_functions(ctx, flat, overlay, tree, class_index, model_name)?;
     mark_record_constructor_calls(flat, tree);
     // Attach callable identity before the rewrite fixed point so rewritten
     // calls retain the exact collected target.
@@ -1018,7 +1066,7 @@ pub(crate) fn finalize_flat_model(
         flat,
     );
 
-    collapse_index_refs_to_known_varrefs(flat);
+    collapse_index_refs_to_known_varrefs(flat)?;
     inject_referenced_qualified_class_constants(tree, class_index, model_name, flat, overlay, ctx)?;
     ctx.seed_expanded_component_keys(flat);
     substitute_known_constants_in_flat(flat, ctx)?;
@@ -1049,7 +1097,7 @@ pub(crate) fn finalize_flat_model(
         )?;
         substitute_known_constants_in_flat(flat, ctx)?;
         mark_record_constructor_calls(flat, tree);
-        collapse_index_refs_to_known_varrefs(flat);
+        collapse_index_refs_to_known_varrefs(flat)?;
     }
     functions::canonicalize_collected_function_calls(flat, class_index)?;
     // Materialize source-level defaults while record inputs still have their
@@ -1057,12 +1105,16 @@ pub(crate) fn finalize_flat_model(
     // must not be copied onto the scalar ABI parameters created below.
     functions::materialize_flat_function_call_args(flat)?;
     functions::specialize_function_arguments(flat)?;
+    functions::thread_foreign_state(flat)?;
     // Record parameter signatures and every call site must change together.
     // Run this only after the rewrite fixed point: earlier lowering allowed a
     // later rewrite to reintroduce source-shaped record arguments against an
     // already decomposed signature.
     functions::lower_record_function_params(flat)?;
-    functions::split_branch_assigned_records(flat);
+    // Record argument decomposition introduces field projections over arrays
+    // and cat operands. Resolve their exact occurrences before shape analysis.
+    collapse_index_refs_to_known_varrefs(flat)?;
+    functions::split_branch_assigned_records(flat)?;
     expand_record_array_field_projections_in_equations(flat);
     // Recheck the decomposed ABI and materialize defaults of any scalar calls
     // introduced by record projection.
@@ -1074,12 +1126,14 @@ pub(crate) fn finalize_flat_model(
     inject_referenced_qualified_class_constants(tree, class_index, model_name, flat, overlay, ctx)?;
     substitute_known_constants_in_flat(flat, ctx)?;
     resolve_nested_constructor_field_access_bindings(flat);
-    crate::postprocess::fold_invariant_scalar_bindings(flat);
+    crate::postprocess::freeze_current_discrete_selections(flat);
+    crate::postprocess::fold_invariant_bindings(flat, &ctx.resource_roots);
     functions::prune_unreachable_functions(flat);
     functions::validate_flat_function_bindings(flat)?;
     ctx.refresh_enum_parameter_lookup(flat);
     enum_literals::canonicalize_flat_enum_literals(flat, tree, &ctx.enum_parameter_values);
-    flat.enum_literal_ordinals = collect_enum_literal_ordinals(tree);
+    flat.enum_literal_ordinals = collect_enum_literal_ordinals(tree, closure);
+    flat.enumeration_declarations = enum_literals::collect_enumeration_declarations(tree, flat);
     if options.simplify_variable_names {
         name_simplify::simplify_flat_names(flat)?;
     }
@@ -1090,6 +1144,34 @@ pub(crate) fn finalize_flat_model(
     })?;
 
     Ok(())
+}
+
+/// Collect the functions the model calls, resolving MLS §14 operator-record
+/// operators first. Operator functions called from collected bodies may
+/// themselves apply overloaded operators, so resolution and collection
+/// alternate until collection adds no function.
+fn collect_flat_functions(
+    ctx: &Context,
+    flat: &mut flat::Model,
+    overlay: &ast::InstanceOverlay,
+    tree: &ast::ClassTree,
+    class_index: &ast::ClassDefIndex<'_>,
+    model_name: &str,
+) -> Result<(), FlattenError> {
+    crate::operator_records::resolve_operator_overloads(flat, class_index)?;
+    seed_flat_functions_from_context(ctx, flat);
+    functions::collect_functions(flat, overlay, tree, class_index, Some(model_name))?;
+    rewrite_function_extends_aliases_in_flat_functions(flat, tree, class_index)?;
+    // Collection only adds functions declared in the class tree, so the
+    // alternation reaches a fixed point.
+    loop {
+        let collected = flat.functions.len();
+        crate::operator_records::resolve_operator_overloads(flat, class_index)?;
+        functions::collect_functions(flat, overlay, tree, class_index, Some(model_name))?;
+        if flat.functions.len() == collected {
+            return Ok(());
+        }
+    }
 }
 
 fn finalize_flat_connections(

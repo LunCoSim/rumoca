@@ -2,7 +2,16 @@ use super::*;
 use crate::{SolveRealFormat, SolveTypeConstructionError, SolveValueKind};
 use rumoca_core::{SourceId, StructuredIndexBinder, StructuredIndexDomain};
 
+mod assigned_state;
+mod boolean_extrema;
+mod fault_flow;
 mod linear_solve;
+mod loop_flow;
+mod native;
+mod pass_flow;
+mod read_flow;
+mod value_numbering;
+mod zero_result_conditional;
 
 fn span(start: usize) -> Span {
     Span::from_offsets(
@@ -289,6 +298,7 @@ fn compact_map_derives_tensor_shape_and_replays_its_checked_region() {
     let arithmetic = profile();
     let domain = StructuredIndexDomain {
         binders: vec![StructuredIndexBinder {
+            provenance: rumoca_core::IndexBinderProvenance::Generated,
             id: 0,
             display_name: "i".to_owned(),
             lower: 1,
@@ -335,6 +345,7 @@ fn invalid_map_domain_commits_no_destination_or_operation() {
         let one = builder.constant(SolveValue::real(arithmetic, 1.0), span(30))?;
         let invalid = StructuredIndexDomain {
             binders: vec![StructuredIndexBinder {
+                provenance: rumoca_core::IndexBinderProvenance::Generated,
                 id: 0,
                 display_name: "i".to_owned(),
                 lower: 1,
@@ -571,6 +582,7 @@ fn fold_rejects_an_invalid_domain_before_building_its_transition() {
         builder.fold(
             rumoca_core::StructuredIndexDomain {
                 binders: vec![rumoca_core::StructuredIndexBinder {
+                    provenance: rumoca_core::IndexBinderProvenance::Generated,
                     id: 0,
                     display_name: "i".into(),
                     lower: 1,
@@ -594,6 +606,58 @@ fn fold_rejects_an_invalid_domain_before_building_its_transition() {
             provenance: span(1)
         }
     );
+}
+
+#[test]
+fn a_fold_predicate_takes_the_binders_of_the_pass_beside_the_tuple_and_captures() {
+    let arithmetic = profile();
+    let integer = SolveValueType::scalar(SolveScalarType::integer(arithmetic));
+    let program = TypedProgram::construct(arithmetic, |builder| {
+        let initial = builder.constant(SolveValue::integer(arithmetic, 0).unwrap(), span(0))?;
+        let bound = builder.constant(SolveValue::integer(arithmetic, 3).unwrap(), span(0))?;
+        builder.fold_while(
+            StructuredIndexDomain {
+                binders: vec![StructuredIndexBinder {
+                    provenance: rumoca_core::IndexBinderProvenance::Generated,
+                    id: 0,
+                    display_name: "i".into(),
+                    lower: 1,
+                    upper: 9,
+                    step: 1,
+                }],
+            },
+            &[initial],
+            &[bound],
+            span(1),
+            |region, _carried, captures, binders, outputs| {
+                let index = region.load(binders[0], span(2))?;
+                let bound = region.load(captures[0], span(2))?;
+                let within =
+                    region.compare(SolveCompareOperator::LessEqual, index, bound, span(2))?;
+                region.store(outputs[0], within, span(2))
+            },
+            |region, carried, _captures, _binders, outputs| {
+                let sum = region.load(carried[0], span(3))?;
+                region.store(outputs[0], sum, span(3))
+            },
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let SolveOperation::Fold {
+        transition,
+        continuation: Some(predicate),
+        ..
+    } = program.operations()[2].operation()
+    else {
+        panic!("the third operation is the fold with its predicate");
+    };
+    // Tuple, capture, binder: the predicate and the transition share inputs.
+    assert_eq!(
+        predicate.inputs(),
+        [integer.clone(), integer.clone(), integer]
+    );
+    assert_eq!(predicate.inputs(), transition.inputs());
 }
 
 #[test]
@@ -641,6 +705,8 @@ fn integer_divide_cannot_bypass_an_explicit_real_conversion() {
     })
     .expect("rejected division leaves the valid typed prefix intact");
 }
+
+mod integer_quotients;
 
 #[test]
 fn integer_quotient_is_integer_only() {
@@ -708,4 +774,61 @@ fn wire_rejects_forged_register_dominance() {
     let error = serde_json::from_value::<TypedProgram>(json)
         .expect_err("wire cannot forge a forward register definition");
     assert!(error.to_string().contains("does not replay"), "{error}");
+}
+
+/// A view update whose value is its own aggregate is admitted only when the
+/// view covers the whole aggregate in order, so the update rewrites each cell
+/// with itself and never permutes one: an executor may alias its destination
+/// to a last-read aggregate without a transposing hazard.
+#[test]
+fn a_view_update_of_an_aggregate_by_itself_is_the_identity_view() {
+    let arithmetic = profile();
+    TypedProgram::construct(arithmetic, |builder| {
+        let full = [
+            ProgramTensorViewAxis::Span {
+                origin: 0,
+                extent: 2,
+            },
+            ProgramTensorViewAxis::Span {
+                origin: 0,
+                extent: 2,
+            },
+        ];
+        let partial = [
+            ProgramTensorViewAxis::Span {
+                origin: 1,
+                extent: 1,
+            },
+            ProgramTensorViewAxis::Span {
+                origin: 0,
+                extent: 2,
+            },
+        ];
+        let one = builder.constant(SolveValue::real(arithmetic, 1.0), span(0))?;
+        let square = builder.fill(one, vec![2, 2], span(1))?;
+        builder.update_view(square, square, &full, span(2))?;
+        assert!(
+            builder
+                .update_view(square, square, &partial, span(3))
+                .is_err()
+        );
+        let index = builder.constant(
+            SolveValue::integer(arithmetic, 1).expect("index fits the checked domain"),
+            span(4),
+        )?;
+        let reduced = [
+            ProgramTensorViewAxis::Index(index),
+            ProgramTensorViewAxis::Span {
+                origin: 0,
+                extent: 2,
+            },
+        ];
+        assert!(
+            builder
+                .update_view(square, square, &reduced, span(5))
+                .is_err()
+        );
+        Ok(())
+    })
+    .expect("the identity view constructs");
 }

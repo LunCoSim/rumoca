@@ -18,6 +18,6 @@ impl FmiRuntimeView<'_> {
     pub fn validate_parameter_only_events(&self) -> Result<(), FmiParameterEventError> {
         super::static_assertions::validate(self.model)
             .map(|_| ())
-            .map_err(FmiParameterEventError)
+            .map_err(|error| FmiParameterEventError(error.message()))
     }
 }

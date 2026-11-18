@@ -8,29 +8,61 @@ use rumoca_core::Span;
 use rumoca_ir_solve as solve;
 use serde::{Deserialize, Serialize};
 
-/// NaN / non-finite runtime tracing, exposed through the sim facade so the CLI
-/// (and library users) can switch it on without an environment variable. See
-/// [`rumoca_eval_solve::nan_trace`].
-pub use rumoca_eval_solve::nan_trace;
+#[cfg(feature = "native-fmi-ls")]
+mod native_fmi_ls;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-fmi-ls-build"))]
+pub use native_fmi_ls::LinkedNativeFmiLsComponent;
+#[cfg(feature = "native-fmi-ls")]
+pub use native_fmi_ls::{NativeFmiLsPreparationError, PreparedNativeFmiLsModel};
+
+/// Checked Solve-only preparation and replay, plus runtime non-finite tracing.
+pub use rumoca_eval_solve::{
+    artifacts::lower_solve_artifacts,
+    fmi_wire::{deserialize_fmi_component, retained_fmi_component_wire},
+    model_wire::{deserialize_solve_model, solve_model_wire},
+    nan_trace,
+};
 use rumoca_ir_dae as dae;
-pub use rumoca_phase_solve::{
-    deserialize_solve_model,
-    fmi::{deserialize_fmi_component, fmi_component_wire, runtime_fmi_component_wire},
-    lower_solve_artifacts, lower_solve_problem, solve_model_wire,
-};
+pub use rumoca_phase_solve::{fmi::finish_fmi_component, lower_solve_package, lower_solve_problem};
+
+/// Refinement of a checked GALEC package into the Solve algorithm block an
+/// `algorithm-block` target prints its C from (#483).
+pub mod algorithm_block {
+    pub use rumoca_phase_solve::{AlgorithmBlockLowerError, lower_algorithm_block};
+}
+
 pub use rumoca_solver::{
-    DiffsolMethod, HotpathStatsSnapshot, ProjectionFallback, ProjectionFallbackCounts,
-    ProjectionFallbackReport, ProjectionSite, RuntimeProgressSnapshot, RuntimeStopSchedule,
-    RuntimeTraceContext, SimBackend, SimOptions, SimPacingMode, SimResult, SimSolverMode,
-    SimVariableMeta, SimulationRequestSummary, SimulationRunMetrics, SolverDeadlineGuard,
-    TimeoutBudget, TimeoutExceeded, build_simulation_metrics_value, build_simulation_payload,
-    is_solver_timeout_panic, panic_on_expired_solver_deadline, projection_fallbacks,
-    projection_fallbacks_value, reset_projection_fallbacks, reset_step_counts, run_timeout_result,
-    run_timeout_step, run_timeout_step_result, runtime_progress_snapshot,
-    shared_value_proof_failures, step_counts, stop_time_reached_with_tol, time_advanced_with_tol,
-    time_match_with_tol, trace_runtime_done, trace_runtime_progress, trace_runtime_start,
-    trace_runtime_step_fail, trace_runtime_timeout,
+    DataSeries, DiffsolMethod, HotpathStatsSnapshot, ObjectiveGradient, ProjectionFallback,
+    ProjectionFallbackCounts, ProjectionFallbackReport, ProjectionSite, RunningKind, RunningTerm,
+    RuntimeProgressSnapshot, RuntimeStopSchedule, RuntimeTraceContext, SimBackend,
+    SimExecutionEngine, SimExecutionPolicy, SimExecutionReceipt, SimNativeDecline,
+    SimNativeRefusal, SimOptions, SimPacingMode, SimResult, SimSolverMode, SimVariableMeta,
+    SimulationRequestSummary, SimulationRunMetrics, SolverDeadlineGuard, TerminalTerm,
+    TimeoutBudget, TimeoutExceeded, TrajectoryObjective, build_simulation_metrics_value,
+    build_simulation_payload, is_solver_timeout_panic, panic_on_expired_solver_deadline,
+    projection_fallbacks, projection_fallbacks_value, reset_projection_fallbacks,
+    reset_step_counts, run_timeout_result, run_timeout_step, run_timeout_step_result,
+    runtime_progress_snapshot, shared_value_proof_failures, step_counts,
+    stop_time_reached_with_tol, time_advanced_with_tol, time_match_with_tol, trace_runtime_done,
+    trace_runtime_progress, trace_runtime_start, trace_runtime_step_fail, trace_runtime_timeout,
 };
+
+macro_rules! scheduled_executor_items {
+    ($($item:item)*) => {
+        $(
+            #[cfg(all(
+                feature = "scheduled-sim",
+                feature = "scenario-config",
+                feature = "input-keyboard",
+                feature = "transport-udp",
+                feature = "transport-zenoh",
+                feature = "viewer-web",
+                feature = "process-control"
+            ))]
+            $item
+        )*
+    };
+}
 
 mod build_timing;
 pub mod bulk;
@@ -43,11 +75,14 @@ mod me_backend;
 #[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
 pub use initialization::initialize_fmi_component;
 pub mod row_eval_trace;
+#[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
+mod session_protocol;
 pub mod sim_trace_compare;
 #[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
 mod simulation_session;
-#[cfg(feature = "scheduled-sim")]
-mod simulation_session_api;
+scheduled_executor_items! {
+    mod simulation_session_api;
+}
 
 #[cfg(feature = "solver-diffsol")]
 mod diffsol;
@@ -65,40 +100,27 @@ pub mod native_code_cache {
         NativeCodeCacheUsage, with_native_code_cache,
     };
 }
-/// Wasm builds carry no compiled native backend at all; the one shared
-/// admission gate uniformly withholds so every caller composes through the
-/// same name on every target.
 #[cfg(all(
     target_arch = "wasm32",
     any(feature = "solver-rk45", feature = "solver-diffsol")
 ))]
-mod native_execution {
-    pub(crate) fn admitted_native_execution_backend(
-        _opts: &rumoca_solver::SimOptions,
-        _model: &rumoca_ir_solve::SolveModel,
-    ) -> Option<rumoca_solver::fmi_me::MeExecutionBackend> {
-        None
-    }
-}
+use wasm_execution as native_execution;
 
-/// Construct the component's opaque execution backend for an external ME host.
-///
-/// Numerical plugins pass this handle to `MeRetainedComponent::instantiate`;
-/// they do not inspect or compile the component's Solve IR. This uses the same
-/// native admission owner as the built-in numerical solvers. An explicit
-/// interpreter policy, or a Wasm target without native compilation, returns
-/// `None`.
-#[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
-pub fn fmi_execution_backend(
-    component: &rumoca_ir_solve::fmi::FmiComponent,
-    options: &SimOptions,
-) -> Option<rumoca_solver::fmi_me::MeExecutionBackend> {
-    native_execution::admitted_native_execution_backend(options, component.runtime_view().model())
-}
-
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "solver-rk45", feature = "solver-diffsol")
+))]
+pub use native_execution::{
+    NativeComputeInventory, native_compute_inventory, native_initialization_inventory,
+};
 #[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
 mod prepared_vectors;
 mod solve_lowering;
+#[cfg(all(
+    any(target_arch = "wasm32", test),
+    any(feature = "solver-rk45", feature = "solver-diffsol")
+))]
+mod wasm_execution;
 pub use build_timing::BuildSimulationTimings;
 #[cfg(feature = "solver-diffsol")]
 pub use diffsol::{
@@ -111,26 +133,41 @@ pub use error::{SimError, SimFailureStage};
 #[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
 pub use prepared_vectors::{PreparedVectorError, refresh_prepared_vectors};
 #[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
+pub use session_protocol::{
+    SESSION_MAX_LINE_BYTES, SESSION_PARENT_DISCONNECTED_EXIT_CODE,
+    SESSION_PROTOCOL_MISMATCH_EXIT_CODE, SESSION_PROTOCOL_VERSION, SessionCommand, SessionEvent,
+    SessionServeExit, serve_session,
+};
+#[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
 pub use simulation_session::{SessionState, SimulationSession};
-#[cfg(feature = "scheduled-sim")]
-pub(crate) use simulation_session_api::SimulationSessionApi;
+scheduled_executor_items! {
+    pub(crate) use simulation_session_api::SimulationSessionApi;
+}
 // The inspection/debug facade (probes + their named report types) is surfaced
 // through `solve_lowering` so the root stays a curated same-crate facade; the
 // report types are re-exported from there rather than as root cross-crate uses.
-#[cfg(feature = "fmi")]
-pub use solve_lowering::lower_fmi_component;
 pub use solve_lowering::{
-    BlockReport, EvalAtProbe, EvalAtReport, EvalAtSlot, JacobianProbe, JacobianReport,
-    ObjectiveGradientProbe, ParameterJacobianProbe, SimulationDiagnosticError,
+    BlockReport, EX010_SESSION_PROTOCOL_VERSION, EX011_SESSION_MALFORMED_COMMAND,
+    EX012_SESSION_INVALID_ARGUMENT, EvalAtProbe, EvalAtReport, EvalAtSlot, JacobianProbe,
+    JacobianReport, ObjectiveGradientProbe, ParameterJacobianProbe, SimulationDiagnosticError,
     SingularityDiagnosis, StateAndParameterJacobianProbe, SteadyStateSensitivityProbe,
     StructuralReport, TearingReport, UnmatchedEquationDiagnosis, UnmatchedUnknownDiagnosis,
     diagnose_structural_singularity, eval_dae_at, jacobian_for_dae,
+    lower_correlated_for_native_execution_with_overrides,
     lower_correlated_for_simulation_with_overrides, lower_dae_for_gpu_preparation,
-    lower_dae_for_simulation, lower_for_differentiation_with_overrides,
-    lower_for_simulation_with_overrides, parameter_jacobian_for_dae,
-    state_and_parameter_jacobian_for_dae, steady_state_adjoint_objective_gradient_for_dae,
-    steady_state_objective_gradient_for_dae, steady_state_parameter_sensitivity_for_dae,
-    structural_report_for_dae,
+    lower_dae_for_native_preparation, lower_dae_for_simulation,
+    lower_for_differentiation_with_overrides, lower_for_simulation_with_overrides,
+    parameter_jacobian_for_dae, state_and_parameter_jacobian_for_dae,
+    steady_state_adjoint_objective_gradient_for_dae, steady_state_objective_gradient_for_dae,
+    steady_state_parameter_sensitivity_for_dae, structural_report_for_dae,
+};
+pub use solve_lowering::{
+    ExcludedParameter, ExclusionReason, Linearization, ParameterClassification,
+    independent_tunable_parameters, linearization_for_dae, select_sensitivity_parameters,
+};
+#[cfg(feature = "fmi")]
+pub use solve_lowering::{
+    lower_fmi_c_export_component, lower_fmi_component, lower_fmi_export_component,
 };
 
 #[cfg(feature = "scenario-config")]
@@ -138,17 +175,17 @@ pub mod scenario_config;
 
 #[cfg(feature = "solver-rk45")]
 pub mod rk45;
+#[cfg(feature = "solver-rk45")]
+mod trajectory_sensitivity;
+#[cfg(feature = "solver-rk45")]
+pub use trajectory_sensitivity::{
+    TrajectoryPlugin, TrajectorySession, trajectory_objective_gradient_for_dae,
+    trajectory_sensitivity_for_dae,
+};
 
-#[cfg(all(
-    feature = "scheduled-sim",
-    feature = "scenario-config",
-    feature = "input-keyboard",
-    feature = "transport-udp",
-    feature = "transport-zenoh",
-    feature = "viewer-web",
-    feature = "process-control"
-))]
-pub mod scheduled_sim;
+scheduled_executor_items! {
+    pub mod scheduled_sim;
+}
 
 #[cfg(feature = "report")]
 pub mod report;
@@ -160,13 +197,24 @@ pub fn simulate_with_diagnostics(
 ) -> Result<SimResult, SimulationDiagnosticError> {
     match opts.solver_mode {
         SimSolverMode::Auto => simulate_with_auto_diagnostics(dae_model, opts),
-        SimSolverMode::RkLike => simulate_with_rk45_diagnostics(dae_model, opts),
+        SimSolverMode::RkLike | SimSolverMode::VelImplicit => {
+            simulate_with_rk45_diagnostics(dae_model, opts)
+        }
         SimSolverMode::Bdf => simulate_with_diffsol_diagnostics(dae_model, opts),
     }
 }
 
 #[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
 pub use simulate_with_diagnostics as simulate_dae_with_diagnostics;
+
+/// Prepare the chosen execution backend for an external Model Exchange host.
+#[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
+pub fn fmi_execution_backend(
+    component: &rumoca_ir_solve::fmi::FmiComponent,
+    options: &SimOptions,
+) -> Result<Option<rumoca_solver::fmi_me::MeExecutionBackend>, SimulationDiagnosticError> {
+    native_execution::admitted_native_execution_backend(options, component.runtime_view().model())
+}
 
 /// Prepare one correlated FMI component with the admitted simulation overrides.
 pub fn prepare_fmi_component(
@@ -181,7 +229,7 @@ pub fn prepare_fmi_component(
 /// Simulate one already-constructed correlated FMI component, dispatching by
 /// `opts.solver_mode`.
 ///
-/// Wire callers replay through `rumoca_phase_solve::fmi::deserialize_fmi_component`;
+/// Wire callers replay through `rumoca_eval_solve::fmi_wire::deserialize_fmi_component`;
 /// a bare Solve root is deliberately not a simulation entry because it carries
 /// no proof that its FMI inventory came from the same source construction.
 #[cfg(any(feature = "solver-diffsol", feature = "solver-rk45"))]
@@ -189,12 +237,18 @@ pub fn simulate_fmi_component(
     component: rumoca_ir_solve::fmi::FmiComponent,
     opts: &SimOptions,
 ) -> Result<SimResult, SimulationDiagnosticError> {
-    let execution_backend =
-        native_execution::admitted_native_execution_backend(opts, component.runtime_view().model());
-    let artifact = rumoca_solver::fmi_me::MeModelArtifact::new(component);
+    let execution_backend = native_execution::admitted_native_execution_backend(
+        opts,
+        component.runtime_view().model(),
+    )?;
+    let receipt = native_execution::execution_receipt(opts, component.runtime_view().model());
+    let artifact =
+        rumoca_solver::fmi_me::MeModelArtifact::new(component).with_execution_receipt(receipt);
     match opts.solver_mode {
         SimSolverMode::Auto => simulate_artifact_auto(artifact, opts, execution_backend),
-        SimSolverMode::RkLike => simulate_artifact_rk45(artifact, opts, execution_backend),
+        SimSolverMode::RkLike | SimSolverMode::VelImplicit => {
+            simulate_artifact_rk45(artifact, opts, execution_backend)
+        }
         SimSolverMode::Bdf => simulate_artifact_diffsol(artifact, opts, execution_backend),
     }
 }
@@ -524,6 +578,8 @@ fn checked_variable_meta<'dae>(
         // solve lowering, not from this reduced flag.
         fixed: variable.fixed_uniform(),
         description: variable.description().map(str::to_string),
+        state_coordinate: None,
+        phasor: None,
     }
 }
 
@@ -637,8 +693,16 @@ fn tunable_variable_meta<'dae>(
             nominal: variable
                 .nominal()
                 .and_then(|id| expression_source(dae_model, view, id)),
-            min_value: minimum.as_ref().map(|values| values[scalar]),
-            max_value: maximum.as_ref().map(|values| values[scalar]),
+            min_value: minimum.as_ref().map(|values| {
+                values
+                    .value(scalar)
+                    .expect("checked attribute covers the variable scalar extent")
+            }),
+            max_value: maximum.as_ref().map(|values| {
+                values
+                    .value(scalar)
+                    .expect("checked attribute covers the variable scalar extent")
+            }),
             fixed: variable.fixed_scalar(scalar),
             description: variable.description().map(str::to_string),
         });
@@ -650,7 +714,7 @@ fn evaluated_attribute<'dae>(
     view: dae::DaeView<'dae>,
     variable: dae::VariableView<'dae>,
     expression: Option<dae::ExprId<'dae>>,
-) -> Result<Option<Vec<f64>>, SimulationDiagnosticError> {
+) -> Result<Option<solve::SolveInitialValues>, SimulationDiagnosticError> {
     rumoca_phase_solve::fmi::numeric_attribute_values(view, variable, expression).map_err(|error| {
         SimulationDiagnosticError::RuntimePreparation {
             message: error.to_string(),
@@ -694,8 +758,7 @@ pub fn compiled_layout_related_bindings_debug(
 ) -> Result<Vec<(String, String)>, rumoca_phase_solve::LowerError> {
     let layout = rumoca_phase_solve::build_var_layout(dae_model)?;
     Ok(layout
-        .bindings()
-        .iter()
+        .scalar_bindings()
         .filter(|(binding_name, _)| {
             binding_name.as_str().starts_with(prefix) && binding_name.as_str() != prefix
         })

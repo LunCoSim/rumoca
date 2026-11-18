@@ -315,7 +315,7 @@ fn try_extract_regular_connection_families(
     }
     let mut result = Vec::new();
     for equation in equations {
-        let ast::Equation::Connect { lhs, rhs } = equation else {
+        let ast::Equation::Connect { lhs, rhs, .. } = equation else {
             continue;
         };
         let Some(a_template) =
@@ -416,6 +416,7 @@ fn regular_connection_domain(
         }
         let (lower, step, upper) = connection_range_bounds(&index.range, int_params, prefix)?;
         let binder = rumoca_core::StructuredIndexBinder {
+            provenance: index.binder?,
             id,
             display_name: name.to_string(),
             lower,
@@ -624,6 +625,7 @@ fn substitute_index_in_for_indices(
                 substitute_index_in_expr(&idx.range, var_name, value)
             };
             rumoca_ir_ast::ForIndex {
+                binder: idx.binder,
                 ident: idx.ident.clone(),
                 range,
             }
@@ -684,6 +686,7 @@ fn expand_for_range(
     };
     let domain = rumoca_core::StructuredIndexDomain {
         binders: vec![rumoca_core::StructuredIndexBinder {
+            provenance: rumoca_core::IndexBinderProvenance::Generated,
             id: 0,
             display_name: "__expanded_connection_index".to_string(),
             lower,
@@ -784,9 +787,10 @@ fn component_ref_path_no_subscripts(cr: &ast::ComponentReference) -> Option<Comp
 /// Substitute an index variable with a concrete value in an equation.
 fn substitute_index_in_equation(eq: &ast::Equation, var_name: &str, value: i64) -> ast::Equation {
     match eq {
-        ast::Equation::Connect { lhs, rhs } => ast::Equation::Connect {
+        ast::Equation::Connect { lhs, rhs, annotation } => ast::Equation::Connect {
             lhs: substitute_index_in_comp_ref(lhs, var_name, value),
             rhs: substitute_index_in_comp_ref(rhs, var_name, value),
+            annotation: annotation.clone(),
         },
         ast::Equation::For { indices, equations } => ast::Equation::For {
             indices: indices
@@ -800,6 +804,7 @@ fn substitute_index_in_equation(eq: &ast::Equation, var_name: &str, value: i64) 
                         substitute_index_in_expr(&idx.range, var_name, value)
                     };
                     rumoca_ir_ast::ForIndex {
+                        binder: idx.binder,
                         ident: idx.ident.clone(),
                         range,
                     }
@@ -1245,6 +1250,7 @@ fn connection_range_binders(
         .enumerate()
         .map(|(dimension, count)| {
             Ok(rumoca_core::StructuredIndexBinder {
+                provenance: rumoca_core::IndexBinderProvenance::Generated,
                 id: dimension,
                 display_name: format!("__connection_index_{}", dimension + 1),
                 lower: 1,
@@ -1284,6 +1290,7 @@ fn compact_connection_ranges(
             };
             let domain = rumoca_core::StructuredIndexDomain {
                 binders: vec![rumoca_core::StructuredIndexBinder {
+                    provenance: rumoca_core::IndexBinderProvenance::Generated,
                     id: 0,
                     display_name: "__connection_range".to_string(),
                     lower: start,
@@ -1507,6 +1514,7 @@ mod tests {
     #[test]
     fn test_extract_connection() {
         let eq = ast::Equation::Connect {
+            annotation: Vec::new(),
             lhs: make_comp_ref(&["a", "p"]),
             rhs: make_comp_ref(&["b", "n"]),
         };
@@ -1540,6 +1548,7 @@ mod tests {
             span: rumoca_core::Span::DUMMY,
         };
         let eq = ast::Equation::Connect {
+            annotation: Vec::new(),
             lhs: make_comp_ref(&["mux2", "y"]),
             rhs: make_comp_ref_with_sub_at(range, &["mux5", "u"], 1),
         };
@@ -1594,7 +1603,7 @@ mod tests {
         ]);
 
         let connections = extract_connections(
-            &[ast::Equation::Connect { lhs, rhs }],
+            &[ast::Equation::Connect { lhs, rhs, annotation: Vec::new() }],
             &ast::QualifiedName::new(),
             &ConnectionParams::new(),
             &test_source_map(),
@@ -1640,7 +1649,7 @@ mod tests {
         let mut rhs = make_comp_ref(&["b"]);
         rhs.parts[0].subs = Some(vec![ast::Subscript::Expression(empty_range)]);
         let connections = extract_connections(
-            &[ast::Equation::Connect { lhs, rhs }],
+            &[ast::Equation::Connect { lhs, rhs, annotation: Vec::new() }],
             &ast::QualifiedName::new(),
             &ConnectionParams::new(),
             &test_source_map(),
@@ -1720,6 +1729,7 @@ mod tests {
     fn test_extract_connections_skips_non_connection_for_equation_range() {
         let eq = ast::Equation::For {
             indices: vec![rumoca_ir_ast::ForIndex {
+                binder: Some(rumoca_core::IndexBinderProvenance::Generated),
                 ident: make_token("i"),
                 range: ast::Expression::ComponentReference(make_comp_ref(&["nout"])),
             }],
@@ -1741,10 +1751,12 @@ mod tests {
     fn test_extract_regular_for_connection_preserves_one_symbolic_family() {
         let eq = ast::Equation::For {
             indices: vec![rumoca_ir_ast::ForIndex {
+                binder: Some(rumoca_core::IndexBinderProvenance::Generated),
                 ident: make_token("i"),
                 range: make_range_expr(make_integer_terminal("1"), make_integer_terminal("3")),
             }],
             equations: vec![ast::Equation::Connect {
+                annotation: Vec::new(),
                 lhs: make_comp_ref_with_sub(make_comp_ref_expr(&["i"]), &["a"]),
                 rhs: make_comp_ref_with_sub(make_comp_ref_expr(&["i"]), &["b"]),
             }],
@@ -1804,10 +1816,12 @@ mod tests {
 
     fn nested_dependent_for_connection_eq() -> ast::Equation {
         let outer_idx = rumoca_ir_ast::ForIndex {
+            binder: Some(rumoca_core::IndexBinderProvenance::Generated),
             ident: make_token("j"),
             range: make_range_expr(make_integer_terminal("1"), make_integer_terminal("2")),
         };
         let inner_idx = rumoca_ir_ast::ForIndex {
+            binder: Some(rumoca_core::IndexBinderProvenance::Generated),
             ident: make_token("i"),
             range: make_range_expr(j_plus_one_expr(), make_integer_terminal("3")),
         };
@@ -1816,6 +1830,7 @@ mod tests {
             equations: vec![ast::Equation::For {
                 indices: vec![inner_idx],
                 equations: vec![ast::Equation::Connect {
+                    annotation: Vec::new(),
                     lhs: make_comp_ref_with_sub(make_comp_ref_expr(&["j"]), &["a"]),
                     rhs: make_comp_ref_with_sub(make_comp_ref_expr(&["i"]), &["b"]),
                 }],
@@ -1825,16 +1840,19 @@ mod tests {
 
     fn multi_index_dependent_for_connection_eq() -> ast::Equation {
         let prior_idx = rumoca_ir_ast::ForIndex {
+            binder: Some(rumoca_core::IndexBinderProvenance::Generated),
             ident: make_token("i"),
             range: make_range_expr(make_integer_terminal("1"), make_integer_terminal("2")),
         };
         let dependent_idx = rumoca_ir_ast::ForIndex {
+            binder: Some(rumoca_core::IndexBinderProvenance::Generated),
             ident: make_token("j"),
             range: make_range_expr(i_plus_one_expr(), make_integer_terminal("3")),
         };
         ast::Equation::For {
             indices: vec![prior_idx, dependent_idx],
             equations: vec![ast::Equation::Connect {
+                annotation: Vec::new(),
                 lhs: make_comp_ref_with_sub(make_comp_ref_expr(&["i"]), &["a"]),
                 rhs: make_comp_ref_with_sub(make_comp_ref_expr(&["j"]), &["b"]),
             }],

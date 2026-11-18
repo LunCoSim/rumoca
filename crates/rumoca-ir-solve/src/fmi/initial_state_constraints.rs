@@ -110,10 +110,9 @@ impl FmiComponent {
                     .base();
                 variable
                     .scalar_names()
-                    .iter()
                     .enumerate()
                     .filter(|(scalar, _)| free.contains(&(base + scalar)))
-                    .map(|(_, name)| name.clone())
+                    .map(|(_, name)| name)
                     .collect::<Vec<_>>()
             })
             .collect()
@@ -157,41 +156,39 @@ impl FmiComponent {
     ) -> Result<Self, FmiInitialStateConstraintError> {
         // Identity and domain admission precede normalization: an invalid name,
         // repeated request or out-of-domain value is never a harmless no-op.
-        let mut accepted = self.resolve_initial_state_constraints(constraints)?;
-        let mut required_changes = Vec::new();
-        for (&index, &(value, input_index, scalar)) in &accepted {
-            let prepared = self.model.initial_y.get(index).copied().ok_or_else(|| {
+        let accepted = self.resolve_initial_state_constraints(constraints)?;
+        let mut updates = Vec::new();
+        for (index, constraint) in accepted {
+            let prepared = self.model.initial_y.value(index).ok_or_else(|| {
                 FmiInitialStateConstraintError::Storage(format!(
                     "state index {index} has no prepared coordinate"
                 ))
             })?;
-            if value.to_bits() != prepared.to_bits() {
-                required_changes.push((
-                    self.construction_inputs[input_index].scalar_names[scalar].clone(),
-                    value,
-                    prepared,
-                ));
+            if constraint.value().to_bits() != prepared.to_bits() {
+                updates.push((index, constraint, prepared));
             }
         }
-        accepted.retain(|index, (value, _, _)| {
-            value.to_bits() != self.model.initial_y[*index].to_bits()
-        });
-        if accepted.is_empty() {
+        if updates.is_empty() {
             return Ok(self.clone());
         }
         let features = self.initial_state_constraint_features();
         if !features.is_continuous_state_only() {
             return Err(FmiInitialStateConstraintError::UnsupportedFeatures {
                 features,
-                required_changes,
+                required_changes: updates
+                    .iter()
+                    .map(|(_, constraint, prepared)| {
+                        (constraint.name().to_owned(), constraint.value(), *prepared)
+                    })
+                    .collect(),
             });
         }
         let mut model = self.model.as_ref().clone();
-        let mut inputs = self.construction_inputs.clone();
+        let inputs = self.metadata.variables().iter().filter_map(FmiVariable::source_input).collect();
         let mut initialization = std::mem::take(&mut model.problem.initialization).into_input();
-        for (&index, &(value, input_index, scalar)) in &accepted {
-            model.initial_y[index] = value;
-            inputs[input_index].start[scalar] = value;
+        for (index, constraint, _) in updates {
+            model.initial_y.set(index, constraint.value())
+                .map_err(|error| FmiInitialStateConstraintError::Storage(error.to_string()))?;
             initialization.given_state_indices.push(index);
         }
         initialization.given_state_indices.sort_unstable();
@@ -208,10 +205,10 @@ impl FmiComponent {
             .collect()
     }
 
-    fn resolve_initial_state_constraints(
+    fn resolve_initial_state_constraints<'request>(
         &self,
-        constraints: &[InitialStateConstraint],
-    ) -> Result<BTreeMap<usize, (f64, usize, usize)>, FmiInitialStateConstraintError> {
+        constraints: &'request [InitialStateConstraint],
+    ) -> Result<BTreeMap<usize, &'request InitialStateConstraint>, FmiInitialStateConstraintError> {
         let free = self.free_initial_state_slots();
         let mut accepted = BTreeMap::new();
         for constraint in constraints {
@@ -220,7 +217,6 @@ impl FmiComponent {
                 .find_map(|variable| {
                     variable
                         .scalar_names()
-                        .iter()
                         .position(|name| name == constraint.name())
                         .map(|scalar| (variable, scalar))
                 })
@@ -234,20 +230,7 @@ impl FmiComponent {
                 return Err(not_free(constraint));
             }
             validate_domain(variable, scalar, constraint)?;
-            let input_index = self
-                .construction_inputs
-                .iter()
-                .position(|input| {
-                    input
-                        .scalar_names
-                        .get(scalar)
-                        .is_some_and(|name| name == constraint.name())
-                })
-                .ok_or_else(|| FmiInitialStateConstraintError::Storage(constraint.name().into()))?;
-            if accepted
-                .insert(index, (constraint.value(), input_index, scalar))
-                .is_some()
-            {
+            if accepted.insert(index, constraint).is_some() {
                 return Err(FmiInitialStateConstraintError::DuplicateState {
                     name: constraint.name().into(),
                 });
@@ -268,10 +251,10 @@ fn validate_domain(
     scalar: usize,
     constraint: &InitialStateConstraint,
 ) -> Result<(), FmiInitialStateConstraintError> {
-    let bound = |values: Option<&[f64]>| -> Result<Option<f64>, FmiInitialStateConstraintError> {
+    let bound = |values: Option<&crate::SolveInitialValues>| -> Result<Option<f64>, FmiInitialStateConstraintError> {
         values
             .map(|values| {
-                values.get(scalar).copied().ok_or_else(|| {
+                values.value(scalar).ok_or_else(|| {
                     FmiInitialStateConstraintError::Storage(constraint.name().into())
                 })
             })

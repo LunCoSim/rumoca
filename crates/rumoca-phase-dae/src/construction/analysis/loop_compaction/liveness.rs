@@ -173,7 +173,7 @@ pub(super) struct LoopLocalStoreRegions<'a> {
     /// than a continuation of the previous one.
     pub(super) enclosing_bodies: &'a [&'a [rumoca_core::Statement]],
     /// What runs once this loop is left, through to the end of the function.
-    pub(super) exit: &'a [rumoca_core::Statement],
+    pub(super) exit: &'a [&'a [rumoca_core::Statement]],
     /// The names the function's caller observes once the body returns.
     pub(super) live_on_exit: &'a LiveSet,
 }
@@ -266,10 +266,10 @@ pub(super) fn prove_unobserved_loop_local_store(
         live_on_exit,
     } = regions;
     let control_flow_is_modeled = !contains_unstructured_jump(body_prefix)
-        && !contains_unstructured_jump(exit)
         && !substituted
             .iter()
             .chain(enclosing_bodies.iter())
+            .chain(exit.iter())
             .any(|segment| contains_unstructured_jump(segment));
     if !control_flow_is_modeled {
         return None;
@@ -280,7 +280,7 @@ pub(super) fn prove_unobserved_loop_local_store(
     if !every_read_is_substitutable {
         return None;
     }
-    if live_in(exit, live_on_exit).contains(name) {
+    if live_in_concatenation(exit, live_on_exit).contains(name) {
         return None;
     }
     let mut back_edges = Vec::with_capacity(enclosing_bodies.len() + 1);
@@ -453,6 +453,13 @@ fn live_in_statement(statement: &rumoca_core::Statement, live_out: &LiveSet) -> 
             span: _,
         } => {
             let mut live = live_out.clone();
+            // MLS §11.2.1.1: the call reads its arguments, then assigns each
+            // output, so a whole scalar receiver kills its incoming value.
+            for output in outputs.iter().flatten() {
+                if let Some(target) = scalar_assignment_target(output) {
+                    kill_value(&mut live, &target);
+                }
+            }
             // The callable is selected by a component reference whose
             // subscripts are ordinary value reads, evaluated where the call
             // runs. The reference's own name denotes a function rather than a

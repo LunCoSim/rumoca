@@ -22,8 +22,11 @@ mod record_alias;
 mod record_alias_postprocess_tests;
 #[cfg(test)]
 mod substitute_constant_tests;
+mod when_discrete_reads;
 
 use super::*;
+
+pub(crate) use when_discrete_reads::freeze_current_discrete_selections;
 
 pub(crate) use constant_lookup::constant_expr_preserves_array_shape;
 pub(crate) use constant_substituter::substitute_known_constants_expr;
@@ -34,7 +37,7 @@ pub(super) use field_access::{
 };
 pub(crate) use index_collapse::{collapse_index_refs_to_known_varrefs, field_access_flat_path};
 pub(crate) use indexed_dimension_recovery::recover_indexed_lhs_dimensions;
-pub(crate) use invariant_bindings::fold_invariant_scalar_bindings;
+pub(crate) use invariant_bindings::fold_invariant_bindings;
 
 use constant_substituter::{
     substitute_known_constants_expr_with_options, substitute_known_constants_statement,
@@ -441,7 +444,9 @@ fn substitute_known_constants_when_equation(
     locals: &HashSet<String>,
 ) -> Result<(), FlattenError> {
     match equation {
-        flat::WhenEquation::Assign { value, .. } | flat::WhenEquation::Reinit { value, .. } => {
+        flat::WhenEquation::Assign { value, .. }
+        | flat::WhenEquation::AssignElement { value, .. }
+        | flat::WhenEquation::Reinit { value, .. } => {
             *value = substitute_known_constants_expr(value.clone(), ctx, live_vars, locals, "")?;
         }
         flat::WhenEquation::Assert {

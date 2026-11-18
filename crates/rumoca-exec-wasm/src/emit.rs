@@ -1,5 +1,23 @@
 //! WASM emitter for residual linear-op rows.
 
+mod arena;
+mod compute;
+mod conditional;
+mod gather;
+mod linear_solve;
+mod seed;
+mod tensor;
+pub(super) use compute::{
+    AdmissionCache, AdmittedEntry, admit_private_entry, emit_event_program_module,
+    emit_exact_assignment_module, emit_private_entries_modules,
+};
+pub(super) use compute::{emit_compute_module, emit_native_assignment_module};
+pub(super) use compute::{
+    emit_native_call_assignment_module, emit_native_call_assignment_module_with_policy,
+};
+#[cfg(test)]
+pub(super) use compute::{emit_private_directional_module, emit_private_program_module};
+
 use rumoca_ir_solve::{BinaryOp, CompareOp, LinearOp, Reg, UnaryOp};
 use std::collections::{BTreeMap, BTreeSet};
 use wasm_encoder::BlockType;
@@ -25,9 +43,8 @@ const OUT_PTR_PARAM: u32 = 4;
 const LOCAL_BASE: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum MathImport {
+pub(crate) enum MathImport {
     Abs,
-    Sign,
     Sin,
     Cos,
     Tan,
@@ -45,10 +62,35 @@ enum MathImport {
 }
 
 impl MathImport {
-    fn symbol(self) -> &'static str {
+    /// The complete math ABI of every emitted module, in declaration order.
+    pub(crate) const ALL: [Self; 15] = [
+        Self::Abs,
+        Self::Sin,
+        Self::Cos,
+        Self::Tan,
+        Self::Asin,
+        Self::Acos,
+        Self::Atan,
+        Self::Sinh,
+        Self::Cosh,
+        Self::Tanh,
+        Self::Exp,
+        Self::Log,
+        Self::Log10,
+        Self::Pow,
+        Self::Atan2,
+    ];
+
+    #[cfg(feature = "component-build")]
+    pub(crate) fn from_symbol(symbol: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|import| import.symbol() == symbol)
+    }
+
+    pub(crate) fn symbol(self) -> &'static str {
         match self {
             Self::Abs => "abs",
-            Self::Sign => "sign",
             Self::Sin => "sin",
             Self::Cos => "cos",
             Self::Tan => "tan",
@@ -66,7 +108,7 @@ impl MathImport {
         }
     }
 
-    fn is_binary(self) -> bool {
+    pub(crate) fn is_binary(self) -> bool {
         matches!(self, Self::Pow | Self::Atan2)
     }
 }
@@ -224,16 +266,15 @@ fn locals_for_register_count(max_registers: usize) -> Result<Vec<(u32, ValType)>
 
 fn collect_imports(rows: &[Vec<LinearOp>]) -> Result<Vec<MathImport>, String> {
     let mut imports = BTreeSet::new();
-    for row in rows {
-        for op in row {
-            if let Some(import) = unary_import(op) {
-                imports.insert(import);
-            }
-            if let Some(import) = binary_import(op) {
-                imports.insert(import);
-            }
+    conditional::visit_operations(rows, |op| {
+        if let Some(import) = unary_import(op) {
+            imports.insert(import);
         }
-    }
+        if let Some(import) = binary_import(op) {
+            imports.insert(import);
+        }
+        Ok(())
+    })?;
     let mut ordered = Vec::new();
     ordered
         .try_reserve(imports.len())
@@ -249,9 +290,6 @@ fn unary_import(op: &LinearOp) -> Option<MathImport> {
         LinearOp::Unary {
             op: UnaryOp::Abs, ..
         } => Some(MathImport::Abs),
-        LinearOp::Unary {
-            op: UnaryOp::Sign, ..
-        } => Some(MathImport::Sign),
         LinearOp::Unary {
             op: UnaryOp::Sin, ..
         } => Some(MathImport::Sin),
@@ -306,6 +344,11 @@ fn binary_import(op: &LinearOp) -> Option<MathImport> {
 }
 
 fn max_registers(rows: &[Vec<LinearOp>]) -> Result<usize, String> {
+    tensor::validate_local_tensor_loads(rows)?;
+    register_count(rows)
+}
+
+fn register_count(rows: &[Vec<LinearOp>]) -> Result<usize, String> {
     rows.iter().try_fold(0usize, |count, row| {
         rumoca_ir_solve::ScalarProgramRegisterFlow::derive(row)
             .map(|flow| count.max(flow.register_count()))
@@ -317,6 +360,38 @@ struct BodyEmitter<'a> {
     imports: &'a ImportCatalog,
     function: &'a mut Function,
     next_output_slot: u64,
+    arena: Option<arena::ArenaPlan>,
+    calls: Option<&'a compute::call_program::layout::CallProgramPlan>,
+    register_base: Reg,
+    root_program_cursor: usize,
+    root_register_layout: Option<std::rc::Rc<arena::register_layout::RegisterLayout>>,
+    region_frame_end: Option<Reg>,
+    conditional_region: Option<conditional::Region>,
+    gather_faults: Vec<crate::NativeGatherFault>,
+    linear_solve_faults: Vec<crate::NativeLinearSolveFault>,
+    gather_status_base: Option<u32>,
+    kernel_ordinal: usize,
+    program_ordinal: usize,
+    program_span: Option<rumoca_core::Span>,
+    operation_ordinal: usize,
+    region_path: Vec<(usize, usize)>,
+    /// Copy Integer call cells into their typed output lanes after the call
+    /// at this operation of the stage program.
+    integer_capture: Vec<IntegerCapture>,
+    /// The native stage being emitted, whose issued exact Integer bindings
+    /// (SOLVE-C69) its top-level pure calls follow.
+    native_stage: Option<&'a rumoca_ir_solve::NativeRefreshAssignmentStage>,
+    event_invocations: Option<&'a [crate::typed_call::retained_event::InvocationStorage]>,
+    event_stops: &'a [u32],
+    private_seed_offset: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::emit) struct IntegerCapture {
+    pub(in crate::emit) operation: usize,
+    pub(in crate::emit) cell: u32,
+    pub(in crate::emit) lane: u32,
+    pub(in crate::emit) count: u32,
 }
 
 impl<'a> BodyEmitter<'a> {
@@ -325,11 +400,33 @@ impl<'a> BodyEmitter<'a> {
             imports,
             function,
             next_output_slot: 0,
+            arena: None,
+            calls: None,
+            register_base: 0,
+            root_program_cursor: 0,
+            root_register_layout: None,
+            region_frame_end: None,
+            conditional_region: None,
+            gather_faults: Vec::new(),
+            linear_solve_faults: Vec::new(),
+            gather_status_base: None,
+            kernel_ordinal: 0,
+            program_ordinal: 0,
+            program_span: None,
+            operation_ordinal: 0,
+            region_path: Vec::new(),
+            integer_capture: Vec::new(),
+            native_stage: None,
+            event_invocations: None,
+            event_stops: &[],
+            private_seed_offset: None,
         }
     }
 
     fn emit_rows(&mut self, rows: &[Vec<LinearOp>]) -> Result<(), String> {
         for row in rows {
+            let issued = self.bind_root_program()?;
+            let row = issued.as_deref().unwrap_or(row);
             for op in row {
                 self.emit_op(op.clone())?;
             }
@@ -338,17 +435,16 @@ impl<'a> BodyEmitter<'a> {
     }
 
     fn emit_op(&mut self, op: LinearOp) -> Result<(), String> {
+        if let Some(result) = self.emit_compact(&op) {
+            return result;
+        }
         match op {
             LinearOp::Const { dst, value } => self.emit_const(dst, value)?,
             LinearOp::LoadTime { dst } => self.emit_time(dst)?,
-            LinearOp::LoadY { dst, index } => {
-                self.emit_array_load(dst, index, Y_PTR_PARAM)?;
-            }
-            LinearOp::LoadP { dst, index } => {
-                self.emit_array_load(dst, index, P_PTR_PARAM)?;
-            }
+            LinearOp::LoadY { dst, index } => self.emit_array_load(dst, index, Y_PTR_PARAM)?,
+            LinearOp::LoadP { dst, index } => self.emit_array_load(dst, index, P_PTR_PARAM)?,
             LinearOp::LoadSeed { dst, index } => {
-                self.emit_array_load(dst, index, SEED_PTR_PARAM)?;
+                self.emit_seed_load(dst, index)?;
             }
             LinearOp::LoadIndexedP {
                 dst,
@@ -361,7 +457,7 @@ impl<'a> BodyEmitter<'a> {
                 base,
                 count,
                 index,
-            } => self.emit_indexed_load(dst, base, count, index, SEED_PTR_PARAM)?,
+            } => self.emit_indexed_seed_load(dst, base, count, index)?,
             LinearOp::LoadIndexedRegister { .. }
             | LinearOp::LoadIndexedFoldCarried { .. }
             | LinearOp::LoadIndexedFoldCapture { .. }
@@ -380,13 +476,11 @@ impl<'a> BodyEmitter<'a> {
                         .to_string(),
                 );
             }
-            LinearOp::Move { dst, src } => {
-                self.push_reg(src)?;
-                self.set_reg(dst)?;
-            }
+            LinearOp::Move { dst, src } => self.emit_move(dst, src)?,
             LinearOp::LinearSolveComponent { .. } => {
                 return Err("WASM backend does not yet support dense linear solve ops".to_string());
             }
+            op @ LinearOp::TensorLoad { .. } => self.emit_tensor_load(op)?,
             LinearOp::DotProduct { .. }
             | LinearOp::MatrixMultiply { .. }
             | LinearOp::TensorBinary { .. }
@@ -395,8 +489,7 @@ impl<'a> BodyEmitter<'a> {
             | LinearOp::TensorConcatenate { .. }
             | LinearOp::TensorUpdate { .. }
             | LinearOp::TensorFill { .. }
-            | LinearOp::TensorIdentity { .. }
-            | LinearOp::TensorLoad { .. } => {
+            | LinearOp::TensorIdentity { .. } => {
                 return Err(
                     "WASM backend does not yet support compact tensor-product ops".to_string(),
                 );
@@ -417,7 +510,9 @@ impl<'a> BodyEmitter<'a> {
                     "WASM backend does not yet support discrete random solve-IR ops".to_string(),
                 );
             }
-            LinearOp::PureCall { .. } | LinearOp::PureCallDirectional { .. } => {
+            LinearOp::PureCall { .. }
+            | LinearOp::PureCallDirectional { .. }
+            | LinearOp::PureCallObservation { .. } => {
                 return Err("WASM backend does not yet support typed pure-call ops".to_string());
             }
             LinearOp::Unary { dst, op, arg } => self.emit_unary(dst, op, arg)?,
@@ -439,8 +534,50 @@ impl<'a> BodyEmitter<'a> {
         Ok(())
     }
 
+    fn emit_compact(&mut self, op: &LinearOp) -> Option<Result<(), String>> {
+        if self.event_invocations.is_some() && matches!(op, LinearOp::PureCallObservation { .. }) {
+            return Some(self.emit_event_observation(op));
+        }
+        if matches!(op, LinearOp::PureCallObservation { .. }) {
+            return Some(Err(
+                "WASM backend requires a checked event-action assertion adapter".to_string(),
+            ));
+        }
+        if let LinearOp::LoadIndexedRegister {
+            dst,
+            base,
+            stride,
+            dimensions,
+            indices,
+        } = op
+        {
+            return Some(self.emit_checked_gather(*dst, *base, *stride, dimensions, indices));
+        }
+        if self.calls.is_some() && matches!(op, LinearOp::LinearSolveComponent { .. }) {
+            return Some(self.emit_dense_linear_solve(op));
+        }
+        if self.calls.is_some() && matches!(op, LinearOp::PureCallDirectional { .. }) {
+            return Some(self.emit_native_directional_call(op));
+        }
+        if self.calls.is_some() && matches!(op, LinearOp::PureCall { .. }) {
+            return Some(self.emit_native_pure_call(op.clone(), None, None));
+        }
+        if let Some(result) = self.emit_conditional_operation(op) {
+            return Some(result);
+        }
+        if self.arena.is_some() && arena::is_tensor(op) {
+            return Some(self.emit_arena_tensor(op.clone()));
+        }
+        None
+    }
+
     fn emit_const(&mut self, dst: Reg, value: f64) -> Result<(), String> {
         self.push(Instruction::F64Const(value.into()));
+        self.set_reg(dst)
+    }
+
+    fn emit_move(&mut self, dst: Reg, src: Reg) -> Result<(), String> {
+        self.push_reg(src)?;
         self.set_reg(dst)
     }
 
@@ -457,8 +594,7 @@ impl<'a> BodyEmitter<'a> {
 
     /// Emit `mem[ptr + 8*(base + clamp(round(index), 0, count-1))]` as an f64
     /// load, matching [`rumoca_ir_solve::resolve_indexed_slot`]: round the
-    /// runtime f64 index to nearest, clamp into `[0, count-1]`, scale to bytes,
-    /// add the run-relative base via the static load offset.
+    /// Resolve a synthetic slot coordinate, then read its checked input range.
     fn emit_indexed_load(
         &mut self,
         dst: Reg,
@@ -467,14 +603,7 @@ impl<'a> BodyEmitter<'a> {
         index: Reg,
         ptr_param: u32,
     ) -> Result<(), String> {
-        let last = if count == 0 { 0.0 } else { (count - 1) as f64 };
-        self.push_reg(index)?;
-        self.push(Instruction::F64Nearest);
-        self.push(Instruction::F64Const(0.0f64.into()));
-        self.push(Instruction::F64Max);
-        self.push(Instruction::F64Const(last.into()));
-        self.push(Instruction::F64Min);
-        self.push(Instruction::I32TruncF64S);
+        self.emit_synthetic_index_slot(index, count)?;
         self.push(Instruction::I32Const(8));
         self.push(Instruction::I32Mul);
         self.push(Instruction::LocalGet(ptr_param));
@@ -512,8 +641,8 @@ impl<'a> BodyEmitter<'a> {
                 self.push_reg(arg)?;
                 self.push(Instruction::F64Trunc);
             }
+            UnaryOp::Sign => self.emit_sign(arg)?,
             UnaryOp::Abs
-            | UnaryOp::Sign
             | UnaryOp::Sin
             | UnaryOp::Cos
             | UnaryOp::Tan
@@ -536,14 +665,30 @@ impl<'a> BodyEmitter<'a> {
         Ok(())
     }
 
+    fn emit_sign(&mut self, arg: Reg) -> Result<(), String> {
+        // Match rumoca_core::modelica_sign: both signed zeros and NaN yield +0.
+        self.push(Instruction::F64Const(1.0f64.into()));
+        self.push(Instruction::F64Const((-1.0f64).into()));
+        self.push(Instruction::F64Const(0.0f64.into()));
+        self.push_reg(arg)?;
+        self.push(Instruction::F64Const(0.0f64.into()));
+        self.push(Instruction::F64Lt);
+        self.push(Instruction::Select);
+        self.push_reg(arg)?;
+        self.push(Instruction::F64Const(0.0f64.into()));
+        self.push(Instruction::F64Gt);
+        self.push(Instruction::Select);
+        Ok(())
+    }
+
     fn emit_binary(&mut self, dst: Reg, op: BinaryOp, lhs: Reg, rhs: Reg) -> Result<(), String> {
         match op {
             BinaryOp::Add => self.emit_arith2(lhs, rhs, Instruction::F64Add)?,
             BinaryOp::Sub => self.emit_arith2(lhs, rhs, Instruction::F64Sub)?,
             BinaryOp::Mul => self.emit_arith2(lhs, rhs, Instruction::F64Mul)?,
             BinaryOp::Div => self.emit_arith2(lhs, rhs, Instruction::F64Div)?,
-            BinaryOp::Min => self.emit_arith2(lhs, rhs, Instruction::F64Min)?,
-            BinaryOp::Max => self.emit_arith2(lhs, rhs, Instruction::F64Max)?,
+            BinaryOp::Min => self.emit_extremum(lhs, rhs, true)?,
+            BinaryOp::Max => self.emit_extremum(lhs, rhs, false)?,
             BinaryOp::And => self.emit_logic2(lhs, rhs, true)?,
             BinaryOp::Or => self.emit_logic2(lhs, rhs, false)?,
             BinaryOp::Pow | BinaryOp::Atan2 => {
@@ -563,6 +708,38 @@ impl<'a> BodyEmitter<'a> {
         self.push_reg(rhs)?;
         self.push(op);
         Ok(())
+    }
+
+    fn emit_extremum(&mut self, lhs: Reg, rhs: Reg, is_min: bool) -> Result<(), String> {
+        // `rumoca_ir_solve::real_extremum`: suppress a single NaN.
+        // Read through push_reg so scalar locals and private arenas agree.
+        self.emit_is_nan(lhs)?;
+        self.emit_is_nan(rhs)?;
+        self.push(Instruction::I32And);
+        self.push(Instruction::If(BlockType::Result(ValType::F64)));
+        self.emit_arith2(lhs, rhs, Instruction::F64Add)?;
+        self.push(Instruction::Else);
+        self.push_reg(lhs)?;
+        self.push_reg(rhs)?;
+        self.emit_arith2(
+            lhs,
+            rhs,
+            if is_min {
+                Instruction::F64Lt
+            } else {
+                Instruction::F64Gt
+            },
+        )?;
+        self.emit_is_nan(rhs)?;
+        self.push(Instruction::I32Or);
+        // Equal operands select rhs, within the canonical signed-zero tie contract.
+        self.push(Instruction::Select);
+        self.push(Instruction::End);
+        Ok(())
+    }
+
+    fn emit_is_nan(&mut self, arg: Reg) -> Result<(), String> {
+        self.emit_arith2(arg, arg, Instruction::F64Ne)
     }
 
     fn emit_logic2(&mut self, lhs: Reg, rhs: Reg, is_and: bool) -> Result<(), String> {
@@ -617,6 +794,9 @@ impl<'a> BodyEmitter<'a> {
     }
 
     fn emit_store_output(&mut self, src: Reg) -> Result<(), String> {
+        if self.conditional_region.is_some() {
+            return self.emit_conditional_output(src);
+        }
         let offset = self
             .next_output_slot
             .checked_mul(8)
@@ -671,12 +851,24 @@ impl<'a> BodyEmitter<'a> {
     }
 
     fn push_reg(&mut self, reg: Reg) -> Result<(), String> {
-        self.push(Instruction::LocalGet(local_for_reg(reg)?));
+        if self.arena.is_some() {
+            self.push_arena_address(reg, None, 0)?;
+            self.push(Instruction::F64Load(arena::memarg()));
+        } else {
+            self.push(Instruction::LocalGet(local_for_reg(reg)?));
+        }
         Ok(())
     }
 
     fn set_reg(&mut self, reg: Reg) -> Result<(), String> {
-        self.push(Instruction::LocalSet(local_for_reg(reg)?));
+        if self.arena.is_some() {
+            self.push(Instruction::LocalSet(LOCAL_BASE));
+            self.push_arena_address(reg, None, 0)?;
+            self.push(Instruction::LocalGet(LOCAL_BASE));
+            self.push(Instruction::F64Store(arena::memarg()));
+        } else {
+            self.push(Instruction::LocalSet(local_for_reg(reg)?));
+        }
         Ok(())
     }
 }

@@ -13,6 +13,8 @@ pub mod runtime;
 mod runtime;
 #[cfg(not(kani))]
 pub mod solver;
+#[cfg(all(test, not(kani)))]
+mod test_fixtures;
 #[cfg(not(kani))]
 pub mod timeline;
 mod verification;
@@ -79,13 +81,15 @@ pub use runtime::solve_ops::{
 };
 #[cfg(not(kani))]
 pub use runtime::solve_runtime::{
-    AlgebraicLinearization, AlgebraicSettle, BlockResidualSplitCounts,
-    CompiledSolveAssignmentSchedule, CompiledSolveEventTransaction, CompiledSolveExpression,
-    CompiledSolveJacobianExpression, CompiledSolveProjectionJacobian, EventTransactionExecution,
-    EventUpdateRowFilter, InitialEventObservation, ProjectedEventUpdateInput,
+    AlgebraicLinearization, AlgebraicSettle, BlockResidualSplitCounts, CompileRefusal,
+    CompiledProgramsCommitting, CompiledSolveAssignmentSchedule, CompiledSolveEventObservation,
+    CompiledSolveEventTransaction, CompiledSolveExpression, CompiledSolveJacobianExpression,
+    CompiledSolveProjectionJacobian, CompiledSolveTargetValues, EventTransactionExecution,
+    EventUpdateRowFilter, InitialEventObservation, PrecompiledSolveBackend,
+    PrecompiledSolveBackendBuilder, ProgramOutputCommit, ProjectedEventUpdateInput,
     ProjectedInitialEventInput, ProjectedInitialEventOutcome, ProjectedPostInitialEventInput,
-    SolveExecutionBackend, SolveRuntime, block_residual_split_counts,
-    reset_block_residual_split_counts,
+    ReferenceReverseExecution, ScalarExecutionView, SolveExecutionBackend, SolveRuntime,
+    SolveRuntimeModel, block_residual_split_counts, reset_block_residual_split_counts,
 };
 #[cfg(not(kani))]
 pub use runtime::time::{
@@ -98,7 +102,22 @@ pub use runtime::timeout::{
     run_timeout_step_result,
 };
 #[cfg(not(kani))]
-pub use solver::{
-    DiffsolMethod, SimBackend, SimDiagnostic, SimExecutionPolicy, SimOptions, SimPacingMode,
-    SimResult, SimSolverMode, SimTermination, SimVariableMeta, WARNING_ASSERTION_CODE,
+pub use runtime::trajectory::{
+    ForwardSensitivityTrajectory, PluginBuilder, QuadratureIntegrand, TrajectoryConfig,
+    TrajectoryError, TrajectoryProblem, forward_sensitivity_trajectory,
 };
+#[cfg(not(kani))]
+pub use runtime::trajectory_objective::{
+    DataSeries, ObjectiveGradient, ResolvedObjective, RunningKind, RunningTerm, TerminalTerm,
+    TrajectoryObjective, adjoint_objective_gradient, forward_objective_gradient,
+};
+#[cfg(not(kani))]
+pub use solver::{
+    DEFAULT_CHECKPOINT_BUDGET_BYTES, DiffsolMethod, MODEL_MESSAGE_CODE, SimBackend, SimDiagnostic,
+    SimExecutionEngine, SimExecutionPolicy, SimExecutionReceipt, SimNativeDecline,
+    SimNativeRefusal, SimOptions, SimPacingMode, SimResult, SimSolverMode, SimTermination,
+    SimVariableMeta, WARNING_ASSERTION_CODE,
+};
+
+#[cfg(test)]
+mod fixture_layout;

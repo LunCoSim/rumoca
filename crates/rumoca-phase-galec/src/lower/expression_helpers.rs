@@ -284,6 +284,7 @@ pub(super) const fn event_name(operation: dae::EventActionOperation<'_>) -> &'st
         dae::EventActionOperation::Assert { .. } => "assert",
         dae::EventActionOperation::Warning { .. } => "warning",
         dae::EventActionOperation::Terminate { .. } => "terminate",
+        dae::EventActionOperation::Print { .. } => "print",
         dae::EventActionOperation::Reinitialize { .. } => "reinitialize",
     }
 }
@@ -668,6 +669,36 @@ fn all_integer(arguments: &[TypedExpression]) -> bool {
             .all(|argument| matches!(argument.scalar_type, gast::ScalarType::Integer))
 }
 
+/// A conservative emission proof for the existing signed-32 production helper.
+/// Its arguments must already inhabit the target Integer domain. A representable
+/// literal divisor other than zero or minus one cannot introduce either C divide
+/// failure. General divisors need a separate target-bound proof or checked fault
+/// path; a declined array-index range proof is not that permission. Minus one is
+/// refused even for safe numerators until such a proof is carried explicitly.
+fn has_proven_integer_divisor(arguments: &[TypedExpression]) -> bool {
+    let [_, divisor] = arguments else {
+        return false;
+    };
+    let gast::Expression::Integer(divisor) = divisor.expression else {
+        return false;
+    };
+    i32::try_from(divisor).is_ok() && !matches!(divisor, 0 | -1)
+}
+
+fn integer_division_name(
+    arguments: &[TypedExpression],
+    span: Span,
+) -> Result<&'static str, GalecTargetError> {
+    if has_proven_integer_divisor(arguments) {
+        return Ok("divisionTowardsZero");
+    }
+    Err(unsupported(
+        "integer-division-domain",
+        "Integer div requires a proven representable nonzero divisor excluding signed-minimum overflow".to_owned(),
+        span,
+    ))
+}
+
 pub(super) fn lower_builtin_arguments(
     builtin: dae::PureBuiltin,
     arguments: Vec<TypedExpression>,
@@ -696,10 +727,16 @@ pub(super) fn lower_builtin_arguments(
             arguments: vec![rounded],
         }));
     }
+    if let Some(name) = integer_typed_real_builtin(builtin, &arguments) {
+        return integer_of_real_builtin(name, arguments, span);
+    }
     let name = match builtin {
         dae::PureBuiltin::Abs => "absolute",
         dae::PureBuiltin::Sign => "sign",
         dae::PureBuiltin::Sqrt => "sqrt",
+        dae::PureBuiltin::Div if all_integer(&arguments) => {
+            integer_division_name(&arguments, span)?
+        }
         dae::PureBuiltin::Div | dae::PureBuiltin::Mod | dae::PureBuiltin::Rem => {
             return Err(unsupported(
                 "builtin:mod",
@@ -774,6 +811,49 @@ pub(super) fn lower_builtin_arguments(
     }))
 }
 
+/// The GALEC Real builtin of an MLS operator typed Integer: MLS 3.7 §3.7.1
+/// types `sign(v)` Integer for either operand type, and `abs(i)` Integer
+/// for an Integer operand, while GALEC `sign` and `absolute` are Real-only
+/// (SPEC_0042 T8).
+fn integer_typed_real_builtin(
+    builtin: dae::PureBuiltin,
+    arguments: &[TypedExpression],
+) -> Option<&'static str> {
+    match builtin {
+        dae::PureBuiltin::Sign => Some("sign"),
+        dae::PureBuiltin::Abs if all_integer(arguments) => Some("absolute"),
+        _ => None,
+    }
+}
+
+/// `integer(name(real(x)))`: the Real builtin over the operand coerced to
+/// Real, converted back. The Real result is an exact integer value, so the
+/// conversion is exact.
+fn integer_of_real_builtin(
+    name: &'static str,
+    arguments: Vec<TypedExpression>,
+    span: Span,
+) -> Result<gast::Expression, GalecTargetError> {
+    let [argument]: [TypedExpression; 1] = arguments.try_into().map_err(|arguments: Vec<_>| {
+        unsupported(
+            "builtin:sign",
+            format!(
+                "checked `{name}` has {} arguments instead of one",
+                arguments.len()
+            ),
+            span,
+        )
+    })?;
+    let real = gast::Expression::Call(gast::FunctionCall {
+        function: with_span(gast::Name::ident(name), span),
+        arguments: vec![coerce(argument, gast::ScalarType::Real, span)?],
+    });
+    Ok(gast::Expression::Call(gast::FunctionCall {
+        function: with_span(gast::Name::ident("integer"), span),
+        arguments: vec![real],
+    }))
+}
+
 pub(super) fn coerce(
     value: TypedExpression,
     expected: gast::ScalarType,
@@ -835,6 +915,64 @@ mod tests {
         }
     }
 
+    fn call_arguments(expression: &gast::Expression) -> &[gast::Expression] {
+        match expression {
+            gast::Expression::Call(call) => &call.arguments,
+            other => panic!("builtin lowering produced {other:?} instead of a call"),
+        }
+    }
+
+    /// `sign(v)` is Integer for either operand type, and `abs(i)` is Integer
+    /// for an Integer operand, while GALEC `sign` and `absolute` are
+    /// Real-only: the Real result is converted, the operand coerced.
+    #[test]
+    fn integer_typed_sign_and_abs_convert_the_real_builtin() {
+        let span = Span::DUMMY;
+        for (builtin, operand, inner, coerced) in [
+            (
+                dae::PureBuiltin::Sign,
+                gast::ScalarType::Real,
+                "sign",
+                false,
+            ),
+            (
+                dae::PureBuiltin::Sign,
+                gast::ScalarType::Integer,
+                "sign",
+                true,
+            ),
+            (
+                dae::PureBuiltin::Abs,
+                gast::ScalarType::Integer,
+                "absolute",
+                true,
+            ),
+        ] {
+            let lowered = lower_builtin_arguments(builtin, vec![typed(operand)], span)
+                .expect("sign and abs lower");
+            assert_eq!(called_name(&lowered), "integer", "{builtin:?} {operand:?}");
+            let [real] = call_arguments(&lowered) else {
+                panic!("integer takes one argument");
+            };
+            assert_eq!(called_name(real), inner, "{builtin:?} {operand:?}");
+            let [argument] = call_arguments(real) else {
+                panic!("{inner} takes one argument");
+            };
+            assert_eq!(
+                matches!(argument, gast::Expression::Call(_)),
+                coerced,
+                "{builtin:?} {operand:?}: {argument:?}"
+            );
+        }
+        let real_abs = lower_builtin_arguments(
+            dae::PureBuiltin::Abs,
+            vec![typed(gast::ScalarType::Real)],
+            span,
+        )
+        .expect("real abs lowers");
+        assert_eq!(called_name(&real_abs), "absolute");
+    }
+
     #[test]
     fn real_min_max_keep_the_real_builtins() {
         let span = Span::DUMMY;
@@ -850,5 +988,83 @@ mod tests {
             .expect("real min/max lowers to the real builtin");
             assert_eq!(called_name(&lowered), expected);
         }
+    }
+    fn integer_value(expression: gast::Expression) -> TypedExpression {
+        TypedExpression {
+            expression,
+            scalar_type: gast::ScalarType::Integer,
+        }
+    }
+    fn integer_variable(name: &str) -> TypedExpression {
+        integer_value(gast::Expression::Ref(gast::Reference::local(
+            gast::Name::ident(name),
+        )))
+    }
+    fn refuses_integer_division(a: TypedExpression, b: TypedExpression) {
+        let error = lower_builtin_arguments(dae::PureBuiltin::Div, vec![a, b], Span::DUMMY)
+            .expect_err("unproved target division must refuse before emission");
+        assert!(
+            matches!(error,GalecTargetError::UnsupportedFeature {feature,..} if feature=="integer-division-domain")
+        );
+    }
+    fn refuses_literal_division(a: i64, b: i64) {
+        refuses_integer_division(
+            integer_value(gast::Expression::Integer(a)),
+            integer_value(gast::Expression::Integer(b)),
+        );
+    }
+    #[test]
+    fn integer_division_domain_refuses_zero_scalar_divisor() {
+        refuses_literal_division(1, 0);
+    }
+    #[test]
+    fn integer_division_domain_refuses_signed_minimum_overflow() {
+        refuses_literal_division(-2147483648, -1);
+    }
+    #[test]
+    fn integer_division_domain_refuses_unknown_scalar_divisor() {
+        refuses_integer_division(integer_variable("a"), integer_variable("b"));
+    }
+    #[test]
+    fn integer_division_domain_refuses_narrowing_a_wide_divisor() {
+        refuses_literal_division(1, 4294967296);
+        refuses_literal_division(1, -4294967296);
+    }
+    #[test]
+    fn integer_division_domain_conservatively_refuses_minus_one() {
+        refuses_literal_division(7, -1);
+    }
+    #[test]
+    fn integer_division_domain_preserves_signed_safe_divisors() {
+        for (a, b) in [
+            (-7, 2),
+            (7, -2),
+            (-7, -2),
+            (7, 1),
+            (-2147483648, 2),
+            (-2147483648, -2),
+            (2147483647, -2147483648),
+        ] {
+            let expression = lower_builtin_arguments(
+                dae::PureBuiltin::Div,
+                vec![
+                    integer_value(gast::Expression::Integer(a)),
+                    integer_value(gast::Expression::Integer(b)),
+                ],
+                Span::DUMMY,
+            )
+            .unwrap();
+            assert_eq!(called_name(&expression), "divisionTowardsZero");
+        }
+        let expression = lower_builtin_arguments(
+            dae::PureBuiltin::Div,
+            vec![
+                integer_variable("a"),
+                integer_value(gast::Expression::Integer(2)),
+            ],
+            Span::DUMMY,
+        )
+        .unwrap();
+        assert_eq!(called_name(&expression), "divisionTowardsZero");
     }
 }

@@ -5,7 +5,11 @@
 //! can be attributed to a specific model variable in a single command instead
 //! of repeated instrumented rebuilds.
 
-use crate::runtime::{inspect_alloc::filled_f64_values, solve_runtime::SolveRuntime};
+use crate::runtime::{
+    inspect_alloc::filled_f64_values,
+    solve_ops::EventActionOutcome,
+    solve_runtime::{EventUpdateRowFilter, SolveRuntime},
+};
 
 /// One named value in an [`EvalAtReport`].
 #[derive(Debug, Clone)]
@@ -84,7 +88,6 @@ impl SolveRuntime {
         tol: f64,
         max_iters: usize,
     ) -> EvalAtReport {
-        let names = &self.model.problem.solve_layout.solver_maps.names;
         let mut error = None;
 
         // `full_solver_y_into` seeds from the model's initial solver vector and
@@ -97,13 +100,32 @@ impl SolveRuntime {
         {
             error = Some(err.to_string());
         }
+        // Event actions are model-level assertions: a function-call-scoped
+        // definedness assertion (MLS 12.4.4) or a model `assert` that fails at
+        // this point is an evaluation error, not a value.
+        if error.is_none() {
+            match self.eval_event_actions(
+                &solver_y_values,
+                params,
+                params,
+                t,
+                EventUpdateRowFilter::All,
+            ) {
+                Ok(EventActionOutcome::AssertionFailed { message, .. }) => {
+                    error = Some(format!("assertion failed: {message}"));
+                }
+                Ok(_) => {}
+                Err(err) => error = Some(err.to_string()),
+            }
+        }
         let solver_y = solver_y_values
             .iter()
             .enumerate()
             .map(|(index, &value)| EvalAtSlot {
-                name: names
-                    .get(index)
-                    .cloned()
+                name: self
+                    .model()
+                    .problem
+                    .solver_name(index)
                     .unwrap_or_else(|| format!("y[{index}]")),
                 value,
             })
@@ -113,7 +135,7 @@ impl SolveRuntime {
         // values (see `eval_state_derivatives_with_solver_y`), so a failure
         // still leaves the offending `der(state)` values in place to name.
         let mut derivative_values =
-            match filled_f64_values(self.state_count, f64::NAN, "eval-at derivative values") {
+            match filled_f64_values(self.state_count(), f64::NAN, "eval-at derivative values") {
                 Ok(values) => values,
                 Err(err) => {
                     if error.is_none() {
@@ -122,7 +144,7 @@ impl SolveRuntime {
                     Vec::new()
                 }
             };
-        if derivative_values.len() == self.state_count
+        if derivative_values.len() == self.state_count()
             && let Err(err) = self.eval_state_derivatives_into(
                 t,
                 state,
@@ -139,7 +161,7 @@ impl SolveRuntime {
             .iter()
             .enumerate()
             .map(|(index, &value)| EvalAtSlot {
-                name: names.get(index).map_or_else(
+                name: self.model().problem.solver_name(index).map_or_else(
                     || format!("der(state[{index}])"),
                     |name| format!("der({name})"),
                 ),
@@ -149,7 +171,7 @@ impl SolveRuntime {
 
         EvalAtReport {
             t,
-            state_count: self.state_count,
+            state_count: self.state_count(),
             solver_y,
             derivatives,
             error,

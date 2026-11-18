@@ -209,9 +209,10 @@ impl DynamicExpressionTargetResolver<'_> {
                 lhs: self.transform_expression(lhs),
                 rhs: self.transform_expression(rhs),
             },
-            ast::Equation::Connect { lhs, rhs } => ast::Equation::Connect {
+            ast::Equation::Connect { lhs, rhs, annotation } => ast::Equation::Connect {
                 lhs: self.transform_component_ref_inner(lhs),
                 rhs: self.transform_component_ref_inner(rhs),
+                annotation,
             },
             ast::Equation::For { indices, equations } => ast::Equation::For {
                 indices: indices

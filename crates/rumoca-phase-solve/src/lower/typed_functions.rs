@@ -1,19 +1,43 @@
 //! Single-source DAE pure-function lowering into the checked typed vocabulary.
 
+mod assertion_statements;
+mod assigned_lowering;
+mod assigned_sources;
+pub use assigned_sources::FunctionAssertionMessage;
 mod assertions;
 mod captures;
+mod constant_aggregates;
+mod eager_scope;
+mod error;
+pub use error::CallLoweringError;
+mod expression_owner;
+use eager_scope::EagerScope;
+mod family_owner;
 mod folds;
 pub(crate) mod formal_stages;
+mod implied_guards;
 mod indexed_slices;
 mod indexed_values;
+mod integer_power;
 mod model_calls;
 mod model_coordinates;
 pub(in crate::lower) mod model_events;
+mod native;
+mod record_fills;
+mod recursive_groups;
 mod regions;
 mod registration;
+mod scalar_expansion;
+mod scoped_conditionals;
 mod tensor;
+mod total_conditionals;
+mod value_types;
+use value_types::FunctionResultsLayout;
 
-use assertions::{assertion_conditions, assertion_is_map_independent, nested_calls};
+use assertions::{assertion_conditions, nested_calls};
+pub(crate) use expression_owner::ExactExpressionForm;
+pub(crate) use family_owner::AlgebraicFamilyForm;
+use indexed_values::leading_index_axes;
 use model_coordinates::ModelCoordinateKey;
 pub(super) use model_events::lower_model_event_transactions;
 use regions::{
@@ -22,6 +46,11 @@ use regions::{
     lower_region_conditional, lower_region_values,
 };
 use registration::register_call;
+pub(crate) use scalar_expansion::{
+    expressions_hold_inexact_integer, holds_assertion_or_loop, is_scalar_expandable,
+};
+pub(crate) use value_types::is_text_value;
+use value_types::{lower_primitive_type, lower_value_type_leaves, record_field_leaf_range};
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -29,6 +58,7 @@ use std::{
     ops::Range,
 };
 
+use crate::lower::dae_faults::FaultMemo;
 use rumoca_ir_dae as dae;
 use rumoca_ir_solve as solve;
 
@@ -38,7 +68,8 @@ use rumoca_ir_solve as solve;
 /// Registration happens at the DAE expression boundary, before a consumer can
 /// emit a projection. It never scans, hashes, or reconstructs an already
 /// lowered scalar program. Nested owners are issued before their caller, so
-/// the resulting table is finite and topological by construction.
+/// the resulting table is finite and topological by construction, except
+/// that the members of one SOLVE-C62 recursive group are issued together.
 pub(crate) struct PureCallRegistry<'dae> {
     table: solve::SolvePureCallTableBuilder,
     identities: CallRegistration<'dae>,
@@ -57,7 +88,7 @@ impl<'dae> PureCallRegistry<'dae> {
         &mut self,
         view: dae::DaeView<'dae>,
         call: dae::ExprId<'dae>,
-    ) -> Result<RegisteredCall<'dae>, solve::SolveProgramConstructionError> {
+    ) -> Result<RegisteredCall<'dae>, CallLoweringError> {
         register_call(
             &mut self.table,
             view,
@@ -87,7 +118,7 @@ pub(super) fn lower_exact_call<'dae>(
     view: dae::DaeView<'dae>,
     call: dae::ExprId<'dae>,
     identity: solve::SolvePureCallIdentity,
-) -> Result<solve::SolvePureCallTable, solve::SolveProgramConstructionError> {
+) -> Result<solve::SolvePureCallTable, CallLoweringError> {
     let arithmetic = arithmetic_profile();
     let mut table = solve::SolvePureCallTable::builder(arithmetic);
     let mut identities = CallRegistration::new(Some(identity));
@@ -103,24 +134,39 @@ pub(super) fn lower_exact_call<'dae>(
     Ok(table.finish())
 }
 
+/// One issued pure-call owner together with its checked call site.
 #[derive(Clone)]
 pub(crate) struct RegisteredCall<'dae> {
-    pub(crate) owner: solve::SolvePureCallOwnerId,
+    pub(crate) callee: CalleeInterface<'dae>,
     pub(crate) site: solve::SolvePureCallSite,
-    pub(crate) result_ranges: Box<[Range<usize>]>,
+}
+
+/// The owner interface a caller body lowers a call against. A SOLVE-C62
+/// recursive group member has it before the group, and so its site, exists.
+#[derive(Clone)]
+pub(crate) struct CalleeInterface<'dae> {
+    pub(crate) owner: solve::SolvePureCallOwnerId,
+    pub(crate) result_layout: std::sync::Arc<FunctionResultsLayout<'dae>>,
     pub(crate) result_leaf_count: usize,
     /// Every call-scoped assertion output after the result leaves, in owner
     /// output order: the owner's own predicates, its own message values, then
     /// each nested call's complete slot tuple.
     pub(crate) assertion_slots: std::sync::Arc<[AssertionSlot]>,
-    pub(crate) assertions: Box<[RegisteredAssertion<'dae>]>,
+    pub(crate) assertions: std::sync::Arc<[RegisteredAssertion<'dae>]>,
+    /// Whether an invocation can enter a SOLVE-C62 recursive group, whose
+    /// body no caller may expand in place.
+    pub(crate) recursive: bool,
+    /// Whether this function and every function it transitively calls reads
+    /// only Integer values scalar row storage holds exactly and converts no
+    /// Real to an Integer, derived once when the owner is registered.
+    pub(crate) scalar_storable: bool,
 }
 
 /// One call-scoped assertion output of a pure-call owner.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AssertionSlot {
     /// The Boolean condition of one assertion reached by the invocation.
-    Predicate,
+    Predicate { level: dae::AssertionLevel },
     /// One scalar an assertion message converts to text, evaluated in the
     /// frame of the function that declares that assertion. `predicate` is
     /// the backward distance to that assertion's predicate slot, which slot
@@ -134,22 +180,28 @@ pub(crate) enum AssertionSlot {
 impl AssertionSlot {
     fn value_type(&self) -> solve::SolveValueType {
         match self {
-            Self::Predicate => solve::SolveValueType::scalar(solve::SolveScalarType::Boolean),
+            Self::Predicate { .. } => {
+                solve::SolveValueType::scalar(solve::SolveScalarType::Boolean)
+            }
             Self::MessageValue { value_type, .. } => value_type.clone(),
         }
     }
 
     fn output(&self) -> solve::SolvePureCallOutput {
         match self {
-            Self::Predicate => solve::SolvePureCallOutput::assertion_predicate(),
-            Self::MessageValue { value_type, .. } => {
-                solve::SolvePureCallOutput::assertion_message_value(value_type.clone())
+            Self::Predicate { level } => {
+                solve::SolvePureCallOutput::assertion_predicate_at_level(match level {
+                    dae::AssertionLevel::Error => solve::SolveAssertionLevel::Error,
+                    dae::AssertionLevel::Warning => solve::SolveAssertionLevel::Warning,
+                })
+            }
+            Self::MessageValue {
+                value_type,
+                predicate,
+            } => {
+                solve::SolvePureCallOutput::assertion_message_value(value_type.clone(), *predicate)
             }
         }
-    }
-
-    const fn is_predicate(&self) -> bool {
-        matches!(self, Self::Predicate)
     }
 
     /// The value a slot holds when its assertion lies in a branch the
@@ -161,7 +213,7 @@ impl AssertionSlot {
         provenance: rumoca_core::Span,
     ) -> Result<solve::ProgramRegister<'program>, solve::SolveProgramConstructionError> {
         let value = match self {
-            Self::Predicate => solve::SolveValue::boolean(true),
+            Self::Predicate { .. } => solve::SolveValue::boolean(true),
             Self::MessageValue { value_type, .. } => match value_type.element_type() {
                 solve::SolveScalarType::Real { .. } => {
                     solve::SolveValue::real(arithmetic_profile(), 0.0)
@@ -178,81 +230,13 @@ impl AssertionSlot {
     }
 }
 
-/// Construction-issued correlation shared by every definition one function
-/// conditional publishes.
-///
-/// A read can demand a definition before the statement walk reaches its
-/// assignment group (most notably from a fold's compact update tuple). Keeping
-/// this exact DAE-owned association lets that demand lower the whole correlated
-/// tuple once instead of lowering each joined scalar expression independently.
-#[derive(Clone, Copy)]
-struct ConditionalDefinitionGroup<'dae> {
-    definitions: dae::FunctionDefinitionValues<'dae>,
-    conditional: dae::FunctionConditionalView<'dae>,
-}
-
-fn conditional_definition_groups<'dae>(
-    statements: dae::FunctionStatements<'dae>,
-) -> Result<
-    HashMap<dae::FunctionDefinitionId<'dae>, ConditionalDefinitionGroup<'dae>>,
-    solve::SolveProgramConstructionError,
-> {
-    fn collect<'dae>(
-        statements: dae::FunctionStatements<'dae>,
-        groups: &mut HashMap<dae::FunctionDefinitionId<'dae>, ConditionalDefinitionGroup<'dae>>,
-    ) -> Result<(), solve::SolveProgramConstructionError> {
-        for statement in statements {
-            match statement {
-                dae::FunctionStatementView::AssignmentGroup {
-                    definitions,
-                    conditional: Some(conditional),
-                } => {
-                    let group = ConditionalDefinitionGroup {
-                        definitions,
-                        conditional,
-                    };
-                    insert_conditional_definition_group(groups, definitions, group)?;
-                }
-                dae::FunctionStatementView::For { statements, .. } => {
-                    collect(statements, groups)?;
-                }
-                dae::FunctionStatementView::Assignment { .. }
-                | dae::FunctionStatementView::AssignmentGroup {
-                    conditional: None, ..
-                }
-                | dae::FunctionStatementView::Assertion { .. } => {}
-            }
-        }
-        Ok(())
-    }
-
-    let mut groups = HashMap::new();
-    collect(statements, &mut groups)?;
-    Ok(groups)
-}
-
-fn insert_conditional_definition_group<'dae>(
-    groups: &mut HashMap<dae::FunctionDefinitionId<'dae>, ConditionalDefinitionGroup<'dae>>,
-    definitions: dae::FunctionDefinitionValues<'dae>,
-    group: ConditionalDefinitionGroup<'dae>,
-) -> Result<(), solve::SolveProgramConstructionError> {
-    for definition in definitions.iter() {
-        if groups.insert(definition.id(), group).is_some() {
-            return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
-                provenance: definition.provenance().span(),
-            });
-        }
-    }
-    Ok(())
-}
-
 #[derive(Clone)]
 pub(crate) struct RegisteredAssertion<'dae> {
     pub(crate) predicate_output: usize,
-    pub(crate) message: dae::ExprId<'dae>,
+    pub(crate) message: FunctionAssertionMessage<'dae>,
     /// Owner output carrying each converted message value, keyed by the value
     /// expression the message converts.
-    pub(crate) message_values: Box<[(dae::ExprId<'dae>, usize)]>,
+    pub(crate) message_values: std::sync::Arc<[(dae::ExprId<'dae>, usize)]>,
     pub(crate) level: dae::AssertionLevel,
     pub(crate) provenance: dae::DaeProvenance,
 }
@@ -298,6 +282,13 @@ struct CallRegistration<'dae> {
     reserved: Option<solve::SolvePureCallIdentity>,
     next: u64,
     calls: HashMap<dae::ExprId<'dae>, RegisteredCall<'dae>>,
+    /// SOLVE-C70 owners, keyed by the DAE family they lower.
+    families: HashMap<dae::ContinuousFamilyId<'dae>, solve::SolvePureCallSite>,
+    expressions: HashMap<dae::ExprId<'dae>, expression_owner::RegisteredExactExpression<'dae>>,
+    /// Functions whose call SCC was already examined for a SOLVE-C62 group.
+    examined_functions: std::collections::HashSet<dae::FunctionId<'dae>>,
+    /// What each function contributes to every owner of it, derived once.
+    function_facts: HashMap<dae::FunctionId<'dae>, std::rc::Rc<registration::FunctionFacts<'dae>>>,
 }
 
 impl CallRegistration<'_> {
@@ -306,6 +297,10 @@ impl CallRegistration<'_> {
             reserved,
             next: 1,
             calls: HashMap::new(),
+            families: HashMap::new(),
+            expressions: HashMap::new(),
+            examined_functions: std::collections::HashSet::new(),
+            function_facts: HashMap::new(),
         }
     }
 
@@ -328,180 +323,12 @@ impl CallRegistration<'_> {
     }
 }
 
-fn boolean_map_type<'dae>(
-    view: dae::DaeView<'dae>,
-    domains: &[dae::DomainId<'dae>],
-    arithmetic: solve::SolveArithmeticProfile,
-    provenance: rumoca_core::Span,
-) -> Result<solve::SolveValueType, solve::SolveProgramConstructionError> {
-    if domains.is_empty() {
-        return Ok(solve::SolveValueType::scalar(
-            solve::SolveScalarType::Boolean,
-        ));
-    }
-    let mut dimensions = Vec::new();
-    for domain in domains {
-        dimensions.extend(
-            view.domain(*domain)
-                .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
-                .structured()
-                .extents()
-                .map_err(|_| solve::SolveProgramConstructionError::InvalidMap { provenance })?
-                .into_iter()
-                .map(|extent| {
-                    u32::try_from(extent).map_err(|_| {
-                        solve::SolveProgramConstructionError::InvalidMap { provenance }
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-    }
-    let value_type = solve::SolveValueType::tensor(solve::SolveScalarType::Boolean, dimensions)
-        .map_err(|_| solve::SolveProgramConstructionError::InvalidMap { provenance })?;
-    if !value_type.belongs_to(arithmetic) {
-        return Err(solve::SolveProgramConstructionError::InvalidMap { provenance });
-    }
-    Ok(value_type)
-}
-
-fn arithmetic_profile() -> solve::SolveArithmeticProfile {
+pub(in crate::lower) fn arithmetic_profile() -> solve::SolveArithmeticProfile {
     solve::SolveArithmeticProfile::construct(
         solve::SolveRealFormat::Binary64,
         solve::SolveIntegerDomain::construct(i64::MIN, i64::MAX)
             .expect("the full i64 domain is nonempty"),
     )
-}
-
-/// Typed leaves one DAE value type occupies in a pure-call interface.
-///
-/// A leaf holds scalars, so a value type holds exactly as many leaves as it
-/// takes to hold its scalars. MLS 3.6 §10.3.1 admits a zero-size array
-/// dimension, and such a value holds no scalars at all: it occupies no leaf.
-/// That is the same rule the record arm applies field by field, so a record
-/// with a zero-size field is narrower than its field count by construction and
-/// every consumer that walks leaves by width - the interface, the call site's
-/// packing, and record-field projection - agrees without a second convention.
-fn lower_value_type_leaves<'dae>(
-    view: dae::DaeView<'dae>,
-    id: dae::ValueTypeId<'dae>,
-    arithmetic: solve::SolveArithmeticProfile,
-) -> Result<Vec<solve::SolveValueType>, solve::SolveProgramConstructionError> {
-    let value_type = view
-        .value_type(id)
-        .ok_or(solve::SolveProgramConstructionError::WireMismatch)?;
-    if value_type.dimensions().contains(&0) {
-        return Ok(Vec::new());
-    }
-    if !value_type.is_record() {
-        return Ok(vec![lower_primitive_type(view, id, arithmetic)?]);
-    }
-    // A record the DAE resolved names its fields. A record that names none is
-    // an unresolved type, not an empty one, so it never reaches an interface.
-    if value_type.record_field_count() == 0 {
-        return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
-            provenance: value_type_provenance(view, id),
-        });
-    }
-    let mut leaves = Vec::new();
-    for ordinal in 0..value_type.record_field_count() {
-        let (_, field_type) = view.record_field(id, ordinal).ok_or(
-            solve::SolveProgramConstructionError::InvalidCallInterface {
-                provenance: value_type_provenance(view, id),
-            },
-        )?;
-        for field_leaf in lower_value_type_leaves(view, field_type, arithmetic)? {
-            if value_type.dimensions().is_empty() {
-                leaves.push(field_leaf);
-                continue;
-            }
-            let mut dimensions = value_type.dimensions().to_vec();
-            dimensions.extend_from_slice(field_leaf.dimensions());
-            leaves.push(
-                solve::SolveValueType::tensor(field_leaf.element_type(), dimensions).map_err(
-                    |_| solve::SolveProgramConstructionError::InvalidCallInterface {
-                        provenance: value_type_provenance(view, id),
-                    },
-                )?,
-            );
-        }
-    }
-    Ok(leaves)
-}
-
-fn value_type_provenance<'dae>(
-    view: dae::DaeView<'dae>,
-    id: dae::ValueTypeId<'dae>,
-) -> rumoca_core::Span {
-    view.value_type_provenance(id)
-        .expect("final DAE value type carries provenance")
-        .span()
-}
-
-fn record_field_leaf_range<'dae>(
-    view: dae::DaeView<'dae>,
-    record: dae::ValueTypeId<'dae>,
-    field: usize,
-    arithmetic: solve::SolveArithmeticProfile,
-) -> Result<Range<usize>, solve::SolveProgramConstructionError> {
-    let value_type = view
-        .value_type(record)
-        .ok_or(solve::SolveProgramConstructionError::WireMismatch)?;
-    if !value_type.is_record() {
-        return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
-            provenance: value_type_provenance(view, record),
-        });
-    }
-    let mut start = 0usize;
-    for ordinal in 0..value_type.record_field_count() {
-        let (_, field_type) = view.record_field(record, ordinal).ok_or(
-            solve::SolveProgramConstructionError::InvalidCallInterface {
-                provenance: value_type_provenance(view, record),
-            },
-        )?;
-        let width = lower_value_type_leaves(view, field_type, arithmetic)?.len();
-        if ordinal == field {
-            return Ok(start..start + width);
-        }
-        start = start.checked_add(width).ok_or(
-            solve::SolveProgramConstructionError::IdentityOverflow {
-                provenance: value_type_provenance(view, record),
-            },
-        )?;
-    }
-    Err(solve::SolveProgramConstructionError::InvalidCallInterface {
-        provenance: value_type_provenance(view, record),
-    })
-}
-
-fn lower_primitive_type<'dae>(
-    view: dae::DaeView<'dae>,
-    id: dae::ValueTypeId<'dae>,
-    arithmetic: solve::SolveArithmeticProfile,
-) -> Result<solve::SolveValueType, solve::SolveProgramConstructionError> {
-    let value_type = view
-        .value_type(id)
-        .ok_or(solve::SolveProgramConstructionError::WireMismatch)?;
-    let scalar = match value_type.scalar_type() {
-        dae::ScalarType::Real => solve::SolveScalarType::real(arithmetic),
-        dae::ScalarType::Integer | dae::ScalarType::Enumeration => {
-            solve::SolveScalarType::integer(arithmetic)
-        }
-        dae::ScalarType::Boolean => solve::SolveScalarType::Boolean,
-        dae::ScalarType::String | dae::ScalarType::Record => {
-            return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
-                provenance: value_type_provenance(view, id),
-            });
-        }
-    };
-    if value_type.dimensions().is_empty() {
-        Ok(solve::SolveValueType::scalar(scalar))
-    } else {
-        solve::SolveValueType::tensor(scalar, value_type.dimensions().to_vec()).map_err(|_| {
-            solve::SolveProgramConstructionError::InvalidCallInterface {
-                provenance: value_type_provenance(view, id),
-            }
-        })
-    }
 }
 
 struct ExpressionLowerer<'builder, 'program, 'dae> {
@@ -519,12 +346,11 @@ struct ExpressionLowerer<'builder, 'program, 'dae> {
     /// lowered resolves that definition instead of an unrelated live value.
     function_values: HashMap<dae::FunctionDefinitionId<'dae>, LoweredValue<'program, 'dae>>,
     /// Exact DAE assignment-group membership for demand-ordered definitions.
-    conditional_groups: HashMap<dae::FunctionDefinitionId<'dae>, ConditionalDefinitionGroup<'dae>>,
     fold_parameters: HashMap<(dae::FunctionFoldId<'dae>, u32), LoweredValue<'program, 'dae>>,
     fold_values: HashMap<dae::FunctionFoldId<'dae>, Vec<LoweredValue<'program, 'dae>>>,
     binders: HashMap<(u32, u32), solve::ProgramRegister<'program>>,
-    callees: HashMap<dae::ExprId<'dae>, RegisteredCall<'dae>>,
-    predicate_ranges: HashMap<dae::ExprId<'dae>, Range<usize>>,
+    callees: std::sync::Arc<HashMap<dae::ExprId<'dae>, CalleeInterface<'dae>>>,
+    predicate_ranges: std::sync::Arc<HashMap<dae::ExprId<'dae>, Range<usize>>>,
     cache: HashMap<dae::ExprId<'dae>, LoweredValue<'program, 'dae>>,
     call_values: HashMap<dae::ExprId<'dae>, Vec<solve::ProgramRegister<'program>>>,
     predicate_values: Vec<Option<solve::ProgramRegister<'program>>>,
@@ -532,6 +358,62 @@ struct ExpressionLowerer<'builder, 'program, 'dae> {
     assertion_slots: std::sync::Arc<[AssertionSlot]>,
     next_direct_assertion: usize,
     direct_assertion_count: usize,
+    direct_assertions: std::sync::Arc<[RegisteredAssertion<'dae>]>,
+    assertion_output_base: usize,
+    loop_statements:
+        std::sync::Arc<HashMap<dae::FunctionFoldId<'dae>, assertions::LoopStatements<'dae>>>,
+    conditional_statements: std::sync::Arc<
+        HashMap<dae::FunctionConditionalId<'dae>, assertions::ConditionalStatements<'dae>>,
+    >,
+    assigned_values: HashMap<
+        (dae::FunctionConditionalId<'dae>, dae::FunctionValueId<'dae>),
+        Vec<solve::ProgramAssignedState<'program>>,
+    >,
+    /// Whether each expression evaluates without failure or effect (see
+    /// `total_conditionals`).
+    totality: FaultMemo<'dae>,
+    /// The tests the early-exit predicate of the fold whose body this is names. A
+    /// conditional statement whose guard consists of them is always taken.
+    implied_guards: Vec<dae::ExprId<'dae>>,
+    /// Eagerly demanded calls and correlated conditionals not yet issued.
+    eager: EagerScope<'dae>,
+}
+
+impl<'builder, 'program, 'dae> ExpressionLowerer<'builder, 'program, 'dae> {
+    /// A lowerer for an owner body over captured model coordinates alone: no
+    /// function parameters, definitions, folds, or nested calls.
+    fn for_model_coordinates(
+        view: dae::DaeView<'dae>,
+        builder: &'builder mut solve::TypedProgramBuilder<'program>,
+        model_coordinates: HashMap<ModelCoordinateKey<'dae>, LoweredValue<'program, 'dae>>,
+    ) -> Self {
+        Self {
+            view,
+            builder,
+            model_coordinates,
+            parameters: HashMap::new(),
+            function_values: HashMap::new(),
+            fold_parameters: HashMap::new(),
+            fold_values: HashMap::new(),
+            binders: HashMap::new(),
+            callees: Default::default(),
+            predicate_ranges: Default::default(),
+            cache: HashMap::new(),
+            call_values: HashMap::new(),
+            predicate_values: Vec::new(),
+            assertion_slots: std::sync::Arc::from([]),
+            next_direct_assertion: 0,
+            direct_assertion_count: 0,
+            direct_assertions: std::sync::Arc::from([]),
+            assertion_output_base: 0,
+            loop_statements: Default::default(),
+            conditional_statements: Default::default(),
+            assigned_values: HashMap::new(),
+            totality: HashMap::new(),
+            implied_guards: Vec::new(),
+            eager: EagerScope::default(),
+        }
+    }
 }
 
 impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
@@ -575,41 +457,61 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         &mut self,
         statements: dae::FunctionStatements<'dae>,
     ) -> Result<(), solve::SolveProgramConstructionError> {
+        // MLS 3.7 §8.3.7: a failed error-level assertion aborts the call, so a
+        // later out-of-range subscript must not be reported in its place. Only
+        // that doomed case changes (see `gated_function_definition_value`); a
+        // body without such a subscript after an assertion lowers as before.
+        let mut gate = assertion_statements::AssertionGate::default();
         for statement in statements {
             match statement {
-                dae::FunctionStatementView::Assignment { definition } => {
-                    self.function_definition_value(definition)?;
-                }
-                dae::FunctionStatementView::AssignmentGroup {
-                    definitions,
-                    conditional: None,
+                dae::FunctionStatementView::RequireAssigned {
+                    conditional,
+                    value,
+                    definition,
+                    provenance,
                 } => {
+                    self.require_assigned_statement(
+                        conditional,
+                        value,
+                        definition,
+                        provenance.span(),
+                    )?;
+                }
+                dae::FunctionStatementView::Conditional { conditional } => {
+                    self.scoped_conditional(conditional)?;
+                }
+                dae::FunctionStatementView::Assignment { definition } => {
+                    self.gated_function_definition_value(definition, &mut gate)?;
+                }
+                dae::FunctionStatementView::AssignmentGroup { definitions, .. } => {
                     for definition in definitions.iter() {
-                        self.function_definition_value(definition)?;
+                        self.gated_function_definition_value(definition, &mut gate)?;
                     }
                 }
                 dae::FunctionStatementView::Assertion {
                     condition,
+                    level,
                     provenance,
                     ..
                 } => {
-                    let predicate = self
-                        .expression(condition)?
-                        .only_register(provenance.span())?;
-                    self.record_assertion_predicate(predicate, provenance.span())?;
-                }
-                dae::FunctionStatementView::AssignmentGroup {
-                    definitions,
-                    conditional: Some(conditional),
-                } => {
-                    self.conditional_assignment(definitions, conditional)?;
+                    let index = self.next_direct_assertion;
+                    self.assertion_statement(condition, provenance.span())?;
+                    if level == dae::AssertionLevel::Error {
+                        self.extend_assertion_gate(&mut gate, index, provenance.span())?;
+                    }
                 }
                 dae::FunctionStatementView::For {
-                    fold,
-                    statements,
-                    provenance,
+                    fold, provenance, ..
                 } => {
                     let values = self.function_fold(fold, provenance.span())?;
+                    if let Some(source) = self.loop_statements.get(&fold) {
+                        if self.next_direct_assertion != source.assertions.start {
+                            return Err(solve::SolveProgramConstructionError::InvalidCallOutput {
+                                provenance: provenance.span(),
+                            });
+                        }
+                        self.next_direct_assertion = source.assertions.end;
+                    }
                     let fold = self
                         .view
                         .function_fold(fold)
@@ -619,7 +521,6 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                             provenance: provenance.span(),
                         });
                     }
-                    let domain = fold.domain();
                     // The loop's exit value of each carried target belongs to
                     // the output definition the fold issued, not to the
                     // in-body definitions that produced it.
@@ -629,123 +530,10 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                             .map(|definition| definition.id())
                             .zip(values),
                     );
-                    self.loop_assertions(statements, &mut vec![domain], provenance.span())?;
                 }
             }
         }
         Ok(())
-    }
-
-    fn record_assertion_predicate(
-        &mut self,
-        predicate: solve::ProgramRegister<'program>,
-        provenance: rumoca_core::Span,
-    ) -> Result<(), solve::SolveProgramConstructionError> {
-        if self.next_direct_assertion >= self.direct_assertion_count {
-            return Err(solve::SolveProgramConstructionError::InvalidCallOutput { provenance });
-        }
-        self.predicate_values[self.next_direct_assertion] = Some(predicate);
-        self.next_direct_assertion += 1;
-        Ok(())
-    }
-
-    // SPEC_0021: Exception - exhaustive dispatch over loop statement variants.
-    #[allow(clippy::excessive_nesting)]
-    fn loop_assertions(
-        &mut self,
-        statements: dae::FunctionStatements<'dae>,
-        domains: &mut Vec<dae::DomainId<'dae>>,
-        provenance: rumoca_core::Span,
-    ) -> Result<(), solve::SolveProgramConstructionError> {
-        for statement in statements {
-            match statement {
-                dae::FunctionStatementView::Assertion {
-                    condition,
-                    provenance,
-                    ..
-                } => {
-                    if !assertion_is_map_independent(self.view, condition)
-                        || !self.pending_predicates([condition]).is_empty()
-                    {
-                        return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
-                            provenance: provenance.span(),
-                        });
-                    }
-                    let predicate =
-                        self.map_assertion_predicate(condition, domains, provenance.span())?;
-                    let predicate = self.builder.reduce(
-                        solve::SolveReductionOperator::All,
-                        predicate,
-                        provenance.span(),
-                    )?;
-                    self.record_assertion_predicate(predicate, provenance.span())?;
-                }
-                dae::FunctionStatementView::For {
-                    fold,
-                    statements,
-                    provenance: nested_provenance,
-                } => {
-                    let domain = self
-                        .view
-                        .function_fold(fold)
-                        .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
-                        .domain();
-                    domains.push(domain);
-                    self.loop_assertions(statements, domains, nested_provenance.span())?;
-                    domains.pop();
-                }
-                dae::FunctionStatementView::Assignment { .. }
-                | dae::FunctionStatementView::AssignmentGroup { .. } => {}
-            }
-        }
-        if domains.is_empty() {
-            return Err(solve::SolveProgramConstructionError::InvalidMap { provenance });
-        }
-        Ok(())
-    }
-
-    // SPEC_0021: Exception - exhaustive assertion-map statement dispatch.
-    #[allow(clippy::excessive_nesting)]
-    fn map_assertion_predicate(
-        &mut self,
-        condition: dae::ExprId<'dae>,
-        domains: &[dae::DomainId<'dae>],
-        provenance: rumoca_core::Span,
-    ) -> Result<solve::ProgramRegister<'program>, solve::SolveProgramConstructionError> {
-        let Some((&domain_id, remaining)) = domains.split_first() else {
-            return self.expression(condition)?.only_register(provenance);
-        };
-        let domain = self
-            .view
-            .domain(domain_id)
-            .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
-            .structured()
-            .clone();
-        let body_type = boolean_map_type(self.view, remaining, arithmetic_profile(), provenance)?;
-        let (captures, environment) = self.capture_environment_for([condition])?;
-        let context = RegionContext {
-            view: self.view,
-            callees: self.callees.clone(),
-            predicate_ranges: self.predicate_ranges.clone(),
-            conditional_groups: self.conditional_groups.clone(),
-            assertion_slots: self.assertion_slots.clone(),
-            direct_assertion_count: self.direct_assertion_count,
-        };
-        let remaining = remaining.to_vec();
-        self.builder.map(
-            domain,
-            &captures,
-            body_type,
-            provenance,
-            move |builder, captures, binders, output| {
-                let mut lowerer =
-                    load_region_lowerer(builder, captures, &environment, &context, provenance)?;
-                lowerer.load_domain_binders(domain_id, binders, provenance)?;
-                let predicate =
-                    lowerer.map_assertion_predicate(condition, &remaining, provenance)?;
-                lowerer.builder.store(output, predicate, provenance)
-            },
-        )
     }
 
     fn conditional(
@@ -757,22 +545,18 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         if operands.len() < 3 || operands.len().is_multiple_of(2) {
             return Err(solve::SolveProgramConstructionError::InvalidRegion { provenance });
         }
+        if let Some(value) = self.total_conditional(value_type, operands, provenance)? {
+            return Ok(value);
+        }
         let condition = self.expression(operands[0])?.only_register(provenance)?;
-        let pending = self.pending_predicates(operands[1..].iter().copied());
+        let pending = self.pending_predicates(operands[1..].iter().copied())?;
         let mut output_types =
             lower_value_type_leaves(self.view, value_type, arithmetic_profile())?;
         let value_leaf_count = output_types.len();
         output_types.extend(self.pending_slot_types(&pending));
         let (captures, environment) =
             self.capture_environment_for(operands[1..].iter().copied())?;
-        let context = RegionContext {
-            view: self.view,
-            callees: self.callees.clone(),
-            predicate_ranges: self.predicate_ranges.clone(),
-            conditional_groups: self.conditional_groups.clone(),
-            assertion_slots: self.assertion_slots.clone(),
-            direct_assertion_count: self.direct_assertion_count,
-        };
+        let context = self.region_context();
         let true_environment = environment.clone();
         let true_context = context.clone();
         let true_operands = vec![operands[1]];
@@ -815,10 +599,8 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                 )
             },
         )?;
-        for (slot, predicate) in pending
-            .into_iter()
-            .zip(destinations[value_leaf_count..].iter().copied())
-        {
+        for slot in pending {
+            let predicate = self.inactive_slot(slot, provenance)?;
             let value = self
                 .predicate_values
                 .get_mut(slot)
@@ -898,6 +680,16 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         if let Some(value) = self.predicate_values.get(slot).copied().flatten() {
             return Ok(value);
         }
+        self.inactive_slot(slot, provenance)
+    }
+
+    /// Nested diagnostics travel through the invocation observer. A region's
+    /// normal result carries only the construction-issued inactive cells.
+    fn inactive_slot(
+        &mut self,
+        slot: usize,
+        provenance: rumoca_core::Span,
+    ) -> Result<solve::ProgramRegister<'program>, solve::SolveProgramConstructionError> {
         let kind = self
             .assertion_slots
             .get(slot)
@@ -906,7 +698,19 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         kind.unselected(self.builder, provenance)
     }
 
+    /// The assertion slots `expressions` would settle that no value in this
+    /// scope settled yet, once the demanded calls among them are issued here
+    /// (a region over `expressions` publishes only the slots still open).
     fn pending_predicates(
+        &mut self,
+        expressions: impl IntoIterator<Item = dae::ExprId<'dae>> + Clone,
+    ) -> Result<Vec<usize>, solve::SolveProgramConstructionError> {
+        self.issue_demanded_calls(&mut dae::ExpressionTraversal::new(), expressions.clone())?;
+        Ok(self.unissued_assertion_slots(expressions))
+    }
+
+    /// Source statement discovery gathers slots without evaluating a call.
+    fn unissued_assertion_slots(
         &self,
         expressions: impl IntoIterator<Item = dae::ExprId<'dae>>,
     ) -> Vec<usize> {
@@ -983,14 +787,7 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             .chain(branches.iter().flatten().copied())
             .chain(fallback.iter().copied());
         let (captures, environment) = self.capture_environment_for(capture_roots)?;
-        let context = RegionContext {
-            view: self.view,
-            callees: self.callees.clone(),
-            predicate_ranges: self.predicate_ranges.clone(),
-            conditional_groups: self.conditional_groups.clone(),
-            assertion_slots: self.assertion_slots.clone(),
-            direct_assertion_count: self.direct_assertion_count,
-        };
+        let context = self.region_context();
         let true_environment = environment.clone();
         let true_context = context.clone();
         let true_branch = value_types
@@ -1019,6 +816,7 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                     RegionValues {
                         results: &true_branch,
                         pending_predicates: &true_pending,
+                        publish_predicates: false,
                         provenance,
                     },
                 )
@@ -1061,7 +859,7 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
     /// value for a slot they published, and this scope's value for a slot its
     /// condition settled.
     fn publish_chain_slots(
-        &self,
+        &mut self,
         destinations: &[solve::ProgramRegister<'program>],
         all_pending: &[usize],
         regional_slots: &[usize],
@@ -1069,10 +867,9 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
     ) -> Result<Vec<solve::ProgramRegister<'program>>, solve::SolveProgramConstructionError> {
         let value_count = destinations.len() - regional_slots.len();
         let mut published = destinations[..value_count].to_vec();
-        let mut regional = destinations[value_count..].iter().copied();
         for slot in all_pending {
             let value = if regional_slots.contains(slot) {
-                regional.next()
+                Some(self.inactive_slot(*slot, provenance)?)
             } else {
                 self.predicate_values.get(*slot).copied().flatten()
             };
@@ -1085,83 +882,46 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         Ok(published)
     }
 
-    fn conditional_assignment(
+    /// The values of one correlated conditional tuple, lowered as one region
+    /// pair: every target shares the conditions, and so shares the values its
+    /// arms compute once.
+    ///
+    /// Sibling if-expressions with the same conditions reach this shared
+    /// expression-region constructor. Ordered function statements have their
+    /// separate canonical lexical owner.
+    fn correlated_conditional_values(
         &mut self,
-        definitions: dae::FunctionDefinitionValues<'dae>,
-        conditional: dae::FunctionConditionalView<'dae>,
-    ) -> Result<(), solve::SolveProgramConstructionError> {
-        let at = definitions
-            .get(0)
-            .expect("checked function conditional defines a nonempty target tuple")
-            .provenance()
-            .span();
-        if conditional.branch_count() == 0
-            || conditional.branch_count() != conditional.conditions().len()
-        {
-            return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
-                provenance: at,
-            });
-        }
-        let definitions = definitions.iter().collect::<Vec<_>>();
-        let conditions = conditional.conditions().collect::<Vec<_>>();
-        let branches = (0..conditional.branch_count())
-            .map(|ordinal| {
-                conditional
-                    .branch(ordinal)
-                    .ok_or(solve::SolveProgramConstructionError::WireMismatch)
-                    .map(Iterator::collect::<Vec<_>>)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let fallback = conditional.fallback().collect::<Vec<_>>();
-        if branches
-            .iter()
-            .any(|branch| branch.len() != definitions.len())
-            || fallback.len() != definitions.len()
-        {
-            return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
-                provenance: at,
-            });
-        }
+        value_types: &[dae::ValueTypeId<'dae>],
+        conditions: &[dae::ExprId<'dae>],
+        branches: &[Vec<dae::ExprId<'dae>>],
+        fallback: &[dae::ExprId<'dae>],
+        at: rumoca_core::Span,
+    ) -> Result<Vec<LoweredValue<'program, 'dae>>, solve::SolveProgramConstructionError> {
         let pending = self.pending_predicates(
             conditions
                 .iter()
                 .copied()
                 .chain(branches.iter().flatten().copied())
                 .chain(fallback.iter().copied()),
-        );
-        let mut output_types = Vec::new();
-        let mut value_types = Vec::with_capacity(definitions.len());
-        let mut value_ranges = Vec::with_capacity(definitions.len());
-        for definition in &definitions {
-            let value_type = function_value_type(self.view, definition.target(), at)?;
-            value_types.push(value_type);
-            let start = output_types.len();
-            output_types.extend(lower_value_type_leaves(
-                self.view,
-                value_type,
-                arithmetic_profile(),
-            )?);
-            value_ranges.push((value_type, start..output_types.len()));
+        )?;
+        let mut value_ranges = Vec::with_capacity(value_types.len());
+        let mut value_leaf_count = 0;
+        for value_type in value_types {
+            let leaves = lower_value_type_leaves(self.view, *value_type, arithmetic_profile())?;
+            value_ranges.push((
+                *value_type,
+                value_leaf_count..value_leaf_count + leaves.len(),
+            ));
+            value_leaf_count += leaves.len();
         }
-        let value_leaf_count = output_types.len();
-        output_types.extend(self.pending_slot_types(&pending));
         let destinations = self.assignment_conditional_chain(
-            &value_types,
-            &conditions,
-            &branches,
-            &fallback,
+            value_types,
+            conditions,
+            branches,
+            fallback,
             &pending,
             at,
         )?;
-        for (definition, (value_type, range)) in definitions.iter().zip(value_ranges) {
-            self.function_values.insert(
-                definition.id(),
-                LoweredValue {
-                    value_type,
-                    leaves: destinations[range].to_vec(),
-                },
-            );
-        }
         for (slot, predicate) in pending
             .into_iter()
             .zip(destinations[value_leaf_count..].iter().copied())
@@ -1181,7 +941,13 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                 None => *value = Some(predicate),
             }
         }
-        Ok(())
+        Ok(value_ranges
+            .into_iter()
+            .map(|(value_type, range)| LoweredValue {
+                value_type,
+                leaves: destinations[range].to_vec(),
+            })
+            .collect())
     }
 
     // SPEC_0021: Exception - exhaustive typed dispatch over expression operation variants.
@@ -1247,11 +1013,17 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             dae::ExpressionOperation::Binary { operator, lhs, rhs } => {
                 self.binary(node.value_type_id(), operator, lhs, rhs, at)?
             }
-            dae::ExpressionOperation::Conditional(operands) => self.conditional(
-                node.value_type_id(),
-                &operands.iter().collect::<Vec<_>>(),
-                at,
-            )?,
+            dae::ExpressionOperation::Conditional(operands) => {
+                self.lower_group_of(expression)?;
+                if let Some(value) = self.cache.get(&expression).cloned() {
+                    return Ok(value);
+                }
+                self.conditional(
+                    node.value_type_id(),
+                    &operands.iter().collect::<Vec<_>>(),
+                    at,
+                )?
+            }
             dae::ExpressionOperation::Builtin { builtin, arguments } => {
                 self.builtin(node.value_type_id(), builtin, arguments, at)?
             }
@@ -1290,6 +1062,11 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             }
             dae::ExpressionOperation::FunctionValue { definition, .. } => {
                 self.function_definition_value(definition)?
+            }
+            dae::ExpressionOperation::FunctionConditionalOutput { definition, .. } => {
+                self.function_values.get(&definition.id()).cloned().ok_or(
+                    solve::SolveProgramConstructionError::InvalidCallOutput { provenance: at },
+                )?
             }
             dae::ExpressionOperation::FunctionFoldParameter { fold, carried, .. } => {
                 self.fold_parameters.get(&(fold, carried)).cloned().ok_or(
@@ -1347,6 +1124,14 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             let (_, field_type) = self.view.record_field(value_type, ordinal).ok_or(
                 solve::SolveProgramConstructionError::InvalidCallInterface { provenance: at },
             )?;
+            if is_text_value(
+                self.view
+                    .value_type(field_type)
+                    .ok_or(solve::SolveProgramConstructionError::WireMismatch)?,
+            ) {
+                // A text field occupies no leaf, so its value is not lowered.
+                continue;
+            }
             let field = self.expression(argument)?;
             leaves.extend(self.coerce_value(field, field_type, at)?.leaves);
         }
@@ -1482,10 +1267,19 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             .structured()
             .clone();
         if body_node.binder_domain().is_some() {
-            let result = self.mapped_expression(body, domain_id, domain, at)?;
-            return Ok(LoweredValue::scalar(value_type, result));
+            let leaves = self.mapped_leaves(body, domain_id, domain, at)?;
+            return Ok(LoweredValue { value_type, leaves });
         }
-        let value = self.expression(body)?.only_register(at)?;
+        let body_value = self.expression(body)?;
+        if body_value.leaves.len() != 1 {
+            return self.filled_record_comprehension(
+                (value_type, body_node.value_type_id()),
+                &domain,
+                body_value,
+                at,
+            );
+        }
+        let value = body_value.only_register(at)?;
         if !body_node.value_type().dimensions().is_empty() {
             let body_type =
                 lower_primitive_type(self.view, body_node.value_type_id(), arithmetic_profile())?;
@@ -1534,7 +1328,24 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         domain: rumoca_core::StructuredIndexDomain,
         at: rumoca_core::Span,
     ) -> Result<solve::ProgramRegister<'program>, solve::SolveProgramConstructionError> {
-        if !self.pending_predicates([body]).is_empty() {
+        let [leaf] = self
+            .mapped_leaves(body, domain_id, domain, at)?
+            .try_into()
+            .map_err(|_| solve::SolveProgramConstructionError::InvalidMap { provenance: at })?;
+        Ok(leaf)
+    }
+
+    /// One compact map per leaf of the body: a record-valued comprehension
+    /// is the struct of arrays of its fields, each leaf a map over the
+    /// domain that evaluates only the body field holding that leaf.
+    fn mapped_leaves(
+        &mut self,
+        body: dae::ExprId<'dae>,
+        domain_id: dae::DomainId<'dae>,
+        domain: rumoca_core::StructuredIndexDomain,
+        at: rumoca_core::Span,
+    ) -> Result<Vec<solve::ProgramRegister<'program>>, solve::SolveProgramConstructionError> {
+        if !self.pending_predicates([body])?.is_empty() {
             return Err(solve::SolveProgramConstructionError::InvalidCallInterface {
                 provenance: at,
             });
@@ -1547,32 +1358,87 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                 .value_type_id(),
             arithmetic_profile(),
         )?;
-        let [body_type] = body_types.as_slice() else {
+        if body_types.is_empty() {
             return Err(solve::SolveProgramConstructionError::InvalidMap { provenance: at });
-        };
+        }
+        let function = self
+            .view
+            .expression(body)
+            .and_then(|node| node.function_scope());
+        self.issue_constant_aggregates([body], function)?;
         let (captures, environment) = self.capture_environment_for([body])?;
-        let context = RegionContext {
-            view: self.view,
-            callees: self.callees.clone(),
-            predicate_ranges: self.predicate_ranges.clone(),
-            conditional_groups: self.conditional_groups.clone(),
-            assertion_slots: self.assertion_slots.clone(),
-            direct_assertion_count: self.direct_assertion_count,
+        let environment = std::rc::Rc::new(environment);
+        let mut leaves = Vec::with_capacity(body_types.len());
+        for (leaf, body_type) in body_types.into_iter().enumerate() {
+            let context = self.region_context();
+            let environment = std::rc::Rc::clone(&environment);
+            let domain = domain.clone();
+            leaves.push(self.builder.map(
+                domain,
+                &captures,
+                body_type,
+                at,
+                move |builder, captures, binders, output| {
+                    let mut lowerer =
+                        load_region_lowerer(builder, captures, &environment, &context, at)?;
+                    lowerer.load_domain_binders(domain_id, binders, at)?;
+                    let value = lowerer.expression_leaf(body, leaf, at)?;
+                    lowerer.builder.store(output, value, at)
+                },
+            )?);
+        }
+        Ok(leaves)
+    }
+
+    /// Leaf `leaf` of a value: a record constructor lowers, and coerces to
+    /// its declared field type, only the field that holds the leaf.
+    fn expression_leaf(
+        &mut self,
+        expression: dae::ExprId<'dae>,
+        leaf: usize,
+        at: rumoca_core::Span,
+    ) -> Result<solve::ProgramRegister<'program>, solve::SolveProgramConstructionError> {
+        let node = self
+            .view
+            .expression(expression)
+            .ok_or(solve::SolveProgramConstructionError::WireMismatch)?;
+        let value = match node.operation() {
+            dae::ExpressionOperation::Record(arguments) => {
+                let value_type = node.value_type_id();
+                let mut selected = None;
+                for (ordinal, argument) in arguments.iter().enumerate() {
+                    let range = record_field_leaf_range(
+                        self.view,
+                        value_type,
+                        ordinal,
+                        arithmetic_profile(),
+                    )?;
+                    selected = selected.or(range.contains(&leaf).then_some((
+                        ordinal,
+                        argument,
+                        range.start,
+                    )));
+                }
+                let (ordinal, argument, start) =
+                    selected.ok_or(solve::SolveProgramConstructionError::InvalidCallInterface {
+                        provenance: at,
+                    })?;
+                let (_, field_type) = self.view.record_field(value_type, ordinal).ok_or(
+                    solve::SolveProgramConstructionError::InvalidCallInterface { provenance: at },
+                )?;
+                let field = self.expression(argument)?;
+                let value = self.coerce_value(field, field_type, at)?;
+                return value.leaves.get(leaf - start).copied().ok_or(
+                    solve::SolveProgramConstructionError::InvalidCallInterface { provenance: at },
+                );
+            }
+            _ => self.expression(expression)?,
         };
-        let result = self.builder.map(
-            domain,
-            &captures,
-            body_type.clone(),
-            at,
-            move |builder, captures, binders, output| {
-                let mut lowerer =
-                    load_region_lowerer(builder, captures, &environment, &context, at)?;
-                lowerer.load_domain_binders(domain_id, binders, at)?;
-                let value = lowerer.expression(body)?.only_register(at)?;
-                lowerer.builder.store(output, value, at)
-            },
-        )?;
-        Ok(result)
+        value
+            .leaves
+            .get(leaf)
+            .copied()
+            .ok_or(solve::SolveProgramConstructionError::InvalidCallInterface { provenance: at })
     }
 
     fn array_update(
@@ -1583,9 +1449,22 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         subscripts: dae::SubscriptsView<'dae>,
         at: rumoca_core::Span,
     ) -> Result<LoweredValue<'program, 'dae>, solve::SolveProgramConstructionError> {
+        self.expression(base)?;
+        let value = self.expression(value)?;
+        self.array_update_with(value_type, base, value, subscripts, at)
+    }
+
+    /// Write an already lowered element or slice value into `base`.
+    pub(super) fn array_update_with(
+        &mut self,
+        value_type: dae::ValueTypeId<'dae>,
+        base: dae::ExprId<'dae>,
+        value: LoweredValue<'program, 'dae>,
+        subscripts: dae::SubscriptsView<'dae>,
+        at: rumoca_core::Span,
+    ) -> Result<LoweredValue<'program, 'dae>, solve::SolveProgramConstructionError> {
         let base_value = self.expression(base)?;
         let base = base_value.only_register(at)?;
-        let value = self.expression(value)?;
         let mut value_register = value.only_register(at)?;
         let base_scalar = self
             .view
@@ -1654,8 +1533,20 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            self.builder
-                .update_element(base, value_register, &indices, at)?
+            let base_dimensions = self
+                .view
+                .value_type(base_value.value_type)
+                .ok_or(solve::SolveProgramConstructionError::WireMismatch)?
+                .dimensions();
+            if indices.len() < base_dimensions.len() {
+                // MLS 10.5.3: the unsubscripted trailing axes are whole, so the
+                // update replaces the sub-array the leading indices select.
+                let axes = leading_index_axes(&indices, &base_dimensions[indices.len()..]);
+                self.builder.update_view(base, value_register, &axes, at)?
+            } else {
+                self.builder
+                    .update_element(base, value_register, &indices, at)?
+            }
         };
         Ok(LoweredValue::scalar(value_type, result))
     }
@@ -1675,15 +1566,15 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
             .get(&owner)
             .cloned()
             .ok_or(solve::SolveProgramConstructionError::UnknownCallOwner { provenance: at })?;
-        let Some(range) = call.result_ranges.get(output as usize).cloned() else {
+        let Some(range) = call.result_layout.ranges.get(output as usize).cloned() else {
             return Err(solve::SolveProgramConstructionError::InvalidCallOutput { provenance: at });
         };
         let values = match self.call_values.get(&owner).cloned() {
             Some(values) => values,
             None => {
                 let lowered_arguments = self.call_arguments(expression, arguments, at)?;
-                let values = self.builder.call(call.owner, &lowered_arguments, at)?;
-                if values.len() != call.result_leaf_count + call.assertion_slots.len() {
+                let issued = self.builder.emit_call(call.owner, &lowered_arguments, at)?;
+                if issued.registers().len() != call.result_leaf_count + call.assertion_slots.len() {
                     return Err(solve::SolveProgramConstructionError::InvalidCallOutput {
                         provenance: at,
                     });
@@ -1696,6 +1587,21 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
                         provenance: at,
                     });
                 }
+                for (offset, kind) in call.assertion_slots.iter().enumerate() {
+                    if matches!(kind, AssertionSlot::Predicate { .. }) {
+                        let parent = self.builder.assertion_output(
+                            self.assertion_output_base + predicate_range.start + offset,
+                            at,
+                        )?;
+                        self.builder.forward_assertion(
+                            &issued,
+                            call.result_leaf_count + offset,
+                            parent,
+                            at,
+                        )?;
+                    }
+                }
+                let values = issued.into_registers();
                 for (slot, predicate) in
                     predicate_range.zip(values[call.result_leaf_count..].iter().copied())
                 {
@@ -1753,6 +1659,15 @@ impl<'program, 'dae> ExpressionLowerer<'_, 'program, 'dae> {
         }
         let mut lowered = Vec::new();
         for (argument, target) in arguments.iter().zip(parameter_types.iter()) {
+            if is_text_value(
+                self.view
+                    .value_type(target)
+                    .ok_or(solve::SolveProgramConstructionError::WireMismatch)?,
+            ) {
+                // A text input occupies no leaf (a decomposed record's `name`
+                // field, for example), so its argument is not lowered.
+                continue;
+            }
             let value = self.expression(argument)?;
             lowered.extend(self.coerce_value(value, target, at)?.leaves);
         }

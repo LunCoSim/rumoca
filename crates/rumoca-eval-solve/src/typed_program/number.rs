@@ -16,12 +16,11 @@ pub(super) fn eval_unary_typed(
         .elements
         .iter()
         .copied()
-        .map(|element| eval_unary_element(operator, element, scalar, provenance))
-        .collect::<Result<Vec<_>, _>>()?;
-    TypedValue::checked(value.value_type.clone(), elements, provenance)
+        .map(|element| eval_unary_element(operator, element, scalar, provenance));
+    TypedValue::checked_elements(value.value_type.clone(), elements, provenance)
 }
 
-fn eval_unary_element(
+pub(crate) fn eval_unary_element(
     operator: SolveUnaryOperator,
     value: SolveValueKind,
     scalar: SolveScalarType,
@@ -130,12 +129,11 @@ pub(super) fn eval_binary_typed(
         .iter()
         .copied()
         .zip(rhs.elements.iter().copied())
-        .map(|(lhs, rhs)| eval_binary_element(operator, lhs, rhs, scalar, provenance))
-        .collect::<Result<Vec<_>, _>>()?;
-    TypedValue::checked(lhs.value_type.clone(), elements, provenance)
+        .map(|(lhs, rhs)| eval_binary_element(operator, lhs, rhs, scalar, provenance));
+    TypedValue::checked_elements(lhs.value_type.clone(), elements, provenance)
 }
 
-pub(super) fn eval_binary_element(
+pub(crate) fn eval_binary_element(
     operator: SolveBinaryOperator,
     lhs: SolveValueKind,
     rhs: SolveValueKind,
@@ -183,6 +181,14 @@ fn eval_integer_binary(
         SolveBinaryOperator::IntegerQuotient => lhs.checked_div(rhs),
         SolveBinaryOperator::Min => Some(lhs.min(rhs)),
         SolveBinaryOperator::Max => Some(lhs.max(rhs)),
+        SolveBinaryOperator::IntegerRemainder => integer_remainder(lhs, rhs),
+        SolveBinaryOperator::IntegerModulo => integer_remainder(lhs, rhs).and_then(|remainder| {
+            if remainder != 0 && (remainder < 0) != (rhs < 0) {
+                remainder.checked_add(rhs)
+            } else {
+                Some(remainder)
+            }
+        }),
         _ => None,
     }
     .filter(|result| domain.contains(*result))
@@ -193,6 +199,15 @@ fn eval_integer_binary(
     Ok(SolveValueKind::Integer(result))
 }
 
+fn integer_remainder(lhs: i64, rhs: i64) -> Option<i64> {
+    // The remainder is representable even when the intermediate quotient is not.
+    if rhs == -1 {
+        Some(0)
+    } else {
+        lhs.checked_rem(rhs)
+    }
+}
+
 fn eval_real_binary_f32(operator: SolveBinaryOperator, lhs: f32, rhs: f32) -> f32 {
     match operator {
         SolveBinaryOperator::Add => lhs + rhs,
@@ -201,11 +216,13 @@ fn eval_real_binary_f32(operator: SolveBinaryOperator, lhs: f32, rhs: f32) -> f3
         SolveBinaryOperator::Divide => lhs / rhs,
         SolveBinaryOperator::Power => lhs.powf(rhs),
         SolveBinaryOperator::Atan2 => lhs.atan2(rhs),
-        SolveBinaryOperator::Min => lhs.min(rhs),
-        SolveBinaryOperator::Max => lhs.max(rhs),
-        SolveBinaryOperator::IntegerQuotient
-        | SolveBinaryOperator::And
-        | SolveBinaryOperator::Or => f32::NAN,
+        SolveBinaryOperator::Min => rumoca_ir_solve::real_extremum(lhs, rhs, true),
+        SolveBinaryOperator::Max => rumoca_ir_solve::real_extremum(lhs, rhs, false),
+        SolveBinaryOperator::And
+        | SolveBinaryOperator::Or
+        | SolveBinaryOperator::IntegerQuotient
+        | SolveBinaryOperator::IntegerModulo
+        | SolveBinaryOperator::IntegerRemainder => f32::NAN,
     }
 }
 
@@ -217,11 +234,13 @@ fn eval_real_binary_f64(operator: SolveBinaryOperator, lhs: f64, rhs: f64) -> f6
         SolveBinaryOperator::Divide => lhs / rhs,
         SolveBinaryOperator::Power => lhs.powf(rhs),
         SolveBinaryOperator::Atan2 => lhs.atan2(rhs),
-        SolveBinaryOperator::Min => lhs.min(rhs),
-        SolveBinaryOperator::Max => lhs.max(rhs),
-        SolveBinaryOperator::IntegerQuotient
-        | SolveBinaryOperator::And
-        | SolveBinaryOperator::Or => f64::NAN,
+        SolveBinaryOperator::Min => rumoca_ir_solve::real_extremum(lhs, rhs, true),
+        SolveBinaryOperator::Max => rumoca_ir_solve::real_extremum(lhs, rhs, false),
+        SolveBinaryOperator::And
+        | SolveBinaryOperator::Or
+        | SolveBinaryOperator::IntegerQuotient
+        | SolveBinaryOperator::IntegerModulo
+        | SolveBinaryOperator::IntegerRemainder => f64::NAN,
     }
 }
 
@@ -239,16 +258,15 @@ pub(super) fn eval_compare_typed(
         .iter()
         .copied()
         .zip(rhs.elements.iter().copied())
-        .map(|(lhs, rhs)| compare_elements(operator, lhs, rhs, provenance))
-        .collect::<Result<Vec<_>, _>>()?;
-    TypedValue::checked(
+        .map(|(lhs, rhs)| compare_elements(operator, lhs, rhs, provenance));
+    TypedValue::checked_elements(
         lhs.value_type.boolean_with_same_shape(),
         elements,
         provenance,
     )
 }
 
-fn compare_elements(
+pub(crate) fn compare_elements(
     operator: SolveCompareOperator,
     lhs: SolveValueKind,
     rhs: SolveValueKind,
@@ -300,12 +318,11 @@ pub(super) fn eval_convert_typed(
         .elements
         .iter()
         .copied()
-        .map(|element| convert_element(operator, element, scalar, provenance))
-        .collect::<Result<Vec<_>, _>>()?;
-    TypedValue::checked(destination_type, elements, provenance)
+        .map(|element| convert_element(operator, element, scalar, provenance));
+    TypedValue::checked_elements(destination_type, elements, provenance)
 }
 
-fn convert_element(
+pub(crate) fn convert_element(
     operator: SolveConversionOperator,
     value: SolveValueKind,
     destination: SolveScalarType,

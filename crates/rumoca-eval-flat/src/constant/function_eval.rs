@@ -24,6 +24,9 @@ use super::errors::EvalError;
 use super::value::Value;
 use super::{EvalEnvironment, EvalIndexMap};
 
+mod statement_calls;
+use statement_calls::{eval_assert_stmt, eval_fn_call_stmt};
+
 /// Execution limits for function evaluation.
 #[derive(Debug, Clone)]
 pub struct EvalLimits {
@@ -222,6 +225,8 @@ struct FunctionEnv {
     outputs: IndexMap<String, Value>,
     /// Local/protected variables.
     locals: IndexMap<String, Value>,
+    source_iterators: Vec<(rumoca_core::IndexBinderProvenance, String, Value)>,
+    source_iterator_declarations: std::collections::HashSet<rumoca_core::DefId>,
 }
 
 /// Function-call argument after expression evaluation.
@@ -255,6 +260,8 @@ impl FunctionEnv {
             inputs,
             outputs: IndexMap::new(),
             locals: IndexMap::new(),
+            source_iterators: Vec::new(),
+            source_iterator_declarations: std::collections::HashSet::new(),
         };
         env.bind_omitted_input_defaults(func, eval)?;
         env.declare_all(func, eval)?;
@@ -751,13 +758,14 @@ pub fn eval_function_with_call_args(
     // Refused before any environment or result construction: a body the
     // evaluator cannot execute must never yield the zero-valued outputs an
     // empty environment would produce.
-    if !func.pure {
+    let translation_read = foreign_reads::translation_read(func, ctx);
+    if !func.pure && translation_read.is_none() {
         return Err(EvalError::not_constant(
             format!("impure function: {}", func.name),
             span,
         ));
     }
-    if func.external.is_some() {
+    if func.external.is_some() && translation_read.is_none() {
         return Err(EvalError::not_constant(
             format!("external function: {}", func.name),
             span,
@@ -784,6 +792,10 @@ pub fn eval_function_with_call_args(
         span,
     };
     let mut env = FunctionEnv::new_with_call_args(func, args, &eval)?;
+    if let Some((read, resources)) = translation_read {
+        foreign_reads::execute(func, read, resources, &mut env, &eval)?;
+        return env.return_value(span);
+    }
     if func.is_constructor {
         return record_constructor_value(func, &env, span);
     }
@@ -869,13 +881,19 @@ fn eval_statement(
             comp,
             args,
             outputs,
-            ..
-        } => eval_fn_call_stmt(comp, args, outputs, state.env, eval),
+            span,
+        } => eval_fn_call_stmt(comp, args, outputs, state.env, eval, *span),
         Statement::When { .. } => Err(EvalError::not_constant(
             "when statement in function",
             eval.span,
         )),
-        Statement::Reinit { .. } | Statement::Assert { .. } => Ok(FlowControl::Continue),
+        Statement::Assert {
+            condition,
+            message,
+            level,
+            span,
+        } => eval_assert_stmt(condition, message, level.as_deref(), state.env, eval, *span),
+        Statement::Reinit { .. } => Ok(FlowControl::Continue),
     }
 }
 
@@ -957,36 +975,6 @@ fn eval_stmt_list(
         if flow != FlowControl::Continue {
             return Ok(flow);
         }
-    }
-    Ok(FlowControl::Continue)
-}
-
-/// Evaluate a function call statement.
-fn eval_fn_call_stmt(
-    comp: &Reference,
-    args: &[Expression],
-    outputs: &[Option<ComponentReference>],
-    env: &mut FunctionEnv,
-    eval: &EvalState<'_>,
-) -> Result<FlowControl, EvalError> {
-    let func_name = comp.as_str();
-
-    // Skip special built-in statements that appear as function calls
-    // These are runtime-only operations that should be no-ops during constant evaluation
-    match func_name {
-        "assert" | "print" | "terminate" | "Modelica.Utilities.Streams.print" => {
-            return Ok(FlowControl::Continue);
-        }
-        _ => {}
-    }
-
-    let arg_values: Vec<Value> = args
-        .iter()
-        .map(|a| eval_expr_in_function(a, env, eval))
-        .collect::<Result<_, _>>()?;
-    let result = call_function(func_name, arg_values, eval)?;
-    if !outputs.is_empty() {
-        assign_fn_outputs(outputs, result, env, eval)?;
     }
     Ok(FlowControl::Continue)
 }
@@ -1302,10 +1290,31 @@ fn eval_var_ref(
     eval: &EvalState<'_>,
 ) -> Result<Value, EvalError> {
     let name = reference.as_str();
-    if let Some(val) = env.get(name) {
-        return apply_subscripts_flat(val.clone(), subscripts, env, eval);
+    if let Some((_, _, value)) = env
+        .source_iterators
+        .iter()
+        .rev()
+        .find(|(binder, spelling, _)| match binder {
+            rumoca_core::IndexBinderProvenance::Source(id) => {
+                reference.target_def_id() == Some(*id)
+            }
+            rumoca_core::IndexBinderProvenance::Generated => {
+                reference.is_generated() && reference.as_str() == spelling
+            }
+        })
+    {
+        return apply_subscripts_flat(value, subscripts, env, eval);
     }
-    if let Some(val) = eval.ctx.get_value(name) {
+    if reference
+        .target_def_id()
+        .is_some_and(|id| env.source_iterator_declarations.contains(&id))
+    {
+        return Err(EvalError::unknown_variable(name, eval.span));
+    }
+    if let Some(val) = env.get(name) {
+        return apply_subscripts_flat(val, subscripts, env, eval);
+    }
+    if let Some(val) = eval.ctx.get_reference_value(reference) {
         return Ok(val.into_owned());
     }
     if let Some((type_name, literal)) = eval.ctx.get_enum(name) {
@@ -1315,7 +1324,11 @@ fn eval_var_ref(
     // reference Flat renders, so `z.im` names the field `im` of the bound local
     // `z`.
     if let Some(value) = read_bound_field_path(reference, env, eval)? {
-        return apply_subscripts_flat(value, subscripts, env, eval);
+        return if subscripts.is_empty() {
+            Ok(value)
+        } else {
+            apply_subscripts_flat(&value, subscripts, env, eval)
+        };
     }
     // An enumeration literal is a registered value (`get_enum` above). A
     // qualified name that names no value is unknown: reading it as an
@@ -1377,6 +1390,11 @@ fn eval_binary(
     eval: &EvalState<'_>,
 ) -> Result<Value, EvalError> {
     let lhs_val = eval_expr_in_function(lhs, env, eval)?;
+    if let Value::Bool(value) = &lhs_val
+        && super::expr_eval::logical_value_determines_result(op, *value)
+    {
+        return Ok(Value::Bool(*value));
+    }
     let rhs_val = eval_expr_in_function(rhs, env, eval)?;
     super::operators::eval_binary_op(op, &lhs_val, &rhs_val, eval.span)
 }
@@ -1463,7 +1481,11 @@ fn eval_array_index(
     eval: &EvalState<'_>,
 ) -> Result<Value, EvalError> {
     let base_val = eval_expr_in_function(base, env, eval)?;
-    apply_subscripts_flat(base_val, subscripts, env, eval)
+    if subscripts.is_empty() {
+        Ok(base_val)
+    } else {
+        apply_subscripts_flat(&base_val, subscripts, env, eval)
+    }
 }
 
 /// Evaluate an array comprehension: `{expr for i in range if filter}`.
@@ -1484,8 +1506,16 @@ fn eval_array_comprehension(
         inputs: env.inputs.clone(),
         outputs: env.outputs.clone(),
         locals: env.locals.clone(),
+        source_iterators: env.source_iterators.clone(),
+        source_iterator_declarations: env.source_iterator_declarations.clone(),
     };
 
+    local_env
+        .source_iterator_declarations
+        .extend(indices.iter().filter_map(|index| match index.binder {
+            rumoca_core::IndexBinderProvenance::Source(id) => Some(id),
+            rumoca_core::IndexBinderProvenance::Generated => None,
+        }));
     eval_comprehension_recursive(expr, indices, filter, &mut local_env, eval)
 }
 
@@ -1512,20 +1542,24 @@ fn eval_comprehension_recursive(
         return eval_expr_in_function(expr, env, eval);
     }
 
-    let index = &indices[0];
+    let (index, remaining) = indices
+        .split_last()
+        .expect("nonempty indices handled above");
     let var_name = index.name.to_string();
     let range_values = eval_range_expr(&index.range, env, eval)?;
-    let remaining = &indices[1..];
 
     let mut results = Vec::new();
 
     // Save original value if it exists
-    let original = env.locals.get(&var_name).cloned();
+    let source_depth = env.source_iterators.len();
 
     for val in range_values {
-        env.locals.insert(var_name.clone(), val);
+        env.source_iterators
+            .push((index.binder, var_name.clone(), val));
 
-        let result = eval_comprehension_recursive(expr, remaining, filter, env, eval)?;
+        let result = eval_comprehension_recursive(expr, remaining, filter, env, eval);
+        env.source_iterators.truncate(source_depth);
+        let result = result?;
 
         // Handle filtered results (empty arrays indicate filtered-out elements)
         match &result {
@@ -1536,13 +1570,6 @@ fn eval_comprehension_recursive(
                 results.push(result);
             }
         }
-    }
-
-    // Restore original value
-    if let Some(orig) = original {
-        env.locals.insert(var_name, orig);
-    } else {
-        env.locals.swap_remove(&var_name);
     }
 
     Ok(Value::Array(results))
@@ -1954,7 +1981,7 @@ fn set_array_element(
 
 /// Apply Flat subscripts using the function's local evaluation environment.
 fn apply_subscripts_flat(
-    value: Value,
+    value: &Value,
     subs: &[Subscript],
     env: &FunctionEnv,
     eval: &EvalState<'_>,
@@ -1967,5 +1994,6 @@ fn apply_subscripts_flat(
     )
 }
 
+mod foreign_reads;
 #[cfg(test)]
 mod tests;

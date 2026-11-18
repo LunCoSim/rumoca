@@ -7,15 +7,19 @@
 //! IR facts: the searched roots and their indicator table, the relation-memory
 //! targets and zero domains, the event iteration schedule, and the pre-binding
 //! lanes of each iteration run. Runtime, post-commit, and unclocked guarded
-//! assignments run as their row blocks. Clocks, scheduled or dynamic time
-//! events, delays, structured updates, and event transactions are refused
-//! here.
+//! assignments run as their row blocks; a guarded assignment under a periodic
+//! clock runs on that clock's ticks. The static instants and the periodic
+//! clock schedules are the component's time events. Dynamic time events,
+//! delays, structured updates, and event transactions are refused here.
+
+#[cfg(test)]
+mod tests;
 
 use serde::Serialize;
 
 use crate::{
-    DiscreteEventPreMode, DiscreteRowRole, EventIterationOwner, PreParamSource, RootSearchPlan,
-    RootSearchRole, RootZeroDomain, ScalarSlot, SolveEventActionKind, SolveModel,
+    DiscreteEventPreMode, DiscreteRowRole, PreParamSource, RootSearchPlan, RootSearchRole,
+    RootZeroDomain, ScalarSlot, SolveEventActionKind, SolveModel,
 };
 
 /// The Solve IR facts the generated component reads to execute events.
@@ -33,11 +37,31 @@ pub(super) struct ScalarEventProfile {
     /// Per discrete output: whether it is a condition memory, the rows
     /// initialization seeds with `pre` following the current value.
     condition_memory_rows: Vec<bool>,
+    /// Pulse-memory outputs and their checked producing programs. Only these
+    /// programs are evaluated when the event releases its clock pulses.
+    pulse_rows: Vec<usize>,
+    pulse_programs: Vec<usize>,
+    /// Per discrete output: whether a public observation recomputes it from
+    /// the observed coordinate (an unread B.1c owner, SPEC_0022 EXPR-012).
+    observation_rows: Vec<bool>,
+    /// Whether an observation row reads a solver coordinate, so the algebraic
+    /// refresh and the rows alternate until they agree.
+    observation_reads_y: bool,
     /// Targets of the runtime assignments and of the post-commit
     /// assignments, in output order.
     runtime_targets: Vec<Slot>,
     /// Per guarded-assignment output, in program order: its target.
     guarded_targets: Vec<Slot>,
+    /// Per guarded-assignment output: the periodic clock that owns it, which
+    /// gates it to that clock's ticks and to the first pass of an event.
+    guarded_clocks: Vec<Option<usize>>,
+    /// The time events the component announces and stops at.
+    time_events: super::time_events::TimeEvents,
+    /// Source storage runs of discrete-valued external inputs. A
+    /// discrete-time input changes only at events (MLS §4.5), so a
+    /// change the importer makes between Co-Simulation steps is an event at
+    /// the next step's first instant.
+    discrete_input_runs: DiscreteInputRuns,
     post_commit_targets: Vec<Slot>,
     /// The parameters actions read at their event-entry value.
     condition_memories: Vec<usize>,
@@ -46,6 +70,13 @@ pub(super) struct ScalarEventProfile {
     root_neighborhoods: Vec<Vec<usize>>,
     /// The event iteration schedule the component walks (ME-EVENT-006).
     schedule: crate::EventIterationSchedule,
+}
+
+impl ScalarEventProfile {
+    /// The exact rows recomputed by this profile's public getter.
+    pub(super) fn public_observation_rows(&self) -> &[bool] {
+        &self.observation_rows
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -119,21 +150,7 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
             _ => Err("a discrete row writes outside the parameters"),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if discrete.row_roles.iter().any(|role| {
-        !matches!(
-            role,
-            DiscreteRowRole::Equation | DiscreteRowRole::ConditionMemory
-        )
-    }) {
-        return Err("the C profile executes only discrete equations and condition memories");
-    }
-    if discrete
-        .pre_modes
-        .iter()
-        .any(|mode| *mode != DiscreteEventPreMode::FollowCurrent)
-    {
-        return Err("the C profile executes only discrete rows whose pre follows the current pass");
-    }
+    validate_scalar_discrete_rows(discrete)?;
     let layout = &problem.solve_layout;
     let pre_bindings = layout
         .pre_param_bindings
@@ -153,8 +170,10 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
         .collect::<Vec<_>>();
     let mut iteration_lanes = Vec::new();
     for run in &discrete.event_iteration_plan.runs {
-        if !matches!(run.owner, EventIterationOwner::ScalarRows { .. }) {
-            return Err("the C profile iterates only scalar discrete rows");
+        // A clock-owned run advances its history on its tick when the event
+        // commits and takes no part in the pass-to-pass fixed point.
+        if discrete.event_iteration_run_clock(run)?.is_some() {
+            continue;
         }
         let storage = layout
             .variable_storage_runs
@@ -166,6 +185,7 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
         }
         iteration_lanes.extend(lanes);
     }
+    let (pulse_rows, pulse_programs) = pulse_producers(discrete)?;
     Ok(ScalarEventProfile {
         roots,
         pre_bindings,
@@ -173,11 +193,21 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
         condition_memory_rows: discrete
             .row_roles
             .iter()
-            .map(|role| *role == DiscreteRowRole::ConditionMemory)
+            .map(|role| role.is_condition_memory())
             .collect(),
+        pulse_rows,
+        pulse_programs,
         discrete_targets,
+        observation_rows: discrete.observation_refresh.clone(),
+        observation_reads_y: discrete.observation_refresh_reads_y,
         runtime_targets: slots(&discrete.runtime_assignment_targets)?,
         guarded_targets: guarded_targets(discrete)?,
+        guarded_clocks: guarded_clocks(
+            discrete,
+            model.problem.clocks.periodic_event_schedules.len(),
+        )?,
+        time_events: super::time_events::derive(model)?,
+        discrete_input_runs: discrete_inputs(problem)?,
         post_commit_targets: slots(&discrete.post_commit_assignment_targets)?,
         condition_memories: events.condition_memory_parameter_indices.clone(),
         schedule: discrete.event_iteration_plan.schedule.clone(),
@@ -186,18 +216,69 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
     })
 }
 
+fn validate_scalar_discrete_rows(
+    discrete: &crate::DiscreteSolveSystem,
+) -> Result<(), &'static str> {
+    if discrete.row_roles.iter().any(|role| {
+        !matches!(
+            role,
+            DiscreteRowRole::Equation
+                | DiscreteRowRole::ConditionMemory
+                | DiscreteRowRole::PulseConditionMemory
+        )
+    }) {
+        return Err("the C profile executes only discrete equations and condition memories");
+    }
+    if discrete
+        .pre_modes
+        .iter()
+        .any(|mode| *mode != DiscreteEventPreMode::FollowCurrent)
+    {
+        return Err("the C profile executes only discrete rows whose pre follows the current pass");
+    }
+    Ok(())
+}
+
+fn pulse_producers(
+    discrete: &crate::DiscreteSolveSystem,
+) -> Result<(Vec<usize>, Vec<usize>), &'static str> {
+    let pulse_rows = discrete
+        .row_roles
+        .iter()
+        .enumerate()
+        .filter_map(|(row, role)| (*role == DiscreteRowRole::PulseConditionMemory).then_some(row))
+        .collect::<Vec<_>>();
+    let pulse_programs = pulse_rows
+        .iter()
+        .map(|row| {
+            discrete
+                .rhs
+                .program_index_for_output(*row)
+                .ok_or("a pulse condition memory has no checked producing program")
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+        .into_iter()
+        .collect();
+    Ok((pulse_rows, pulse_programs))
+}
+
 fn refuse_unsupported_owners(model: &SolveModel) -> Result<(), &'static str> {
     let problem = &model.problem;
     let events = &problem.events;
     let discrete = &problem.discrete;
-    if crate::solve_has_runtime_events(problem) || crate::solve_has_clocks(problem) {
-        return Err("the C profile cannot execute delays, terminal events, or clocks");
+    if crate::solve_has_runtime_events(problem) {
+        return Err("the C profile cannot execute delays or terminal events");
+    }
+    if discrete.clock_owners.iter().any(Option::is_some)
+        || !discrete.clock_partition_intermediates.is_empty()
+    {
+        return Err("the C profile executes clocks only through guarded assignments");
     }
     if !events.scheduled_root_conditions.is_empty()
-        || !events.scheduled_time_events.is_empty()
         || !events.dynamic_time_event_rhs.is_empty()
+        || !events.dynamic_time_event_names.is_empty()
     {
-        return Err("the C profile cannot execute time events");
+        return Err("the C profile cannot execute dynamic or scheduled-root time events");
     }
     if events.actions.iter().any(|action| {
         !matches!(
@@ -206,6 +287,13 @@ fn refuse_unsupported_owners(model: &SolveModel) -> Result<(), &'static str> {
         ) || action.clock_owner.is_some()
     }) {
         return Err("the C profile executes only unscheduled assertions");
+    }
+    if discrete
+        .guarded_assignments
+        .iter()
+        .any(crate::GuardedAssignmentProgram::observation_refresh)
+    {
+        return Err("the C profile cannot observe a guarded assignment through a refresh");
     }
     if !discrete.structured_rhs.is_empty()
         || !discrete.structured_updates.is_empty()
@@ -220,9 +308,6 @@ fn refuse_unsupported_owners(model: &SolveModel) -> Result<(), &'static str> {
         .any(|binding| binding.clock_schedule.is_some())
     {
         return Err("the C profile cannot execute clocked previous() history");
-    }
-    if problem.solve_layout.initial_event_parameter_index.is_some() {
-        return Err("the C profile cannot execute an initial event yet");
     }
     Ok(())
 }
@@ -258,13 +343,10 @@ fn scalar_event_root(
 }
 
 /// The guarded assignments' targets, expanded from their compact ranges in
-/// program and range order; an owner under a clock is refused.
+/// program and range order.
 fn guarded_targets(discrete: &crate::DiscreteSolveSystem) -> Result<Vec<Slot>, &'static str> {
     let mut targets = Vec::new();
     for program in &discrete.guarded_assignments {
-        if program.clock_owner().is_some() {
-            return Err("the C profile cannot execute clocked guarded assignments");
-        }
         for range in program.target_ranges() {
             let (column, base) = match range.base() {
                 ScalarSlot::Y { index, .. } => ("y", index),
@@ -282,4 +364,79 @@ fn guarded_targets(discrete: &crate::DiscreteSolveSystem) -> Result<Vec<Slot>, &
         }
     }
     Ok(targets)
+}
+
+/// The periodic clock of every guarded-assignment output, in the order of
+/// [`guarded_targets`].
+fn guarded_clocks(
+    discrete: &crate::DiscreteSolveSystem,
+    clock_count: usize,
+) -> Result<Vec<Option<usize>>, &'static str> {
+    let mut clocks = Vec::new();
+    for program in &discrete.guarded_assignments {
+        let clock = program.clock_owner().map(crate::PeriodicClockId::index);
+        if clock.is_some_and(|clock| clock >= clock_count) {
+            return Err("a guarded assignment names a clock outside the clock partition");
+        }
+        let outputs: usize = program
+            .target_ranges()
+            .iter()
+            .map(|range| range.count())
+            .sum();
+        clocks.extend(std::iter::repeat_n(clock, outputs));
+    }
+    Ok(clocks)
+}
+
+/// A checked projection of the same problem's discrete input storage runs.
+#[derive(Debug, Serialize)]
+struct DiscreteInputRuns {
+    runs: Vec<DiscreteInputRun>,
+    scalar_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscreteInputRun {
+    p_base: usize,
+    count: usize,
+    seen_offset: usize,
+}
+
+/// Preserve storage order and repeated mappings; each owns its seen lanes.
+fn discrete_inputs(problem: &crate::SolveProblem) -> Result<DiscreteInputRuns, &'static str> {
+    let mut inputs = DiscreteInputRuns {
+        runs: Vec::new(),
+        scalar_count: 0,
+    };
+    for run in &problem.solve_layout.variable_storage_runs {
+        let discrete = matches!(
+            run.value_kind,
+            crate::SolveVariableValueKind::Integer
+                | crate::SolveVariableValueKind::Boolean
+                | crate::SolveVariableValueKind::Enumeration
+        );
+        if run.role != crate::SolveVariableStorageRole::ExternalInput || !discrete {
+            continue;
+        }
+        let ScalarSlot::P { index, .. } = run.base else {
+            return Err("a discrete input lives outside the parameters");
+        };
+        let end = index
+            .checked_add(run.scalar_count)
+            .ok_or("a discrete input parameter range overflowed")?;
+        if end > problem.layout.p_scalars() {
+            return Err("a discrete input parameter range exceeds its storage");
+        }
+        let seen_end = inputs
+            .scalar_count
+            .checked_add(run.scalar_count)
+            .ok_or("the discrete input history size overflowed")?;
+        inputs.runs.push(DiscreteInputRun {
+            p_base: index,
+            count: run.scalar_count,
+            seen_offset: inputs.scalar_count,
+        });
+        inputs.scalar_count = seen_end;
+    }
+    Ok(inputs)
 }

@@ -1,6 +1,16 @@
 mod additive;
-mod producers;
+#[cfg(test)]
+mod additive_tests;
+pub(super) mod cached;
+mod concatenate;
+mod dependency_candidates;
+#[cfg(test)]
+mod dependency_candidates_tests;
+pub(in crate::refresh) mod producers;
+mod reciprocal;
 pub(super) mod tensor_affine;
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::dependency::{ScalarProgramYDependency, y_load_indices};
 use crate::{BinaryOp, LinearOp, StridedOperand, TargetAssignmentShape, UnaryOp};
@@ -24,54 +34,96 @@ fn canonical_assignment_shape(
     target_y_index: usize,
     dependencies: &ScalarProgramYDependency<'_>,
 ) -> Option<TargetAssignmentShape> {
-    // The checked dependency owner can exclude a target before isolator
-    // construction. Unbounded dependencies remain candidates.
-    if !dependencies.depends_on(output, target_y_index) {
-        return None;
+    OutputShapes::new(prefix, output, dependencies).for_target(target_y_index)
+}
+
+/// The assignment shapes of one output. Direct, zero, and affine shapes are
+/// read off the output's own expression, whatever target is asked about, so
+/// they are derived once per output; the remaining kinds are derived per
+/// target in the same preference order.
+struct OutputShapes<'prefix, 'dependencies> {
+    prefix: ProgramPrefix<'prefix>,
+    output: u32,
+    dependencies: &'dependencies ScalarProgramYDependency<'dependencies>,
+    fixed: BTreeMap<usize, TargetAssignmentShape>,
+}
+
+impl<'prefix, 'dependencies> OutputShapes<'prefix, 'dependencies> {
+    fn new(
+        prefix: ProgramPrefix<'prefix>,
+        output: u32,
+        dependencies: &'dependencies ScalarProgramYDependency<'dependencies>,
+    ) -> Self {
+        let mut fixed = BTreeMap::new();
+        for shape in direct_assignment_shapes(prefix, output, dependencies)
+            .into_iter()
+            .chain(zero_assignment_shape(prefix, output))
+            .chain(affine_assignment_shapes(prefix, output, dependencies))
+        {
+            fixed.entry(shape.target_y_index()).or_insert(shape);
+        }
+        Self {
+            prefix,
+            output,
+            dependencies,
+            fixed,
+        }
     }
-    let direct = assignment_expression_registers(prefix, output)
+
+    fn for_target(&self, target_y_index: usize) -> Option<TargetAssignmentShape> {
+        let (prefix, output, dependencies) = (self.prefix, self.output, self.dependencies);
+        self.fixed
+            .get(&target_y_index)
+            .cloned()
+            .or_else(|| additive::derive(prefix, output, target_y_index, dependencies))
+            .or_else(|| reciprocal::derive(prefix, output, target_y_index, dependencies))
+            .or_else(|| {
+                Some(TargetAssignmentShape::TensorAffine {
+                    target_y_index,
+                    projection: tensor_affine::derive(
+                        prefix,
+                        output,
+                        target_y_index,
+                        dependencies,
+                    )?,
+                    expr_eval_len: prefix.len(),
+                })
+            })
+    }
+}
+
+/// Every direct shape of `output`, in expression order: the first one found
+/// for a target is its direct shape.
+fn direct_assignment_shapes(
+    prefix: ProgramPrefix<'_>,
+    output: u32,
+    dependencies: &ScalarProgramYDependency<'_>,
+) -> Vec<TargetAssignmentShape> {
+    assignment_expression_registers(prefix, output)
         .into_iter()
         .flatten()
-        .find_map(|(target, expression, target_scale)| {
+        .filter_map(|(target, expression, target_scale)| {
             let load = target_load(prefix, target)?;
-            if load.index != target_y_index || dependencies.depends_on(expression, target_y_index) {
+            if dependencies.depends_on(expression, load.index) {
                 return None;
             }
             Some(TargetAssignmentShape::Direct {
-                target_y_index,
+                target_y_index: load.index,
                 expr_reg: expression,
                 target_scale,
                 expr_eval_len: producer_position(prefix, expression)?
                     .checked_add(1)?
                     .max(load.required_eval_len),
             })
-        });
-    direct
-        .or_else(|| zero_assignment_shape(prefix, output, target_y_index))
-        .or_else(|| {
-            affine_assignment_shapes(prefix, output, dependencies)
-                .into_iter()
-                .find(|shape| shape.target_y_index() == target_y_index)
         })
-        .or_else(|| additive::derive(prefix, output, target_y_index, dependencies))
-        .or_else(|| {
-            Some(TargetAssignmentShape::TensorAffine {
-                target_y_index,
-                projection: tensor_affine::derive(prefix, output, target_y_index, dependencies)?,
-                expr_eval_len: prefix.len(),
-            })
-        })
+        .collect()
 }
 
-fn zero_assignment_shape(
-    prefix: ProgramPrefix<'_>,
-    output: u32,
-    target_y_index: usize,
-) -> Option<TargetAssignmentShape> {
+fn zero_assignment_shape(prefix: ProgramPrefix<'_>, output: u32) -> Option<TargetAssignmentShape> {
     let (register, _) = strip_affine_output_wrappers(prefix, output);
     let load = target_load(prefix, register)?;
-    (load.index == target_y_index).then_some(TargetAssignmentShape::Zero {
-        target_y_index,
+    Some(TargetAssignmentShape::Zero {
+        target_y_index: load.index,
         expr_eval_len: prefix.len(),
     })
 }
@@ -87,9 +139,13 @@ pub fn derive_target_assignment_shapes(
     program: &[LinearOp],
 ) -> Vec<(usize, TargetAssignmentShape)> {
     let mut shapes = Vec::new();
+    let mut certified = BTreeSet::new();
     // The outputs of one range store share their prefix, so its producers,
     // dependencies, and loaded targets are derived once per store.
     let mut store: Option<PrefixAnalysis<'_>> = None;
+    // The candidate walk starts at the output's producing operation, so the
+    // lanes of one operation share it.
+    let mut walks: BTreeMap<usize, Option<dependency_candidates::Candidates>> = BTreeMap::new();
     for (output_offset, (output, store_position)) in store_output_registers(program).enumerate() {
         let Some(prefix) = program.get(..store_position) else {
             continue;
@@ -98,6 +154,7 @@ pub fn derive_target_assignment_shapes(
             .as_ref()
             .is_none_or(|analysis| analysis.position != store_position)
         {
+            walks.clear();
             // A prefix without unique producers exposes no certificate, so its
             // dependencies and targets are never needed.
             store = Some(PrefixAnalysis {
@@ -118,23 +175,76 @@ pub fn derive_target_assignment_shapes(
         else {
             continue;
         };
-        for &target in targets {
-            let Some(shape) =
-                canonical_assignment_shape(producers.view(), output, target, dependencies)
-            else {
+        if !producer_may_certify(producers.view(), output) {
+            continue;
+        }
+        // Scalar shapes isolate a target the output itself depends on; a
+        // tensor affine certificate, possible only through a product step,
+        // also keeps the targets of the whole operations it walks.
+        let walked = producers
+            .view()
+            .producer_position(output)
+            .and_then(|position| {
+                walks
+                    .entry(position)
+                    .or_insert_with(|| dependency_candidates::derive(producers.view(), output))
+                    .as_ref()
+            });
+        let candidates = assignment_candidates(output, dependencies, targets, walked);
+        let output_shapes = OutputShapes::new(producers.view(), output, dependencies);
+        for &target in &candidates {
+            let Some(shape) = output_shapes.for_target(target) else {
                 continue;
             };
-            if shapes.iter().all(
-                |(existing_output, existing): &(usize, TargetAssignmentShape)| {
-                    *existing_output != output_offset
-                        || existing.target_y_index() != shape.target_y_index()
-                },
-            ) {
+            if certified.insert((output_offset, shape.target_y_index())) {
                 shapes.push((output_offset, shape));
             }
         }
     }
     shapes
+}
+
+fn assignment_candidates(
+    output: u32,
+    dependencies: &ScalarProgramYDependency<'_>,
+    targets: &BTreeSet<usize>,
+    walked: Option<&dependency_candidates::Candidates>,
+) -> BTreeSet<usize> {
+    let Some(walked) = walked else {
+        return targets.clone();
+    };
+    let mut candidates = dependencies.register_dependencies(output).map_or_else(
+        || targets.clone(),
+        |scalar| {
+            scalar
+                .iter()
+                .filter(|index| targets.contains(index))
+                .collect()
+        },
+    );
+    if !walked.linear {
+        candidates.extend(walked.targets.iter().copied());
+    }
+    candidates
+}
+
+fn has_assignment_shape(
+    prefix: ProgramPrefix<'_>,
+    output: u32,
+    dependencies: &ScalarProgramYDependency<'_>,
+) -> bool {
+    if !producer_may_certify(prefix, output) {
+        return false;
+    }
+    let shapes = OutputShapes::new(prefix, output, dependencies);
+    if !shapes.fixed.is_empty() {
+        return true;
+    }
+    let walked = dependency_candidates::derive(prefix, output);
+    let targets = y_load_indices(prefix.operations());
+    assignment_candidates(output, dependencies, &targets, walked.as_ref())
+        .into_iter()
+        .any(|target| shapes.for_target(target).is_some())
 }
 
 /// One store position's prefix analyses, shared by the outputs it stores.
@@ -217,7 +327,7 @@ pub fn output_y_reads(program: &[LinearOp], output_offset: usize) -> OutputYRead
         return OutputYReads::Absent;
     };
     match ScalarProgramYDependency::new(prefix).register_dependencies(output) {
-        Some(reads) => OutputYReads::Bounded(reads),
+        Some(reads) => OutputYReads::Bounded(reads.into_owned()),
         None => OutputYReads::Unbounded,
     }
 }
@@ -228,7 +338,7 @@ pub fn output_y_reads(program: &[LinearOp], output_offset: usize) -> OutputYRead
 #[derive(Clone, Debug)]
 pub enum OutputYReads {
     Absent,
-    Bounded(std::collections::BTreeSet<usize>),
+    Bounded(crate::IndexIntervals),
     Unbounded,
 }
 
@@ -237,7 +347,7 @@ impl OutputYReads {
     pub fn contains(&self, y_index: usize) -> bool {
         match self {
             Self::Absent => false,
-            Self::Bounded(reads) => reads.contains(&y_index),
+            Self::Bounded(reads) => reads.contains(y_index),
             Self::Unbounded => true,
         }
     }
@@ -637,6 +747,9 @@ fn target_load(mut program: ProgramPrefix<'_>, mut register: u32) -> Option<Targ
                 });
             }
             LinearOp::Move { src, .. } => register = *src,
+            LinearOp::TensorConcatenate { .. } => {
+                register = concatenate::source_register(program, register)?
+            }
             operation => {
                 register = projected_input_register(operation, register)?;
                 required_eval_len = required_eval_len.max(position.checked_add(1)?);
@@ -683,52 +796,26 @@ fn producer_position(program: ProgramPrefix<'_>, register: u32) -> Option<usize>
     program.producer_position(register)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tensor_output_assignments_only_target_its_dependencies() {
-        const COUNT: usize = 64;
-        let program = vec![
-            LinearOp::LoadP { dst: 0, index: 0 },
-            LinearOp::TensorLoad {
-                dst_start: 1,
-                input: crate::TensorInputKind::Y,
-                input_start: 0,
-                count: COUNT,
-                seed_start: None,
-                lanes: 1,
-            },
-            LinearOp::TensorBinary {
-                dst_start: 1 + COUNT as u32,
-                op: BinaryOp::Mul,
-                lhs_start: 0,
-                rhs_start: 1,
-                count: COUNT,
-                lhs_stride: 0,
-                rhs_stride: 1,
-                lanes: 1,
-            },
-            LinearOp::StoreOutputRange {
-                start: 1 + COUNT as u32,
-                count: COUNT,
-                stride: 1,
-            },
-        ];
-        let started = std::time::Instant::now();
-        let shapes = derive_target_assignment_shapes(&program);
-        eprintln!(
-            "tensor_assignment_preparation_us={}",
-            started.elapsed().as_micros()
-        );
-        assert_eq!(shapes.len(), COUNT);
-        for (output, shape) in shapes {
-            assert_eq!(shape.target_y_index(), output);
-            assert!(
-                canonical_assignment_shape_for_output(&program, output, (output + 1) % COUNT)
-                    .is_none()
-            );
-        }
-    }
+/// Whether some assignment shape can start from the operation producing
+/// `output`. Every derivation above begins at that producer: a target load
+/// chain (`LoadY`, a Y `TensorLoad`, `Move`, or a pure call's projected input),
+/// an affine or additive wrapper (`Unary`, `Binary`, `TensorBinary`), or a
+/// tensor projection step, which needs a projection operation or a target
+/// load. Any other producer (a fold, a conditional, a call without a projected
+/// input) gives no shape for any target, so its targets are never tried.
+fn producer_may_certify(prefix: ProgramPrefix<'_>, output: u32) -> bool {
+    producer(prefix, output).is_some_and(|operation| {
+        matches!(
+            operation,
+            LinearOp::LoadY { .. }
+                | LinearOp::TensorLoad { .. }
+                | LinearOp::Move { .. }
+                | LinearOp::TensorConcatenate { .. }
+                | LinearOp::Unary { .. }
+                | LinearOp::Binary { .. }
+                | LinearOp::TensorBinary { .. }
+                | LinearOp::PureCall { .. }
+                | LinearOp::PureCallDirectional { .. }
+        ) || tensor_affine::operation::ProjectionOperation::new(operation).is_some()
+    })
 }

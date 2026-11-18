@@ -88,6 +88,13 @@ fn transfer(
     outputs: &mut Vec<bool>,
 ) -> Option<()> {
     match op {
+        Op::PureCallObservation {
+            dst_start,
+            input_starts,
+            site,
+        } => {
+            observation(table, r, *dst_start, input_starts, site)?;
+        }
         Op::Const { dst, .. } => r[*dst as usize] = true,
         Op::LoadY { dst, index } => r[*dst as usize] = *y.get(*index)?,
         Op::LoadP { dst, index } => r[*dst as usize] = *p.get(*index)?,
@@ -123,22 +130,7 @@ fn transfer(
             input_starts,
             site,
         } => {
-            let inputs = input_starts
-                .iter()
-                .zip(site.inputs())
-                .map(|(start, ty)| {
-                    r.get(*start as usize..*start as usize + ty.scalar_count() as usize)
-                        .map(|v| v.iter().all(|x| *x))
-                })
-                .collect::<Option<Vec<_>>>()?;
-            let owner = table.owner(site.owner())?;
-            let values = super::typed_dependencies::outputs(table, owner.body(), &inputs);
-            let mut start = *dst_start as usize;
-            for (value, output) in values.iter().zip(owner.outputs()) {
-                let end = start + output.value_type().scalar_count() as usize;
-                r.get_mut(start..end)?.fill(*value);
-                start = end;
-            }
+            pure_call(table, r, *dst_start, input_starts, site)?;
         }
         Op::TensorBinary {
             dst_start,
@@ -167,6 +159,9 @@ fn transfer(
             let start = *dst_start as usize;
             r.get_mut(start..start + count * lanes)?.fill(stable);
         }
+        Op::MatrixMultiply { .. } | Op::TensorCross { .. } | Op::TensorConcatenate { .. } => {
+            tensor_kernel(op, r)?
+        }
         Op::StoreOutput { src } => outputs.push(r[*src as usize]),
         Op::StoreOutputRange {
             start,
@@ -182,6 +177,125 @@ fn transfer(
             r.get_mut(dst..dst + op.dst_register_count())?.fill(false);
         }
     }
+    Some(())
+}
+
+fn pure_call(
+    table: &SolvePureCallTable,
+    registers: &mut [bool],
+    destination: crate::Reg,
+    starts: &[crate::Reg],
+    site: &crate::SolvePureCallSite,
+) -> Option<()> {
+    let inputs = starts
+        .iter()
+        .zip(site.inputs())
+        .map(|(start, ty)| {
+            registers
+                .get(*start as usize..*start as usize + ty.scalar_count() as usize)
+                .map(|values| values.iter().all(|value| *value))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let owner = table.owner(site.owner())?;
+    let values = super::typed_dependencies::owner_outputs(table, owner, &inputs);
+    let mut start = destination as usize;
+    for (value, output) in values.iter().zip(owner.outputs()) {
+        let end = start + output.value_type().scalar_count() as usize;
+        registers.get_mut(start..end)?.fill(*value);
+        start = end;
+    }
+    Some(())
+}
+
+fn observation(
+    table: &SolvePureCallTable,
+    registers: &mut [bool],
+    destination: crate::Reg,
+    starts: &[crate::Reg],
+    site: &crate::SolveAssertionObservationSite,
+) -> Option<()> {
+    if !site.matches_table(table) || starts.len() != site.value_site().inputs().len() {
+        return None;
+    }
+    let settled = starts.iter().zip(site.value_site().inputs()).try_fold(
+        true,
+        |settled, (start, value_type)| {
+            let range = registers
+                .get(*start as usize..*start as usize + value_type.scalar_count() as usize)?;
+            Some(settled && range.iter().all(|value| *value))
+        },
+    )?;
+    registers
+        .get_mut(destination as usize..destination as usize + site.output_scalar_count())?
+        .fill(settled);
+    Some(())
+}
+
+/// Whole-tensor kernels: every result element is settled exactly when every
+/// element of every operand range is.
+fn tensor_kernel(op: &Op, r: &mut [bool]) -> Option<()> {
+    match op {
+        Op::MatrixMultiply {
+            dst_start,
+            lhs_start,
+            rhs_start,
+            rows,
+            inner,
+            columns,
+            lanes,
+        } => {
+            let sources = [
+                (*lhs_start, rows * inner * lanes),
+                (*rhs_start, inner * columns * lanes),
+            ];
+            settle_from_ranges(r, &sources, *dst_start, rows * columns * lanes)
+        }
+        Op::TensorCross {
+            dst_start,
+            lhs_start,
+            rhs_start,
+            lanes,
+        } => {
+            let sources = [(*lhs_start, 3 * lanes), (*rhs_start, 3 * lanes)];
+            settle_from_ranges(r, &sources, *dst_start, 3 * lanes)
+        }
+        Op::TensorConcatenate {
+            dst_start,
+            sources,
+            dimensions,
+            lanes,
+            ..
+        } => {
+            let extent = |dimensions: &[u32]| {
+                dimensions
+                    .iter()
+                    .fold(*lanes, |count, extent| count * *extent as usize)
+            };
+            let ranges = sources
+                .iter()
+                .map(|source| (source.start, extent(&source.dimensions)))
+                .collect::<Vec<_>>();
+            settle_from_ranges(r, &ranges, *dst_start, extent(dimensions))
+        }
+        _ => None,
+    }
+}
+
+/// Mark `count` registers from `dst` settled exactly when every register of
+/// every `(start, count)` source range is settled.
+fn settle_from_ranges(
+    r: &mut [bool],
+    sources: &[(crate::Reg, usize)],
+    dst: crate::Reg,
+    count: usize,
+) -> Option<()> {
+    let mut settled = true;
+    for (start, width) in sources {
+        let start = *start as usize;
+        settled &= r.get(start..start + width)?.iter().all(|value| *value);
+    }
+    let dst = dst as usize;
+    r.get_mut(dst..dst + count)?.fill(settled);
     Some(())
 }
 

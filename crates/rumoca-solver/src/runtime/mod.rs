@@ -17,6 +17,8 @@ pub mod iterative_solve;
 pub mod jacobian;
 #[cfg(not(kani))]
 pub mod mass_matrix;
+#[cfg(all(not(kani), any(test, feature = "native-wasm")))]
+pub mod native_wasm_error;
 #[cfg(not(kani))]
 pub mod output_budget;
 #[cfg(not(kani))]
@@ -37,3 +39,9 @@ pub mod solve_runtime;
 pub mod time;
 #[cfg(not(kani))]
 pub mod timeout;
+#[cfg(not(kani))]
+pub mod trajectory;
+#[cfg(not(kani))]
+mod trajectory_initial;
+#[cfg(not(kani))]
+pub mod trajectory_objective;

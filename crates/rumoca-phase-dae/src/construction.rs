@@ -1,3 +1,4 @@
+mod affine_slices;
 mod algorithm;
 mod algorithm_lowering;
 mod analysis;
@@ -19,13 +20,17 @@ mod function_shapes;
 mod function_statements;
 mod initial_discrete_values;
 mod initial_parameter_values;
+mod materialized_family_bodies;
 mod model_algorithm;
 mod model_events;
 mod multi_output_equations;
+mod native_lapack;
 mod native_tables;
 mod ordinary_equations;
 mod record_equation;
 mod structured_body;
+mod structured_templates;
+mod terminal_print;
 #[cfg(test)]
 mod tests;
 mod variable_construction;
@@ -48,33 +53,38 @@ use crate::balance::BalanceDetail;
 use algorithm::{
     AlgorithmFunctionCall, AlgorithmStatementContext, lower_algorithm_assignment,
     lower_algorithm_function_call, lower_algorithm_tensor_loop, own_clocked_algorithm_targets,
+    own_clocked_function_outputs,
 };
 use algorithm_lowering::{AlgorithmEnvironment, ModelAlgorithmsRequest, lower_algorithms};
 use analysis::{
     AggregateDiscreteConnections, Analysis, ClockPlan, ComprehensionKey, ComprehensionPlans,
-    DelayPlan, DerivedParameterPlan, DiscreteValueAssignmentPlan, DiscreteValueTopologyPlan,
-    DynamicTimeEventOperand, EquationPartition, ExpressionEventPlan, ExpressionEventPlans,
-    ExternalArgumentPlan, ExternalFunctionPlan, FunctionArrayAssemblyPlan, FunctionAssignmentPlan,
-    FunctionDefinednessPlan, FunctionIntegerReduction, FunctionLoopLowering, FunctionPlan,
-    FunctionRecordAssemblyPlan, FunctionRecordCallAssemblyPlan, FunctionRecordFieldAssembly,
-    FunctionRecordFieldAssemblyPlan, FunctionStatementPlan, FunctionValueSeed,
-    HistoryOperatorPlans, ModelAlgorithmPlan, ModelEventFunctionCallPlan,
-    ModelEventFunctionOutputPlan, ModelEventTensorLoopPlan, MultiOutputEquationPlan,
-    PartialJoinPlan, PlannedRole, RecordArrayFieldPlan, RecordArrayFieldPlans,
-    RecordEquationFieldPlan, RecordEquationFieldValue, RecordEquationPlan, RuntimeVariableRole,
-    SemiLinearRules, StructuredSource, WhenBranchKey, analyze, assigned_function_targets,
-    branch_never_completes, discrete_value_assignment, effective_function_scalar_type,
-    effective_variable_scalar_type, empty_array_bound_to_declaration, equation_partition,
-    flattened_function_loop_source, function_assertion, function_record_field_name,
-    inferred_clock_transfer, is_event_condition, is_inferred_clock_condition,
-    is_whole_clock_coordinate, materialized_discrete_real_family, materialized_discrete_value_rows,
-    model_algorithm_targets, record_field_projections, selected_conditional_statements,
+    DelayPlan, DerivedParameterPlan, DiscreteConnectionRanks, DiscreteValueAssignmentPlan,
+    DiscreteValueTopologyPlan, DynamicTimeEventOperand, EquationPartition, ExpressionEventPlan,
+    ExpressionEventPlans, ExternalArgumentPlan, ExternalFunctionPlan, FunctionArrayAssemblyPlan,
+    FunctionAssignmentPlan, FunctionDefinednessPlan, FunctionIntegerReduction,
+    FunctionLoopLowering, FunctionPlan, FunctionRecordAssemblyPlan, FunctionRecordCallAssemblyPlan,
+    FunctionRecordFieldAssembly, FunctionRecordFieldAssemblyPlan, FunctionRecordFieldSource,
+    FunctionStatementPlan, FunctionValueSeed, HistoryOperatorPlans, ModelAlgorithmPlan,
+    ModelEventFunctionCallPlan, ModelEventFunctionOutputPlan, ModelEventTensorLoopPlan,
+    MultiOutputEquationPlan, NativeLapackPlan, PlannedRole, RecordArrayFieldPlan,
+    RecordArrayFieldPlans, RecordEquationFieldPlan, RecordEquationFieldValue, RecordEquationPlan,
+    RecordProjectionStep, RuntimeVariableRole, SemiLinearRules, StructuredSource, WhenBranchKey,
+    WhenFunctionCallKey, analyze, assigned_function_targets, collect_algorithm_writes,
+    discrete_value_assignment, effective_function_scalar_type, effective_variable_scalar_type,
+    empty_array_bound_to_declaration, equation_partition, flattened_function_loop_source,
+    function_assertion, function_record_field_name, inferred_clock_transfer, is_event_condition,
+    is_inferred_clock_condition, is_whole_clock_coordinate, materialized_discrete_real_family,
+    materialized_discrete_value_rows, model_algorithm_targets, names_overlap,
+    record_field_projections, selected_conditional_statements, selected_when_target,
     specialized_comprehension_plan, structured_assignment_names,
-    when_conditional_selects_clock_structure,
+    when_conditional_selects_clock_structure, when_function_call_key,
 };
 use clock_operator_hosts::clock_operator_hosts;
 use clocks::{LoweredClocks, lower_clocked_value_owners, lower_clocks};
-use conditions::{combine_conditions, condition_owner_clock, lower_condition, negate_condition};
+use conditions::{
+    chain_owner_clock, combine_conditions, condition_owner_clock, lower_condition,
+    negate_condition, unowned_tick_activation,
+};
 use discrete_values::{DiscreteValueOwnerHandle, DiscreteValueStaging};
 use enumeration_conversion::{
     enumeration_conversion, enumeration_range_ordinals, enumeration_range_type,
@@ -92,10 +102,10 @@ use expression::{
 };
 use function_array_assembly::lower_function_array_assembly;
 use function_body::{
-    DefinednessPredicates, FunctionConditional, FunctionFold, PartialTarget, TotalArrayDefinition,
-    function_value_coordinate, lower_function_conditional, lower_function_fold,
+    FunctionFold, TotalArrayDefinition, function_value_coordinate, lower_function_fold,
     lower_function_value_seed, lower_generated_boolean_assignment, lower_guarded_function_return,
-    lower_integer_reduction, lower_total_function_array_definition,
+    lower_integer_reduction, lower_ordered_function_conditional,
+    lower_total_function_array_definition,
 };
 use function_construction::{
     FunctionRegistry, FunctionRegistryInput, construct_functions, function_value_type,
@@ -103,10 +113,11 @@ use function_construction::{
 use function_external::define_external_function;
 use function_record_assembly::{
     lower_function_loop_record_assembly, lower_function_record_assembly,
-    lower_function_record_field_assembly, lower_function_record_value,
+    lower_function_record_field_assembly,
 };
 use function_seeds::{
-    collect_function_sequence_seeds, lower_function_sequence_seeds, lower_named_function_seeds,
+    collect_function_sequence_seeds, lower_function_iteration_local_seeds,
+    lower_function_sequence_seeds, lower_named_function_seeds,
 };
 use function_shapes::{
     FunctionShapeAnalysis, FunctionShapeCertificate, FunctionSpecializationKey, ProvenValue,
@@ -120,9 +131,11 @@ use model_algorithm::{
 };
 use model_events::{WhenChainsRequest, always_condition, lower_when_assignment, lower_when_chains};
 use multi_output_equations::{MultiOutputDiscreteOwners, lower_multi_output_equation};
+use native_lapack::lower_native_lapack;
 use ordinary_equations::{OrdinaryEquationRow, lower_ordinary_equation};
-use record_equation::lower_record_equation;
+use record_equation::{lower_record_equation, lower_record_projection};
 use structured_body::{lower_structured_body, normalize_conditional_residual};
+use structured_templates::{SelectedFamilies, TemplateSelection};
 use variable_construction::{
     VariableConstructionPlan, VariableDefinitionContext, define_reserved_variables,
     insert_variable_identities, plan_variable_construction,
@@ -141,6 +154,12 @@ enum Coordinate<'dae> {
 }
 
 impl<'dae> Coordinate<'dae> {
+    fn discrete_value(self) -> Option<dae::DiscreteValueId<'dae>> {
+        match self {
+            Self::DiscreteValue(variable) => Some(variable),
+            _ => None,
+        }
+    }
     fn current(self) -> dae::CoordinateInput<'dae> {
         match self {
             Self::Parameter(id) => dae::CoordinateInput::Parameter(id),
@@ -242,6 +261,15 @@ struct ReservedVariable<'flat, 'dae> {
 }
 
 pub(crate) fn construct(flat: &flat::Model, source_map: SourceMap) -> Result<dae::Dae, ToDaeError> {
+    construct_with_evidence(flat, source_map).map(|result| result.dae)
+}
+
+pub(crate) fn construct_with_evidence(
+    flat: &flat::Model,
+    source_map: SourceMap,
+) -> Result<crate::DaeConstructionResult, ToDaeError> {
+    let prepared = analysis::prepared_flat(flat)?;
+    let flat = prepared.as_ref();
     let analysis = analyze(flat)?.with_semi_linear_rules(flat);
     if !flat.is_partial && !analysis.balance.is_balanced() {
         return Err(ToDaeError::unbalanced_from_detail(analysis.balance));
@@ -253,14 +281,19 @@ pub(crate) fn construct(flat: &flat::Model, source_map: SourceMap) -> Result<dae
         build_checked(flat, &analysis, &variable_plan, construction)
     })
     .map_err(ToDaeError::from)?;
-    Ok(dae.with_external_tables(external_tables))
+    Ok(crate::DaeConstructionResult {
+        dae: dae.with_external_tables(external_tables),
+        balance_detail: analysis.balance,
+        structural_selections: analysis.structural_selections,
+    })
 }
 
 /// The balance evidence and the structural guard selections of one analysis.
 pub(crate) fn construction_evidence(
     flat: &flat::Model,
 ) -> Result<(BalanceDetail, Vec<analysis::StructuralSelection>), ToDaeError> {
-    analyze(flat).map(|analysis| (analysis.balance, analysis.structural_selections))
+    let prepared = analysis::prepared_flat(flat)?;
+    analyze(prepared.as_ref()).map(|analysis| (analysis.balance, analysis.structural_selections))
 }
 
 fn build_checked<'dae>(
@@ -269,9 +302,6 @@ fn build_checked<'dae>(
     variable_plan: &VariableConstructionPlan,
     construction: &mut dae::DaeConstruction<'dae>,
 ) -> Result<(), dae::DaeConstructionError> {
-    if let Some(declaration) = flat.predefined_string_declaration {
-        construction.register_predefined_string(declaration)?;
-    }
     let value_types = reserve_value_types(flat, analysis, construction)?;
     let mut clocks = lower_analysis_clocks(construction, flat, analysis)?;
     let no_function_ids = HashMap::new();
@@ -342,7 +372,12 @@ fn build_checked<'dae>(
         &analysis.clocked_value_owners,
         &clocks,
     )?;
-    let mut discrete_values = DiscreteValueStaging::new();
+    let mut discrete_values = DiscreteValueStaging::new(
+        flat,
+        &coordinates,
+        construction,
+        &analysis.discrete_value_topology,
+    )?;
     lower_bindings(
         construction,
         &mut discrete_values,
@@ -495,6 +530,7 @@ fn lower_model_owners<'dae>(
                 tensor_loops: None,
                 function_calls: None,
                 transaction_steps: None,
+                deferred_reals: None,
             },
             plans: &analysis.model_algorithm_plans,
             topology: &analysis.discrete_value_topology,
@@ -503,15 +539,7 @@ fn lower_model_owners<'dae>(
     lower_when_chains(
         construction,
         &mut discrete_values,
-        WhenChainsRequest::new(
-            coordinates,
-            functions,
-            &analysis.sample_lattices,
-            clocks,
-            &flat.when_chains,
-            &analysis.discrete_value_topology,
-            &analysis.clocked_when_owners,
-        ),
+        WhenChainsRequest::new(coordinates, functions, clocks, flat, analysis),
     )?;
     discrete_values.add_holds(construction, coordinates, &analysis.discrete_value_topology)?;
     discrete_values.finish(construction, &analysis.discrete_value_topology)
@@ -522,6 +550,9 @@ fn reserve_value_types<'dae>(
     analysis: &Analysis,
     construction: &mut dae::DaeConstruction<'dae>,
 ) -> Result<HashMap<VarName, dae::ValueTypeId<'dae>>, dae::DaeConstructionError> {
+    if let Some(declaration) = flat.predefined_string_declaration {
+        construction.register_predefined_string(declaration)?;
+    }
     let mut value_types = HashMap::new();
     for (name, variable) in &flat.variables {
         if matches!(analysis.roles[name], PlannedRole::Clock) {
@@ -562,6 +593,7 @@ fn lower_attribute_expression<'dae>(
     lower_expression_scoped(
         construction,
         LoweringSymbols {
+            source_comprehension_binders: None,
             coordinates,
             functions,
             // A variable's attribute and binding values keep their MLS §3.6.5
@@ -817,7 +849,7 @@ struct StructuredEquationEnvironment<'scope, 'dae> {
     flat: &'scope flat::Model,
     roles: &'scope HashMap<VarName, PlannedRole>,
     topology: &'scope DiscreteValueTopologyPlan,
-    connection_ranks: &'scope HashMap<VarName, usize>,
+    connection_ranks: &'scope DiscreteConnectionRanks,
     aggregate_connections: &'scope AggregateDiscreteConnections,
     clocked_owners: &'scope HashMap<usize, ClockPlan>,
     clocks: &'scope LoweredClocks<'dae>,
@@ -826,7 +858,7 @@ struct StructuredEquationEnvironment<'scope, 'dae> {
 #[derive(Clone, Copy)]
 struct StructuredEquationRows<'scope, 'dae> {
     equations: &'scope [flat::Equation],
-    families: &'scope [flat::StructuredEquationFamily],
+    families: SelectedFamilies<'scope>,
     excluded_families: &'scope HashSet<usize>,
     environment: Option<StructuredEquationEnvironment<'scope, 'dae>>,
     initialization: bool,
@@ -842,8 +874,8 @@ fn lower_structured_equations<'dae>(
     for (family_index, family) in rows.families.iter().enumerate() {
         if rows.excluded_families.contains(&family_index)
             || rows.environment.is_some_and(|environment| {
-                materialized_discrete_real_family(family, environment.roles)
-                    || materialized_discrete_value_rows(family, rows.equations, environment.roles)
+                materialized_discrete_real_family(&family, environment.roles)
+                    || materialized_discrete_value_rows(&family, rows.equations, environment.roles)
             })
         {
             continue;
@@ -852,26 +884,21 @@ fn lower_structured_equations<'dae>(
         let generated_root = equation_generation(&family.origin);
         let domain =
             construction.domains(|domains| domains.structured(family.domain.clone(), owner))?;
-        let bodies = if let Some(template) = &family.template {
-            let mut binders = HashMap::with_capacity(family.domain.binders.len());
-            for (ordinal, binder) in family.domain.binders.iter().enumerate() {
-                let id = construction.domains(|domains| domains.binder(domain, ordinal, owner))?;
-                binders.insert(VarName::new(&binder.display_name), id);
-            }
-            let mut scoped_shapes = functions.shapes.model_values().clone();
-            for binder in binders.keys() {
-                // A StructuredIndexDomain binder is a scalar Integer by
-                // construction.  Carry that proof into function-call shape
-                // selection while lowering the compact body.
-                scoped_shapes.insert(binder.clone(), Vec::new());
-            }
+        // A discrete-value family is owned by its source template whether or not
+        // its optional compact view is selected: Appendix B discrete assignments
+        // never become continuous residual rows.
+        let mut compact = None;
+        if let Some(template) = family.source_template() {
+            let (binders, scoped_shapes) =
+                structured_template_scope(construction, functions, &family, domain, owner)?;
             if lower_partitioned_structured_template(
                 construction,
                 discrete_values,
                 StructuredTemplatePartitionInput {
                     coordinates,
                     functions,
-                    family,
+                    family: &family,
+                    template,
                     domain,
                     scalar_view: template.scalar_view,
                     binders: &binders,
@@ -882,11 +909,15 @@ fn lower_structured_equations<'dae>(
             )? {
                 continue;
             }
-            template
+            compact = Some((binders, scoped_shapes));
+        }
+        let bodies = match (family.template, compact) {
+            (Some(template), Some((binders, scoped_shapes))) => template
                 .body
                 .iter()
                 .map(|body| {
                     let symbols = LoweringSymbols {
+                        source_comprehension_binders: None,
                         coordinates,
                         functions,
                         shapes: &scoped_shapes,
@@ -903,16 +934,15 @@ fn lower_structured_equations<'dae>(
                         owner.span(),
                     )
                 })
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            lower_materialized_family_bodies(
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => lower_materialized_family_bodies(
                 construction,
                 coordinates,
                 functions,
                 rows.equations,
-                family,
+                &family,
                 owner,
-            )?
+            )?,
         };
         let scalar_view = family
             .template
@@ -941,6 +971,7 @@ struct StructuredTemplatePartitionInput<'scope, 'flat, 'dae> {
     coordinates: &'scope HashMap<VarName, Coordinate<'dae>>,
     functions: &'scope FunctionRegistry<'flat, 'dae>,
     family: &'scope flat::StructuredEquationFamily,
+    template: &'scope rumoca_core::ComprehensionTemplate,
     domain: dae::DomainId<'dae>,
     scalar_view: rumoca_core::ComprehensionScalarView,
     binders: &'scope HashMap<VarName, dae::DomainBinderId<'dae>>,
@@ -957,11 +988,7 @@ fn lower_partitioned_structured_template<'dae>(
     let Some(environment) = input.environment else {
         return Ok(false);
     };
-    let template = input
-        .family
-        .template
-        .as_ref()
-        .expect("partitioned structured lowering receives a template family");
+    let template = input.template;
     let assignments = match structured_family_partition(input.family, template, environment) {
         StructuredFamilyPartition::Continuous => return Ok(false),
         StructuredFamilyPartition::ConsumedDiscreteValue => return Ok(true),
@@ -991,6 +1018,14 @@ fn structured_family_partition<'flat>(
     template: &'flat rumoca_core::ComprehensionTemplate,
     environment: StructuredEquationEnvironment<'flat, '_>,
 ) -> StructuredFamilyPartition<'flat> {
+    if let Some(assignment) = environment.aggregate_connections.source_family_assignment(
+        environment.flat,
+        family,
+        template,
+        environment.roles,
+    ) {
+        return StructuredFamilyPartition::DiscreteValue(vec![assignment]);
+    }
     let assignments = template
         .body
         .iter()
@@ -1000,7 +1035,7 @@ fn structured_family_partition<'flat>(
             // views of one semantic owner. Consult the authoritative row
             // claim for every origin, so an aggregate owner constructed from
             // exact element coverage consumes the template view as well.
-            if family.interiors_materialized {
+            if family.interiors_materialized() {
                 let row = family.first_equation_index + ordinal;
                 let equation = &environment.flat.equations[row];
                 return match equation_partition(
@@ -1105,6 +1140,7 @@ fn lower_structured_discrete_family<'dae>(
         .expect("a structured discrete family has one planned B.1c owner");
     for plan in input.assignments {
         let symbols = LoweringSymbols {
+            source_comprehension_binders: None,
             coordinates: input.coordinates,
             functions: input.functions,
             shapes: input.shapes,
@@ -1182,52 +1218,14 @@ fn lower_materialized_family_bodies<'dae>(
     family: &flat::StructuredEquationFamily,
     owner: dae::DaeProvenance,
 ) -> Result<Vec<dae::ExprId<'dae>>, dae::DaeConstructionError> {
-    let domain_count = family
-        .domain
-        .scalar_count()
-        .expect("analysis validates the structured domain");
-    let extents = family
-        .domain
-        .extents()
-        .expect("analysis validates the structured domain");
-    let mut bodies = Vec::with_capacity(family.equations_per_point);
-    for body_ordinal in 0..family.equations_per_point {
-        let mut scalar_bodies = Vec::with_capacity(domain_count);
-        for point in 0..domain_count {
-            let offset = point
-                .checked_mul(family.equations_per_point)
-                .and_then(|offset| offset.checked_add(body_ordinal))
-                .expect("analysis validates the materialized family row range");
-            let equation = &equations[family.first_equation_index + offset];
-            let symbols = LoweringSymbols {
-                coordinates,
-                functions,
-                shapes: functions.shapes.model_values(),
-                function_body: None,
-                values: None,
-                owner_clock: None,
-            };
-            scalar_bodies.push(lower_structured_body(
-                construction,
-                symbols,
-                &HashMap::new(),
-                &equation.residual,
-                equation_generation(&equation.origin),
-                equation.span,
-            )?);
-        }
-        let provenance = dae::DaeProvenance::generated(
-            dae::DaeGeneration::ArrayEquationProjection,
-            owner.span(),
-        )?;
-        bodies.push(pack_row_major_body(
-            construction,
-            &scalar_bodies,
-            &extents,
-            provenance,
-        )?);
-    }
-    Ok(bodies)
+    materialized_family_bodies::lower(
+        construction,
+        coordinates,
+        functions,
+        equations,
+        family,
+        owner,
+    )
 }
 
 pub(super) fn pack_row_major_body<'dae>(
@@ -1280,7 +1278,7 @@ struct EquationRows<'scope, 'dae> {
     records: &'scope HashMap<usize, RecordEquationPlan>,
     multi_output: &'scope HashMap<usize, MultiOutputEquationPlan>,
     roles: &'scope HashMap<VarName, PlannedRole>,
-    connection_ranks: &'scope HashMap<VarName, usize>,
+    connection_ranks: &'scope DiscreteConnectionRanks,
     aggregate_connections: &'scope AggregateDiscreteConnections,
     topology: &'scope DiscreteValueTopologyPlan,
     clocked_owners: &'scope HashMap<usize, ClockPlan>,
@@ -1400,4 +1398,34 @@ fn equation_owner_provenance(
         Some(generation) => dae::DaeProvenance::generated(generation, span),
         None => dae::DaeProvenance::source(span),
     }
+}
+
+/// The domain binders of a structured family and the model shapes that carry
+/// each binder's proven bounds into function-call shape selection.
+fn structured_template_scope<'dae>(
+    construction: &mut dae::DaeConstruction<'dae>,
+    functions: &FunctionRegistry<'_, 'dae>,
+    family: &flat::StructuredEquationFamily,
+    domain: dae::DomainId<'dae>,
+    owner: dae::DaeProvenance,
+) -> Result<
+    (
+        HashMap<VarName, dae::DomainBinderId<'dae>>,
+        ShapeEnvironment,
+    ),
+    dae::DaeConstructionError,
+> {
+    let mut binders = HashMap::with_capacity(family.domain.binders.len());
+    for (ordinal, binder) in family.domain.binders.iter().enumerate() {
+        let id = construction.domains(|domains| domains.binder(domain, ordinal, owner))?;
+        binders.insert(VarName::new(&binder.display_name), id);
+    }
+    let mut scoped_shapes = functions.shapes.model_values().clone();
+    for (name, binder) in &binders {
+        // A StructuredIndexDomain binder is a scalar Integer by construction.
+        let (lower, upper) =
+            construction.domains(|domains| domains.binder_bounds(*binder, owner))?;
+        scoped_shapes.bind_slice_binder(name.clone(), lower, upper);
+    }
+    Ok((binders, scoped_shapes))
 }

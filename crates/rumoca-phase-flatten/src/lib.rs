@@ -38,6 +38,7 @@ mod connections_builtin;
 mod constant_extraction;
 #[cfg(test)]
 mod context_suffix_tests;
+mod continuous_algebraic;
 mod enum_literals;
 mod equations;
 mod errors;
@@ -45,6 +46,7 @@ mod function_lowering;
 mod function_precollect;
 mod functions;
 mod name_simplify;
+mod operator_records;
 mod outer_refs;
 mod param_variability;
 mod path_utils;
@@ -54,8 +56,10 @@ pub mod qualify;
 pub(crate) mod record_constant_arrays;
 #[cfg(test)]
 mod reference_contract_tests;
+mod resource_roots;
 mod source_spans;
 mod static_subscripts;
+mod target_closure;
 #[cfg(test)]
 mod test_support;
 mod variables;
@@ -72,6 +76,8 @@ use rumoca_core::{ExpressionVisitor, Reference};
 use rumoca_core::{OptionalTimer, maybe_elapsed_duration, maybe_start_timer};
 use rumoca_ir_ast as ast;
 use rumoca_ir_flat as flat;
+
+pub use target_closure::TargetClosure;
 
 use constant_extraction::*;
 use source_spans::required_location_span;
@@ -105,8 +111,8 @@ pub(crate) use function_precollect::{
 use pipeline::*;
 use postprocess::*;
 use record_constant_arrays::{
-    component_type_is_record, synthesize_component_modification_binding,
-    try_extract_record_array_constructor_constant,
+    component_type_is_record, component_type_may_be_enumeration,
+    synthesize_component_modification_binding, try_extract_record_array_constructor_constant,
 };
 use rumoca_eval_flat::phase_constant::{
     ParamEvalContext, ParamEvaluator, eval_user_func_real, infer_array_dimensions,
@@ -340,6 +346,27 @@ pub fn flatten_ref_with_options(
     model_name: &str,
     options: FlattenOptions,
 ) -> Result<flat::Model, FlattenError> {
+    flatten_ref_in_closure(
+        tree,
+        overlay,
+        model_name,
+        options,
+        &TargetClosure::whole_tree(),
+    )
+}
+
+/// Flatten a model whose type tables are restricted to `closure`.
+///
+/// The flat model carries the type identities, enumeration declarations and
+/// enumeration literals of the closure classes only, so it does not depend on
+/// unrelated classes of the resolved tree.
+pub fn flatten_ref_in_closure(
+    tree: &ast::ClassTree,
+    overlay: &ast::InstanceOverlay,
+    model_name: &str,
+    options: FlattenOptions,
+    closure: &TargetClosure,
+) -> Result<flat::Model, FlattenError> {
     let mut ctx = Context::new();
     ctx.declared_dimensions = std::sync::Arc::new(
         rumoca_eval_ast::eval::DeclaredDimensions::from_instanced(tree, overlay),
@@ -348,6 +375,7 @@ pub fn flatten_ref_with_options(
         .scope_tree
         .predefined_member(&rumoca_core::ComponentPath::from_flat_path("String"));
     ctx.predefined_intrinsics = ast_lower::PredefinedIntrinsicIds::from_tree(tree);
+    ctx.resource_roots = resource_roots::resource_roots(tree);
     ctx.materialize_structured_families = options.materialize_structured_families;
     if !model_name.is_empty() {
         ctx.simulated_root_name = Some(crate::path_utils::leaf_segment(model_name).to_string());
@@ -384,7 +412,7 @@ pub fn flatten_ref_with_options(
     let component_override_map =
         build_component_override_map(overlay, tree, &class_index, model_name)?;
 
-    initialize_flat_metadata(&mut flat, overlay);
+    initialize_flat_metadata(&mut flat, overlay, closure);
     process_component_instances_for_flatten(
         &mut flat,
         overlay,
@@ -417,6 +445,7 @@ pub fn flatten_ref_with_options(
         tree,
         class_index: &class_index,
         model_name,
+        closure,
         options,
         flatten_graph: &flatten_graph,
         component_override_map: &component_override_map,
@@ -547,7 +576,10 @@ mod seed_function_tests {
     }
 }
 
-fn collect_enum_literal_ordinals(tree: &ast::ClassTree) -> IndexMap<String, i64> {
+fn collect_enum_literal_ordinals(
+    tree: &ast::ClassTree,
+    closure: &TargetClosure,
+) -> IndexMap<String, i64> {
     let mut ordinals = IndexMap::new();
     for (enum_name, literals) in [
         (
@@ -567,6 +599,9 @@ fn collect_enum_literal_ordinals(tree: &ast::ClassTree) -> IndexMap<String, i64>
         }
     }
     for (def_id, qualified_name) in &tree.def_map {
+        if !closure.contains(*def_id) {
+            continue;
+        }
         let Some(class_def) = tree.get_class_by_def_id(*def_id) else {
             continue;
         };

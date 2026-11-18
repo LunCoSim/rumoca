@@ -1,20 +1,50 @@
+mod calls;
+pub use calls::{ProgramCall, SolveAssertionForwarding};
+mod construction_checks;
 mod construction_error;
+use construction_checks::{
+    binary_operator_accepts, checked_ordinal, construct_region, declare_interface_slots,
+    indices_in_bounds, require_fold_domain, require_map_domain, require_provenance,
+    slice_in_bounds,
+};
 pub use construction_error::SolveProgramConstructionError;
 
+mod assigned_state;
+use assigned_state::{AssignedStateConstruction, AssignedStateLayout};
+pub use assigned_state::{
+    ProgramAssignedState, SolveAssignedConditional, SolveAssignedStateId,
+    SolveAssignedStateOperation,
+};
+mod assertions;
 mod directional;
+pub use assertions::{ProgramAssertion, SolveAssertionMessage};
+mod fault_flow;
 mod linear_solve;
+mod loop_flow;
+mod native;
+mod operation_visit;
+mod pass_flow;
+mod read_flow;
 mod tensor;
+mod value_numbering;
+use value_numbering::ValueKey;
 
+pub use loop_flow::{MAX_UNROLLED_OPERATIONS, MAX_UNROLLED_PASSES, invariant_guard};
+pub use pass_flow::index_forms;
 pub use tensor::promoted_concatenate_dimensions;
 pub(in crate::typed_program) mod wire;
 
 use std::marker::PhantomData;
 
+use rumoca_core::native_body::NativeBody;
 use rumoca_core::{Span, StructuredIndexDomain};
 use serde::{Deserialize, Serialize};
 
-use super::call::{SolvePureCallOwnerId, SolvePureCallTableView};
+use super::call::{SolvePureCallOutput, SolvePureCallOwnerId, SolvePureCallTableView};
+use super::demand::{SolveLiveness, SolveOutputDemand};
+use super::pass_independence::{IndependentPasses, LaneExactness, SolveIndexForm};
 use super::types::{SolveArithmeticProfile, SolveScalarType, SolveValue, SolveValueType};
+use crate::fault::FaultClass;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SolveSlotId(u32);
@@ -157,6 +187,10 @@ pub enum SolveBinaryOperator {
     /// failure, never a wrapped or defaulted value. `Divide` stays Real-only,
     /// so an Integer `/` cannot bypass its explicit conversion to Real.
     IntegerQuotient,
+    /// MLS `mod`: exact Integer remainder with the divisor's sign.
+    IntegerModulo,
+    /// MLS `rem`: exact Integer remainder with the dividend's sign.
+    IntegerRemainder,
     Power,
     And,
     Or,
@@ -197,6 +231,22 @@ pub enum SolveReductionOperator {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum SolveOperation {
+    AssignedConditional {
+        program: Box<SolveAssignedConditional>,
+    },
+    AssignedState {
+        #[serde(rename = "state_operation")]
+        operation: SolveAssignedStateOperation,
+    },
+    /// One source-ordered assertion with failed-only message captures.
+    CheckAssertion {
+        predicate_output: usize,
+        message_outputs: Box<[usize]>,
+        condition: SolveRegisterId,
+        captures: Box<[SolveRegisterId]>,
+        destinations: Box<[SolveRegisterId]>,
+        message: SolveAssertionMessage,
+    },
     Constant {
         destination: SolveRegisterId,
         value: SolveValue,
@@ -257,8 +307,17 @@ pub enum SolveOperation {
         domain: StructuredIndexDomain,
         initial: Box<[SolveRegisterId]>,
         captures: Box<[SolveRegisterId]>,
+        state_captures: Box<[SolveAssignedStateId]>,
         destinations: Box<[SolveRegisterId]>,
         transition: Box<SolveProgramRegion>,
+        /// An early-exit predicate over the carried tuple, the captures and
+        /// the binder values of the pass about to run, evaluated before each
+        /// pass; the first false value ends the loop with the current tuple
+        /// (MLS §11.2.3). The producer proves that every skipped pass would
+        /// leave the tuple unchanged, so the domain stays the static capacity
+        /// while a run-time bound such as `i <= n` decides how many passes
+        /// execute.
+        continuation: Option<Box<SolveProgramRegion>>,
     },
     /// Elementwise multiplication of one aggregate by one scalar.
     Scale {
@@ -377,6 +436,7 @@ pub enum SolveOperation {
     /// destinations are ordered value results followed by assertion
     /// predicates exactly as declared by the owner interface.
     Call {
+        assertion_forwarding: Box<[SolveAssertionForwarding]>,
         owner: SolvePureCallOwnerId,
         arguments: Box<[SolveRegisterId]>,
         destinations: Box<[SolveRegisterId]>,
@@ -387,190 +447,14 @@ pub enum SolveOperation {
         matrix: SolveRegisterId,
         rhs: SolveRegisterId,
     },
-}
-
-impl SolveOperation {
-    /// Visits every register read by this operation in semantic operand order.
-    ///
-    /// This is the closed-vocabulary source of truth for checked backend
-    /// liveness. Region bodies own separate register namespaces, so structured
-    /// operations visit only their captures and other enclosing-program
-    /// operands here.
-    pub fn visit_input_registers(&self, mut visit: impl FnMut(SolveRegisterId)) {
-        match self {
-            Self::Constant { .. } | Self::Load { .. } | Self::Identity { .. } => {}
-            Self::Store { source, .. } => visit(*source),
-            Self::Unary { operand, .. }
-            | Self::Convert { operand, .. }
-            | Self::Transpose { operand, .. }
-            | Self::Reduce { operand, .. }
-            | Self::Diagonal { operand, .. } => visit(*operand),
-            Self::Binary { lhs, rhs, .. }
-            | Self::Compare { lhs, rhs, .. }
-            | Self::MatrixMultiply { lhs, rhs, .. }
-            | Self::Cross { lhs, rhs, .. } => visit_register_pair(*lhs, *rhs, &mut visit),
-            Self::LinearSolve { matrix, rhs, .. } => {
-                visit_register_pair(*matrix, *rhs, &mut visit);
-            }
-            Self::Select {
-                condition,
-                if_true,
-                if_false,
-                ..
-            } => {
-                visit(*condition);
-                visit(*if_true);
-                visit(*if_false);
-            }
-            Self::Conditional {
-                condition,
-                captures,
-                ..
-            } => visit_register_then_list(*condition, captures, &mut visit),
-            Self::Map { captures, .. } => captures.iter().copied().for_each(&mut visit),
-            Self::Fold {
-                initial, captures, ..
-            } => {
-                initial.iter().copied().for_each(&mut visit);
-                captures.iter().copied().for_each(&mut visit);
-            }
-            Self::Scale {
-                aggregate, scalar, ..
-            }
-            | Self::BroadcastBinary {
-                aggregate, scalar, ..
-            } => visit_register_pair(*aggregate, *scalar, &mut visit),
-            Self::Concatenate { operands, .. }
-            | Self::ConstructAggregate {
-                elements: operands, ..
-            } => operands.iter().copied().for_each(&mut visit),
-            Self::Fill { value, .. } => visit(*value),
-            Self::ProjectElement { aggregate, .. } | Self::ProjectSlice { aggregate, .. } => {
-                visit(*aggregate)
-            }
-            Self::ProjectElementDynamic {
-                aggregate, indices, ..
-            } => visit_register_then_list(*aggregate, indices, &mut visit),
-            Self::ProjectView {
-                aggregate, axes, ..
-            } => {
-                visit(*aggregate);
-                visit_view_axis_registers(axes, &mut visit);
-            }
-            Self::SelectElement {
-                aggregate,
-                indices,
-                out_of_range,
-                ..
-            } => {
-                visit_register_then_list(*aggregate, indices, &mut visit);
-                visit(*out_of_range);
-            }
-            Self::UpdateElement {
-                aggregate,
-                value,
-                indices,
-                ..
-            } => visit_register_pair_then_list(*aggregate, *value, indices, &mut visit),
-            Self::UpdateSlice {
-                aggregate, value, ..
-            } => visit_register_pair(*aggregate, *value, &mut visit),
-            Self::UpdateView {
-                aggregate,
-                value,
-                axes,
-                ..
-            } => {
-                visit(*aggregate);
-                visit(*value);
-                visit_view_axis_registers(axes, &mut visit);
-            }
-            Self::Call { arguments, .. } => arguments.iter().copied().for_each(&mut visit),
-        }
-    }
-
-    /// Visits every register defined by this operation in result-tuple order.
-    pub fn visit_output_registers(&self, mut visit: impl FnMut(SolveRegisterId)) {
-        match self {
-            Self::Store { .. } => {}
-            Self::Constant { destination, .. }
-            | Self::Load { destination, .. }
-            | Self::Unary { destination, .. }
-            | Self::Binary { destination, .. }
-            | Self::Compare { destination, .. }
-            | Self::Convert { destination, .. }
-            | Self::Select { destination, .. }
-            | Self::Map { destination, .. }
-            | Self::MatrixMultiply { destination, .. }
-            | Self::LinearSolve { destination, .. }
-            | Self::Scale { destination, .. }
-            | Self::BroadcastBinary { destination, .. }
-            | Self::Transpose { destination, .. }
-            | Self::Cross { destination, .. }
-            | Self::Reduce { destination, .. }
-            | Self::Identity { destination }
-            | Self::Diagonal { destination, .. }
-            | Self::Concatenate { destination, .. }
-            | Self::Fill { destination, .. }
-            | Self::ConstructAggregate { destination, .. }
-            | Self::ProjectElement { destination, .. }
-            | Self::ProjectElementDynamic { destination, .. }
-            | Self::ProjectSlice { destination, .. }
-            | Self::ProjectView { destination, .. }
-            | Self::SelectElement { destination, .. }
-            | Self::UpdateElement { destination, .. }
-            | Self::UpdateSlice { destination, .. }
-            | Self::UpdateView { destination, .. } => visit(*destination),
-            Self::Conditional { destinations, .. }
-            | Self::Fold { destinations, .. }
-            | Self::Call { destinations, .. } => {
-                destinations.iter().copied().for_each(&mut visit);
-            }
-        }
-    }
-}
-
-fn visit_view_axis_registers(
-    axes: &[SolveTensorViewAxis],
-    visit: &mut impl FnMut(SolveRegisterId),
-) {
-    for axis in axes {
-        if let SolveTensorViewAxis::Index(register) = axis {
-            visit(*register);
-        }
-    }
-}
-
-/// Visits two operand registers in semantic order.
-fn visit_register_pair(
-    first: SolveRegisterId,
-    second: SolveRegisterId,
-    visit: &mut impl FnMut(SolveRegisterId),
-) {
-    visit(first);
-    visit(second);
-}
-
-/// Visits one leading operand register, then a compact operand list.
-fn visit_register_then_list(
-    first: SolveRegisterId,
-    registers: &[SolveRegisterId],
-    visit: &mut impl FnMut(SolveRegisterId),
-) {
-    visit(first);
-    registers.iter().copied().for_each(visit);
-}
-
-/// Visits two leading operand registers, then a compact operand list.
-fn visit_register_pair_then_list(
-    first: SolveRegisterId,
-    second: SolveRegisterId,
-    registers: &[SolveRegisterId],
-    visit: &mut impl FnMut(SolveRegisterId),
-) {
-    visit(first);
-    visit(second);
-    registers.iter().copied().for_each(visit);
+    /// One SPEC_0040 DAE-C30 compiler-defined foreign body, typed by its
+    /// catalog interface: operands are its inputs and destinations its
+    /// outputs, each in interface order.
+    Native {
+        body: NativeBody,
+        operands: Box<[SolveRegisterId]>,
+        destinations: Box<[SolveRegisterId]>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -627,6 +511,17 @@ pub struct TypedProgram {
     slots: Box<[SolveSlot]>,
     register_types: Box<[SolveValueType]>,
     operations: Box<[SolveSpannedOperation]>,
+    assigned_states: AssignedStateLayout,
+    #[serde(skip)]
+    read_flow: read_flow::ReadFlow,
+    #[serde(skip)]
+    fault_flow: fault_flow::FaultFlow,
+    #[serde(skip)]
+    loop_flow: loop_flow::LoopFlow,
+    #[serde(skip)]
+    pass_flow: pass_flow::PassFlow,
+    #[serde(skip)]
+    call_demands: Box<[Option<SolveOutputDemand>]>,
 }
 
 impl TypedProgram {
@@ -636,22 +531,7 @@ impl TypedProgram {
             &mut TypedProgramBuilder<'program>,
         ) -> Result<(), SolveProgramConstructionError>,
     ) -> Result<Self, SolveProgramConstructionError> {
-        let mut builder = TypedProgramBuilder {
-            arithmetic,
-            slots: Vec::new(),
-            slot_initialized: Vec::new(),
-            register_types: Vec::new(),
-            operations: Vec::new(),
-            available_calls: SolvePureCallTableView::default(),
-            marker: PhantomData,
-        };
-        build(&mut builder)?;
-        Ok(Self {
-            arithmetic,
-            slots: builder.slots.into_boxed_slice(),
-            register_types: builder.register_types.into_boxed_slice(),
-            operations: builder.operations.into_boxed_slice(),
-        })
+        Self::construct_with_calls(arithmetic, SolvePureCallTableView::default(), build)
     }
 
     pub(super) fn construct_with_calls(
@@ -661,22 +541,198 @@ impl TypedProgram {
             &mut TypedProgramBuilder<'program>,
         ) -> Result<(), SolveProgramConstructionError>,
     ) -> Result<Self, SolveProgramConstructionError> {
+        Self::construct_with_owner(arithmetic, available_calls, &[], build)
+    }
+
+    pub(super) fn construct_with_owner(
+        arithmetic: SolveArithmeticProfile,
+        available_calls: SolvePureCallTableView<'_>,
+        assertion_outputs: &[SolvePureCallOutput],
+        build: impl for<'program> FnOnce(
+            &mut TypedProgramBuilder<'program>,
+        ) -> Result<(), SolveProgramConstructionError>,
+    ) -> Result<Self, SolveProgramConstructionError> {
+        Self::construct_with_assigned_interface(
+            arithmetic,
+            available_calls,
+            assertion_outputs,
+            Vec::new(),
+            Vec::new(),
+            None,
+            build,
+        )
+    }
+
+    fn construct_with_assigned_interface(
+        arithmetic: SolveArithmeticProfile,
+        available_calls: SolvePureCallTableView<'_>,
+        assertion_outputs: &[SolvePureCallOutput],
+        state_inputs: Vec<SolveValueType>,
+        state_outputs: Vec<SolveValueType>,
+        region_provenance: Option<Span>,
+        build: impl for<'program> FnOnce(
+            &mut TypedProgramBuilder<'program>,
+        ) -> Result<(), SolveProgramConstructionError>,
+    ) -> Result<Self, SolveProgramConstructionError> {
+        if state_inputs
+            .iter()
+            .chain(&state_outputs)
+            .any(|value_type| !value_type.belongs_to(arithmetic))
+        {
+            return Err(SolveProgramConstructionError::WireMismatch);
+        }
         let mut builder = TypedProgramBuilder {
             arithmetic,
             slots: Vec::new(),
             slot_initialized: Vec::new(),
             register_types: Vec::new(),
             operations: Vec::new(),
+            numbering: std::collections::HashMap::new(),
+            numbered_values: true,
+            assigned_states: AssignedStateConstruction::interface(state_inputs, state_outputs),
             available_calls,
+            assertion_outputs,
             marker: PhantomData,
         };
         build(&mut builder)?;
-        Ok(Self {
+        builder.assigned_states.complete(
+            builder
+                .operations
+                .last()
+                .map(|op| op.provenance)
+                .or(region_provenance),
+        )?;
+        Ok(Self::assemble(
             arithmetic,
-            slots: builder.slots.into_boxed_slice(),
-            register_types: builder.register_types.into_boxed_slice(),
-            operations: builder.operations.into_boxed_slice(),
-        })
+            builder.slots,
+            builder.register_types,
+            builder.operations,
+            builder.assigned_states.layout,
+        ))
+    }
+
+    fn assemble(
+        arithmetic: SolveArithmeticProfile,
+        slots: Vec<SolveSlot>,
+        register_types: Vec<SolveValueType>,
+        operations: Vec<SolveSpannedOperation>,
+        assigned_states: AssignedStateLayout,
+    ) -> Self {
+        let read_flow = read_flow::ReadFlow::of(&operations, register_types.len(), &slots);
+        let fault_flow = fault_flow::FaultFlow::of(&operations, &register_types, &slots, &[]);
+        let loop_flow = loop_flow::LoopFlow::of(&operations);
+        let pass_flow = pass_flow::PassFlow::of(&operations, &fault_flow);
+        let mut program = Self {
+            arithmetic,
+            slots: slots.into_boxed_slice(),
+            register_types: register_types.into_boxed_slice(),
+            operations: operations.into_boxed_slice(),
+            assigned_states,
+            read_flow,
+            fault_flow,
+            loop_flow,
+            pass_flow,
+            call_demands: Box::default(),
+        };
+        program.call_demands = SolveLiveness::call_site_demands(&program);
+        program
+    }
+
+    /// The operations one pass of this program emits, counting each unrolled
+    /// loop once per pass.
+    #[must_use]
+    pub fn emitted_weight(&self) -> usize {
+        self.loop_flow.weight()
+    }
+
+    /// Whether a pass of this program can record an observation: an assertion
+    /// check or a call anywhere in it.
+    #[must_use]
+    pub fn observes(&self) -> bool {
+        self.loop_flow.observes()
+    }
+
+    /// The number of straight-line passes operation `operation` may be emitted
+    /// as, when it is a loop with a proven constant trip count and a body
+    /// within the cost bound, else `None`. A loop whose passes must not record
+    /// an observation (`observed`) and whose body does has no unrolling.
+    #[must_use]
+    pub fn unrolled_passes(&self, operation: usize, observed: bool) -> Option<usize> {
+        let passes = self.loop_flow.unrolled(operation)?;
+        let body_observes = match self.operations.get(operation)?.operation() {
+            SolveOperation::Fold { transition, .. } => transition.body().observes(),
+            SolveOperation::Map { body, .. } => body.body().observes(),
+            _ => return None,
+        };
+        (!(observed && body_observes)).then_some(passes)
+    }
+
+    /// The independent-passes property of loop operation `operation`, proven
+    /// once when this program was constructed (SPEC_0040 SOLVE-C104): no pass
+    /// reads a value another pass writes or carries a value to the next, and
+    /// the exactness of the operations of one pass says whether passes may be
+    /// evaluated in lanes. `None` for an operation that is not such a loop.
+    #[must_use]
+    pub fn independent_passes(&self, operation: usize) -> Option<IndependentPasses> {
+        self.pass_flow.passes(operation)
+    }
+
+    /// The outputs of the callee of call operation `operation` that this
+    /// program reads, in output order; `None` for an operation that is not a
+    /// call. This is the demand a plan built for the call site serves.
+    #[must_use]
+    pub fn call_site_demand(&self, operation: usize) -> Option<&SolveOutputDemand> {
+        self.call_demands.get(operation)?.as_ref()
+    }
+
+    /// How operation `operation` can fail, proven once when this program was
+    /// constructed. Every pass that drops, reorders or speculates an operation
+    /// reads this one classification (SPEC_0040 SOLVE-C102).
+    #[must_use]
+    pub fn fault_class(&self, operation: usize) -> FaultClass {
+        self.fault_flow
+            .classes()
+            .get(operation)
+            .copied()
+            .unwrap_or(FaultClass::HasEffect)
+    }
+
+    /// Whether operation `operation` is pure and cannot fault, so it may be
+    /// dropped when nothing reads its results.
+    #[must_use]
+    pub fn is_prunable(&self, operation: usize) -> bool {
+        self.fault_class(operation).is_prunable()
+    }
+
+    /// The class of this program entered as a region: the join of its
+    /// operations, where a store to its own Output slot is not an effect.
+    #[must_use]
+    pub fn region_fault_class(&self) -> FaultClass {
+        self.fault_flow.region_class(&self.operations, &self.slots)
+    }
+
+    /// The last operation of this program that reads each register, by register
+    /// index; `None` for a register nothing reads. Every executor derives its
+    /// value lifetimes from this relation.
+    #[must_use]
+    pub fn register_last_reads(&self) -> &[Option<usize>] {
+        self.read_flow.register_last_reads()
+    }
+
+    /// Whether `operation` is the last operation of this program that reads
+    /// `register` and lists it once. The register's value is dead afterwards,
+    /// so an executor may move it out instead of sharing it.
+    #[must_use]
+    pub fn register_moves_at(&self, register: SolveRegisterId, operation: usize) -> bool {
+        self.read_flow
+            .register_moves_at(register.index(), operation)
+    }
+
+    /// Whether `operation` is the last load of the read-only `slot`, whose
+    /// value is dead afterwards.
+    #[must_use]
+    pub fn slot_last_load_at(&self, slot: SolveSlotId, operation: usize) -> bool {
+        self.read_flow.slot_last_load_at(slot.index(), operation)
     }
 
     #[must_use]
@@ -722,7 +778,13 @@ pub struct TypedProgramBuilder<'program> {
     slot_initialized: Vec<bool>,
     register_types: Vec<SolveValueType>,
     operations: Vec<SolveSpannedOperation>,
+    numbering: std::collections::HashMap<ValueKey, SolveRegisterId>,
+    /// Whether repeated scalar computations share a register; a replayed wire
+    /// keeps every recorded register.
+    numbered_values: bool,
+    assigned_states: AssignedStateConstruction,
     available_calls: SolvePureCallTableView<'program>,
+    assertion_outputs: &'program [SolvePureCallOutput],
     marker: PhantomData<&'program mut &'program ()>,
 }
 
@@ -759,6 +821,19 @@ impl<'program> TypedProgramBuilder<'program> {
         })
     }
 
+    /// Treat `slot` as holding a value on entry: a block slot an earlier
+    /// lifecycle method defined (#483). The GALEC lifecycle requires Startup
+    /// to define every block variable, so Recalibrate and DoStep may read any.
+    pub(crate) fn assume_slot_initialized(
+        &mut self,
+        slot: ProgramSlot<'program>,
+        provenance: Span,
+    ) -> Result<(), SolveProgramConstructionError> {
+        let index = self.slot(slot, provenance)?.id.index();
+        self.slot_initialized[index] = true;
+        Ok(())
+    }
+
     pub fn constant(
         &mut self,
         value: SolveValue,
@@ -768,6 +843,14 @@ impl<'program> TypedProgramBuilder<'program> {
         if !value.value_type().belongs_to(self.arithmetic) {
             return Err(SolveProgramConstructionError::ProfileMismatch { provenance });
         }
+        let key = value
+            .value_type()
+            .dimensions()
+            .is_empty()
+            .then(|| ValueKey::Constant(value.clone()));
+        if let Some(existing) = self.numbered(key.as_ref()) {
+            return Ok(existing);
+        }
         let destination = self.issue_register(value.value_type().clone(), provenance)?;
         self.push(
             SolveOperation::Constant {
@@ -776,6 +859,7 @@ impl<'program> TypedProgramBuilder<'program> {
             },
             provenance,
         );
+        self.number(key, destination);
         Ok(destination)
     }
 
@@ -868,6 +952,13 @@ impl<'program> TypedProgramBuilder<'program> {
         if !valid {
             return Err(SolveProgramConstructionError::TypeMismatch { provenance });
         }
+        let key = value_type
+            .dimensions()
+            .is_empty()
+            .then_some(ValueKey::Unary(operator, operand.id));
+        if let Some(existing) = self.numbered(key.as_ref()) {
+            return Ok(existing);
+        }
         let destination = self.issue_register(value_type, provenance)?;
         self.push(
             SolveOperation::Unary {
@@ -877,6 +968,7 @@ impl<'program> TypedProgramBuilder<'program> {
             },
             provenance,
         );
+        self.number(key, destination);
         Ok(destination)
     }
 
@@ -894,6 +986,13 @@ impl<'program> TypedProgramBuilder<'program> {
         if lhs_type != *rhs_type || !valid_elements {
             return Err(SolveProgramConstructionError::TypeMismatch { provenance });
         }
+        let key = lhs_type
+            .dimensions()
+            .is_empty()
+            .then_some(ValueKey::Binary(operator, lhs.id, rhs.id));
+        if let Some(existing) = self.numbered(key.as_ref()) {
+            return Ok(existing);
+        }
         let destination = self.issue_register(lhs_type, provenance)?;
         self.push(
             SolveOperation::Binary {
@@ -904,6 +1003,7 @@ impl<'program> TypedProgramBuilder<'program> {
             },
             provenance,
         );
+        self.number(key, destination);
         Ok(destination)
     }
 
@@ -924,6 +1024,13 @@ impl<'program> TypedProgramBuilder<'program> {
         if lhs_type != *rhs_type || (ordered && !lhs_type.element_type().is_numeric()) {
             return Err(SolveProgramConstructionError::TypeMismatch { provenance });
         }
+        let key = lhs_type
+            .dimensions()
+            .is_empty()
+            .then_some(ValueKey::Compare(operator, lhs.id, rhs.id));
+        if let Some(existing) = self.numbered(key.as_ref()) {
+            return Ok(existing);
+        }
         let destination = self.issue_register(lhs_type.boolean_with_same_shape(), provenance)?;
         self.push(
             SolveOperation::Compare {
@@ -934,6 +1041,7 @@ impl<'program> TypedProgramBuilder<'program> {
             },
             provenance,
         );
+        self.number(key, destination);
         Ok(destination)
     }
 
@@ -957,6 +1065,13 @@ impl<'program> TypedProgramBuilder<'program> {
             _ => return Err(SolveProgramConstructionError::TypeMismatch { provenance }),
         };
         let value_type = operand_type.with_element_type(scalar);
+        let key = value_type
+            .dimensions()
+            .is_empty()
+            .then_some(ValueKey::Convert(operator, operand.id));
+        if let Some(existing) = self.numbered(key.as_ref()) {
+            return Ok(existing);
+        }
         let destination = self.issue_register(value_type, provenance)?;
         self.push(
             SolveOperation::Convert {
@@ -966,6 +1081,7 @@ impl<'program> TypedProgramBuilder<'program> {
             },
             provenance,
         );
+        self.number(key, destination);
         Ok(destination)
     }
 
@@ -1042,7 +1158,6 @@ impl<'program> TypedProgramBuilder<'program> {
         let condition_type = self.register_type(condition, provenance)?;
         if condition_type.element_type() != SolveScalarType::Boolean
             || !condition_type.dimensions().is_empty()
-            || output_types.is_empty()
             || output_types
                 .iter()
                 .any(|value_type| !value_type.belongs_to(self.arithmetic))
@@ -1077,33 +1192,51 @@ impl<'program> TypedProgramBuilder<'program> {
             &[ProgramSlot<'region>],
         ) -> Result<(), SolveProgramConstructionError>,
     ) -> Result<Vec<ProgramRegister<'program>>, SolveProgramConstructionError> {
-        require_provenance(provenance)?;
-        require_fold_domain(&domain, self.arithmetic, provenance)?;
-        if initial.is_empty() {
-            return Err(SolveProgramConstructionError::InvalidFold { provenance });
-        }
-        let carried_types = self.register_types_for(initial, provenance)?;
-        let capture_types = self.register_types_for(captures, provenance)?;
-        let binder_types = vec![
-            SolveValueType::scalar(SolveScalarType::integer(self.arithmetic));
-            domain.binders.len()
-        ];
-        let mut input_types = carried_types.clone();
-        input_types.extend(capture_types.iter().cloned());
-        input_types.extend(binder_types.iter().cloned());
-        let carried_count = carried_types.len();
-        let capture_count = capture_types.len();
-        let transition = self.build_region(
-            input_types,
-            carried_types,
+        self.fold_with_assigned(
+            domain,
+            initial,
+            captures,
+            &[],
             provenance,
-            |builder, inputs, outputs| {
-                let (carried, remaining) = inputs.split_at(carried_count);
-                let (captures, binders) = remaining.split_at(capture_count);
+            |builder, _, carried, captures, binders, outputs| {
                 build(builder, carried, captures, binders, outputs)
             },
-        )?;
-        self.fold_from_region(domain, initial, captures, transition, provenance)
+        )
+    }
+
+    pub fn fold_while(
+        &mut self,
+        domain: StructuredIndexDomain,
+        initial: &[ProgramRegister<'program>],
+        captures: &[ProgramRegister<'program>],
+        provenance: Span,
+        continuation: impl for<'region> FnOnce(
+            &mut TypedProgramBuilder<'region>,
+            &[ProgramSlot<'region>],
+            &[ProgramSlot<'region>],
+            &[ProgramSlot<'region>],
+            &[ProgramSlot<'region>],
+        ) -> Result<(), SolveProgramConstructionError>,
+        build: impl for<'region> FnOnce(
+            &mut TypedProgramBuilder<'region>,
+            &[ProgramSlot<'region>],
+            &[ProgramSlot<'region>],
+            &[ProgramSlot<'region>],
+            &[ProgramSlot<'region>],
+        ) -> Result<(), SolveProgramConstructionError>,
+    ) -> Result<Vec<ProgramRegister<'program>>, SolveProgramConstructionError> {
+        self.fold_while_assigned(
+            domain,
+            initial,
+            (captures, &[]),
+            provenance,
+            |builder, _, carried, captures, binders, outputs| {
+                continuation(builder, carried, captures, binders, outputs)
+            },
+            |builder, _, carried, captures, binders, outputs| {
+                build(builder, carried, captures, binders, outputs)
+            },
+        )
     }
 
     pub fn map(
@@ -1139,7 +1272,7 @@ impl<'program> TypedProgramBuilder<'program> {
             |builder, inputs, outputs| {
                 let (captures, binders) = inputs.split_at(capture_count);
                 let [output] = outputs else {
-                    unreachable!("checked map body owns one output")
+                    return Err(SolveProgramConstructionError::InvalidMap { provenance });
                 };
                 build(builder, captures, binders, *output)
             },
@@ -1158,8 +1291,11 @@ impl<'program> TypedProgramBuilder<'program> {
             &[ProgramSlot<'region>],
         ) -> Result<(), SolveProgramConstructionError>,
     ) -> Result<SolveProgramRegion, SolveProgramConstructionError> {
-        let body =
-            TypedProgram::construct_with_calls(self.arithmetic, self.available_calls, |builder| {
+        let body = TypedProgram::construct_with_owner(
+            self.arithmetic,
+            self.available_calls,
+            self.assertion_outputs,
+            |builder| {
                 let input_slots = declare_interface_slots(
                     builder,
                     &inputs,
@@ -1175,18 +1311,19 @@ impl<'program> TypedProgramBuilder<'program> {
                     provenance,
                 )?;
                 build(builder, &input_slots, &output_slots)
-            })?;
+            },
+        )?;
         construct_region(inputs, outputs, body, provenance)
     }
 
-    fn conditional_from_regions(
-        &mut self,
+    fn check_conditional_regions(
+        &self,
         condition: ProgramRegister<'program>,
         captures: &[ProgramRegister<'program>],
-        if_true: SolveProgramRegion,
-        if_false: SolveProgramRegion,
+        if_true: &SolveProgramRegion,
+        if_false: &SolveProgramRegion,
         provenance: Span,
-    ) -> Result<Vec<ProgramRegister<'program>>, SolveProgramConstructionError> {
+    ) -> Result<(), SolveProgramConstructionError> {
         require_provenance(provenance)?;
         let condition_type = self.register_type(condition, provenance)?;
         let capture_types = captures
@@ -1202,6 +1339,25 @@ impl<'program> TypedProgramBuilder<'program> {
             || if_false.body.arithmetic() != self.arithmetic
             || if_true.provenance != provenance
             || if_false.provenance != provenance
+        {
+            return Err(SolveProgramConstructionError::InvalidRegion { provenance });
+        }
+        Ok(())
+    }
+
+    fn conditional_from_regions(
+        &mut self,
+        condition: ProgramRegister<'program>,
+        captures: &[ProgramRegister<'program>],
+        if_true: SolveProgramRegion,
+        if_false: SolveProgramRegion,
+        provenance: Span,
+    ) -> Result<Vec<ProgramRegister<'program>>, SolveProgramConstructionError> {
+        self.check_conditional_regions(condition, captures, &if_true, &if_false, provenance)?;
+        if !if_true.body.assigned_state_inputs().is_empty()
+            || !if_true.body.assigned_state_outputs().is_empty()
+            || !if_false.body.assigned_state_inputs().is_empty()
+            || !if_false.body.assigned_state_outputs().is_empty()
         {
             return Err(SolveProgramConstructionError::InvalidRegion { provenance });
         }
@@ -1236,12 +1392,20 @@ impl<'program> TypedProgramBuilder<'program> {
         &mut self,
         domain: StructuredIndexDomain,
         initial: &[ProgramRegister<'program>],
-        captures: &[ProgramRegister<'program>],
+        (captures, state_captures): (
+            &[ProgramRegister<'program>],
+            &[ProgramAssignedState<'program>],
+        ),
         transition: SolveProgramRegion,
+        continuation: Option<SolveProgramRegion>,
         provenance: Span,
     ) -> Result<Vec<ProgramRegister<'program>>, SolveProgramConstructionError> {
         require_provenance(provenance)?;
         require_fold_domain(&domain, self.arithmetic, provenance)?;
+        let state_types = state_captures
+            .iter()
+            .map(|state| self.assigned_state_type(*state, provenance).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
         let carried_types = self.register_types_for(initial, provenance)?;
         let capture_types = self.register_types_for(captures, provenance)?;
         let binder_type = SolveValueType::scalar(SolveScalarType::integer(self.arithmetic));
@@ -1252,10 +1416,21 @@ impl<'program> TypedProgramBuilder<'program> {
             .chain(std::iter::repeat_n(binder_type, domain.binders.len()))
             .collect::<Vec<_>>();
         if carried_types.is_empty()
+            || transition.body.assigned_state_inputs() != state_types
+            || !transition.body.assigned_state_outputs().is_empty()
             || transition.inputs.as_ref() != expected_inputs
             || transition.outputs.as_ref() != carried_types
             || transition.body.arithmetic() != self.arithmetic
             || transition.provenance != provenance
+            || continuation.as_ref().is_some_and(|predicate| {
+                predicate.body.assigned_state_inputs() != state_types
+                    || !predicate.body.assigned_state_outputs().is_empty()
+                    || predicate.inputs.as_ref() != expected_inputs
+                    || predicate.outputs.as_ref()
+                        != [SolveValueType::scalar(SolveScalarType::Boolean)]
+                    || predicate.body.arithmetic() != self.arithmetic
+                    || predicate.provenance != provenance
+            })
         {
             return Err(SolveProgramConstructionError::InvalidFold { provenance });
         }
@@ -1271,6 +1446,11 @@ impl<'program> TypedProgramBuilder<'program> {
                     .map(|value| value.id)
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
+                state_captures: state_captures
+                    .iter()
+                    .map(|state| state.id)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
                 captures: captures
                     .iter()
                     .map(|value| value.id)
@@ -1282,6 +1462,7 @@ impl<'program> TypedProgramBuilder<'program> {
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
                 transition: Box::new(transition),
+                continuation: continuation.map(Box::new),
             },
             provenance,
         );
@@ -1307,7 +1488,9 @@ impl<'program> TypedProgramBuilder<'program> {
         let [body_type] = body.outputs.as_ref() else {
             return Err(SolveProgramConstructionError::InvalidMap { provenance });
         };
-        if body.inputs.as_ref() != expected_inputs
+        if !body.body.assigned_state_inputs().is_empty()
+            || !body.body.assigned_state_outputs().is_empty()
+            || body.inputs.as_ref() != expected_inputs
             || body.body.arithmetic() != self.arithmetic
             || body.provenance != provenance
         {
@@ -1412,6 +1595,13 @@ impl<'program> TypedProgramBuilder<'program> {
             return Err(SolveProgramConstructionError::InvalidProjection { provenance });
         }
         let value_type = SolveValueType::scalar(aggregate_type.element_type());
+        let key = Some(ValueKey::Project(
+            aggregate.id,
+            indices.clone().into_boxed_slice(),
+        ));
+        if let Some(existing) = self.numbered(key.as_ref()) {
+            return Ok(existing);
+        }
         let destination = self.issue_register(value_type, provenance)?;
         self.push(
             SolveOperation::ProjectElement {
@@ -1421,6 +1611,7 @@ impl<'program> TypedProgramBuilder<'program> {
             },
             provenance,
         );
+        self.number(key, destination);
         Ok(destination)
     }
 
@@ -1443,6 +1634,13 @@ impl<'program> TypedProgramBuilder<'program> {
             return Err(SolveProgramConstructionError::InvalidProjection { provenance });
         }
         let value_type = SolveValueType::scalar(aggregate_type.element_type());
+        let key = Some(ValueKey::ProjectDynamic(
+            aggregate.id,
+            indices.iter().map(|index| index.id).collect(),
+        ));
+        if let Some(existing) = self.numbered(key.as_ref()) {
+            return Ok(existing);
+        }
         let destination = self.issue_register(value_type, provenance)?;
         self.push(
             SolveOperation::ProjectElementDynamic {
@@ -1456,6 +1654,7 @@ impl<'program> TypedProgramBuilder<'program> {
             },
             provenance,
         );
+        self.number(key, destination);
         Ok(destination)
     }
 
@@ -1603,12 +1802,23 @@ impl<'program> TypedProgramBuilder<'program> {
         Ok(destination)
     }
 
+    /// Legacy value-only facade; all call emission delegates to `emit_call`.
     pub fn call(
         &mut self,
         owner: SolvePureCallOwnerId,
         arguments: &[ProgramRegister<'program>],
         provenance: Span,
     ) -> Result<Vec<ProgramRegister<'program>>, SolveProgramConstructionError> {
+        self.emit_call(owner, arguments, provenance)
+            .map(ProgramCall::into_registers)
+    }
+
+    pub fn emit_call(
+        &mut self,
+        owner: SolvePureCallOwnerId,
+        arguments: &[ProgramRegister<'program>],
+        provenance: Span,
+    ) -> Result<ProgramCall<'program>, SolveProgramConstructionError> {
         require_provenance(provenance)?;
         let interface = self
             .available_calls
@@ -1643,8 +1853,10 @@ impl<'program> TypedProgramBuilder<'program> {
             .into_iter()
             .map(|value_type| self.issue_register(value_type, provenance))
             .collect::<Result<Vec<_>, _>>()?;
+        let operation = self.operations.len();
         self.push(
             SolveOperation::Call {
+                assertion_forwarding: Box::new([]),
                 owner,
                 arguments: arguments
                     .iter()
@@ -1659,7 +1871,12 @@ impl<'program> TypedProgramBuilder<'program> {
             },
             provenance,
         );
-        Ok(destinations)
+        Ok(ProgramCall {
+            operation,
+            owner,
+            registers: destinations,
+            marker: PhantomData,
+        })
     }
 
     fn aggregate_type(
@@ -1723,6 +1940,22 @@ impl<'program> TypedProgramBuilder<'program> {
             .ok_or(SolveProgramConstructionError::UnknownRegister { provenance })
     }
 
+    /// The register of an earlier identical single-cell computation.
+    fn numbered(&self, key: Option<&ValueKey>) -> Option<ProgramRegister<'program>> {
+        key.filter(|_| self.numbered_values)
+            .and_then(|key| self.numbering.get(key))
+            .map(|&id| ProgramRegister {
+                id,
+                marker: PhantomData,
+            })
+    }
+
+    fn number(&mut self, key: Option<ValueKey>, register: ProgramRegister<'program>) {
+        if let Some(key) = key {
+            self.numbering.insert(key, register.id);
+        }
+    }
+
     fn issue_register(
         &mut self,
         value_type: SolveValueType,
@@ -1742,205 +1975,6 @@ impl<'program> TypedProgramBuilder<'program> {
             provenance,
         });
     }
-}
-
-fn declare_interface_slots<'program>(
-    builder: &mut TypedProgramBuilder<'program>,
-    value_types: &[SolveValueType],
-    storage: SolveStorageClass,
-    access: SolveSlotAccess,
-    provenance: Span,
-) -> Result<Vec<ProgramSlot<'program>>, SolveProgramConstructionError> {
-    value_types
-        .iter()
-        .cloned()
-        .map(|value_type| builder.declare_slot(value_type, storage, access, provenance))
-        .collect()
-}
-
-fn require_fold_domain(
-    domain: &StructuredIndexDomain,
-    arithmetic: SolveArithmeticProfile,
-    provenance: Span,
-) -> Result<(), SolveProgramConstructionError> {
-    domain
-        .validate()
-        .map_err(|_| SolveProgramConstructionError::InvalidFold { provenance })?;
-    let integers = arithmetic.integer_domain();
-    if domain.binders.is_empty()
-        || domain
-            .binders
-            .iter()
-            .any(|binder| !integers.contains(binder.lower) || !integers.contains(binder.upper))
-    {
-        return Err(SolveProgramConstructionError::InvalidFold { provenance });
-    }
-    Ok(())
-}
-
-fn require_map_domain(
-    domain: &StructuredIndexDomain,
-    arithmetic: SolveArithmeticProfile,
-    provenance: Span,
-) -> Result<(), SolveProgramConstructionError> {
-    domain
-        .validate()
-        .map_err(|_| SolveProgramConstructionError::InvalidMap { provenance })?;
-    let integers = arithmetic.integer_domain();
-    if domain.binders.is_empty()
-        || domain
-            .binders
-            .iter()
-            .any(|binder| !integers.contains(binder.lower) || !integers.contains(binder.upper))
-    {
-        return Err(SolveProgramConstructionError::InvalidMap { provenance });
-    }
-    Ok(())
-}
-
-pub(super) fn construct_region(
-    inputs: Vec<SolveValueType>,
-    outputs: Vec<SolveValueType>,
-    body: TypedProgram,
-    provenance: Span,
-) -> Result<SolveProgramRegion, SolveProgramConstructionError> {
-    if provenance.is_dummy()
-        || outputs.is_empty()
-        || inputs
-            .iter()
-            .chain(&outputs)
-            .any(|value_type| !value_type.belongs_to(body.arithmetic()))
-    {
-        return Err(SolveProgramConstructionError::InvalidRegion { provenance });
-    }
-    validate_region_body(&body, &inputs, &outputs, provenance)?;
-    Ok(SolveProgramRegion {
-        inputs: inputs.into_boxed_slice(),
-        outputs: outputs.into_boxed_slice(),
-        body,
-        provenance,
-    })
-}
-
-fn validate_region_body(
-    body: &TypedProgram,
-    inputs: &[SolveValueType],
-    outputs: &[SolveValueType],
-    provenance: Span,
-) -> Result<(), SolveProgramConstructionError> {
-    let interface_count = inputs
-        .len()
-        .checked_add(outputs.len())
-        .ok_or(SolveProgramConstructionError::IdentityOverflow { provenance })?;
-    if body.slots().len() < interface_count
-        || !slots_match(
-            &body.slots()[..inputs.len()],
-            inputs,
-            SolveStorageClass::Input,
-        )
-        || !slots_match(
-            &body.slots()[inputs.len()..interface_count],
-            outputs,
-            SolveStorageClass::Output,
-        )
-        || body.slots()[interface_count..]
-            .iter()
-            .any(|slot| slot.storage() != SolveStorageClass::MethodLocal)
-    {
-        return Err(SolveProgramConstructionError::InvalidRegion { provenance });
-    }
-    validate_region_outputs(body, inputs.len(), outputs.len(), provenance)
-}
-
-fn slots_match(
-    slots: &[SolveSlot],
-    expected: &[SolveValueType],
-    storage: SolveStorageClass,
-) -> bool {
-    slots
-        .iter()
-        .zip(expected)
-        .all(|(slot, expected)| slot.storage() == storage && slot.value_type() == expected)
-}
-
-fn validate_region_outputs(
-    body: &TypedProgram,
-    output_start: usize,
-    output_count: usize,
-    provenance: Span,
-) -> Result<(), SolveProgramConstructionError> {
-    let mut stores = vec![0usize; output_count];
-    for operation in body.operations() {
-        match operation.operation() {
-            SolveOperation::Load { slot, .. }
-                if (output_start..output_start + output_count).contains(&slot.index()) =>
-            {
-                return Err(SolveProgramConstructionError::InvalidRegion { provenance });
-            }
-            SolveOperation::Store { slot, .. } => {
-                if let Some(output) = slot
-                    .index()
-                    .checked_sub(output_start)
-                    .filter(|output| *output < output_count)
-                {
-                    stores[output] += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    if stores.iter().any(|count| *count != 1) {
-        return Err(SolveProgramConstructionError::InvalidRegion { provenance });
-    }
-    Ok(())
-}
-
-fn checked_ordinal(value: usize, provenance: Span) -> Result<u32, SolveProgramConstructionError> {
-    u32::try_from(value).map_err(|_| SolveProgramConstructionError::IdentityOverflow { provenance })
-}
-
-fn require_provenance(provenance: Span) -> Result<(), SolveProgramConstructionError> {
-    if provenance.is_dummy() {
-        return Err(SolveProgramConstructionError::MissingProvenance);
-    }
-    Ok(())
-}
-
-fn binary_operator_accepts(operator: SolveBinaryOperator, scalar: SolveScalarType) -> bool {
-    match operator {
-        SolveBinaryOperator::Add
-        | SolveBinaryOperator::Subtract
-        | SolveBinaryOperator::Multiply => scalar.is_numeric(),
-        // MLS §10.3.4 orders Boolean operands with `false < true`.
-        SolveBinaryOperator::Min | SolveBinaryOperator::Max => {
-            scalar.is_numeric() || scalar == SolveScalarType::Boolean
-        }
-        SolveBinaryOperator::IntegerQuotient => matches!(scalar, SolveScalarType::Integer(_)),
-        SolveBinaryOperator::Divide | SolveBinaryOperator::Power | SolveBinaryOperator::Atan2 => {
-            matches!(scalar, SolveScalarType::Real { .. })
-        }
-        SolveBinaryOperator::And | SolveBinaryOperator::Or => scalar == SolveScalarType::Boolean,
-    }
-}
-
-fn indices_in_bounds(dimensions: &[u32], indices: &[u32]) -> bool {
-    dimensions.len() == indices.len()
-        && dimensions
-            .iter()
-            .zip(indices)
-            .all(|(extent, index)| *index < *extent)
-}
-
-fn slice_in_bounds(base: &[u32], origin: &[u32], dimensions: &[u32]) -> bool {
-    base.len() == origin.len()
-        && base.len() == dimensions.len()
-        && base
-            .iter()
-            .zip(origin)
-            .zip(dimensions)
-            .all(|((base, origin), extent)| {
-                origin.checked_add(*extent).is_some_and(|end| end <= *base)
-            })
 }
 
 #[cfg(test)]

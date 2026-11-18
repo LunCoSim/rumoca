@@ -1,6 +1,6 @@
 use crate::{
     DifferentiableModel, GradientDescent, GradientMode, GradientStrategy, OptError,
-    RhsMseObjective, TrainableSet, rhs_mse_value_and_gradient,
+    RhsMseObjective, TrainableSet, TrajectoryFit, rhs_mse_value_and_gradient,
 };
 use rumoca::Compiler;
 use rumoca_solver::{SimOptions, SimSolverMode};
@@ -56,6 +56,13 @@ fn linear_model_with_options(options: &SimOptions) -> DifferentiableModel {
         .expect("LinearFit should compile");
     DifferentiableModel::from_dae_default(&result.dae, options)
         .expect("LinearFit should prepare for optimization")
+}
+
+#[test]
+fn state_names_report_the_solver_states_in_state_order() {
+    let model = linear_model();
+    assert_eq!(model.state_names().expect("state names"), ["x"]);
+    assert_eq!(model.state_names().unwrap().len(), model.state().len());
 }
 
 #[test]
@@ -224,4 +231,152 @@ fn gradient_descent_reduces_rhs_mse_loss() {
             .abs()
             < 0.8
     );
+}
+
+const DECAY: &str = r#"
+model Decay
+  parameter Real a = 1.0;
+  Real x(start = 1.0, fixed = true);
+equation
+  der(x) = -a * x;
+end Decay;
+"#;
+
+/// Gradient descent on the adjoint gradient of a least-squares trajectory loss
+/// recovers the decay rate that generated synthetic measurements.
+#[test]
+fn gradient_descent_fits_a_decay_rate_to_measured_trajectory() {
+    let result = Compiler::new()
+        .model("Decay")
+        .compile_str(DECAY, "Decay.mo")
+        .expect("Decay should compile");
+    let options = SimOptions {
+        t_end: 1.0,
+        rtol: 1.0e-8,
+        atol: 1.0e-10,
+        ..SimOptions::default()
+    };
+    let mut model = DifferentiableModel::from_dae_default(&result.dae, &options)
+        .expect("Decay should prepare for optimization");
+    let trainables = TrainableSet::by_names(&model, &["a"]).expect("known trainable");
+
+    // Measurements of x(t) = exp(-2 t), the model with a = 2.
+    let times: Vec<f64> = (0..=50).map(|index| f64::from(index) / 50.0).collect();
+    let measured: Vec<f64> = times.iter().map(|t| (-2.0 * t).exp()).collect();
+    let series = rumoca_sim::DataSeries::new(times, measured).expect("measurements");
+    let fit = TrajectoryFit::new(options, vec![("x".to_string(), series)]);
+
+    let report = GradientDescent::new(8.0, 30)
+        .fit_trajectory(&result.dae, &mut model, &fit, &trainables)
+        .expect("trajectory fit should run");
+
+    let initial = report.initial_loss().expect("initial loss");
+    let final_loss = report.final_loss().expect("final loss");
+    assert!(
+        final_loss < initial * 1.0e-3,
+        "initial={initial}, final={final_loss}"
+    );
+    let fitted = report.final_parameters().expect("final parameters")[0];
+    assert!((fitted - 2.0).abs() < 0.05, "fitted a = {fitted}");
+    assert!((model.parameter_value("a").expect("a") - fitted).abs() < 1.0e-12);
+    assert_eq!(report.trainable_names, ["a"]);
+}
+
+#[test]
+fn trajectory_fit_rejects_a_non_positive_learning_rate() {
+    let result = Compiler::new()
+        .model("Decay")
+        .compile_str(DECAY, "Decay.mo")
+        .expect("Decay should compile");
+    let mut model = DifferentiableModel::from_dae_default(&result.dae, &SimOptions::default())
+        .expect("Decay should prepare for optimization");
+    let trainables = TrainableSet::by_names(&model, &["a"]).expect("known trainable");
+    let fit = TrajectoryFit::new(SimOptions::default(), Vec::new());
+
+    let error = GradientDescent::new(0.0, 1)
+        .fit_trajectory(&result.dae, &mut model, &fit, &trainables)
+        .expect_err("a zero learning rate is invalid");
+    assert!(matches!(error, OptError::NonFinite { .. }));
+
+    let error = GradientDescent::new(1.0, 1)
+        .fit_trajectory(&result.dae, &mut model, &fit, &trainables)
+        .expect_err("a fit with no measurement has no objective");
+    assert!(matches!(error, OptError::Trajectory(_)));
+}
+
+#[test]
+fn user_guide_rhs_fit_uses_the_authored_neural_model() {
+    use crate as rumoca_opt;
+    let compiled = Compiler::new()
+        .model("NeuralODETensor")
+        .compile_str(
+            include_str!("../../../examples/models/NeuralODETensor.mo"),
+            "NeuralODETensor.mo",
+        )
+        .expect("the documented neural model compiles");
+    let target_derivatives = vec![0.0, 0.0];
+    // ANCHOR: guide-rhs-fit
+    let mut model = rumoca_opt::DifferentiableModel::from_dae_default(
+        &compiled.dae,
+        &rumoca_solver::SimOptions::default(),
+    )
+    .expect("prepare the compiled neural model");
+    let trainables = rumoca_opt::TrainableSet::by_names(&model, &["b1[1]", "bmid[1]"])
+        .expect("select the documented independent network biases");
+    let objective = rumoca_opt::RhsMseObjective::new(0.0, target_derivatives);
+    let gradient = rumoca_opt::rhs_mse_value_and_gradient(
+        &model,
+        &objective,
+        &trainables,
+        rumoca_opt::GradientMode::Auto,
+    )
+    .expect("differentiate the neural RHS fitting objective");
+    // ANCHOR_END: guide-rhs-fit
+    assert_eq!(gradient.gradients.len(), 2);
+    assert_eq!(gradient.trainable_names, ["b1[1]", "bmid[1]"]);
+    assert!(gradient.loss.is_finite());
+    assert!(gradient.gradients.iter().all(|value| value.is_finite()));
+    assert!(gradient.gradients.iter().all(|value| value.abs() > 1e-12));
+    assert!(matches!(
+        TrainableSet::by_names(&model, &["W1[1,1]"]),
+        Err(OptError::UnknownTrainable { .. })
+    ));
+    let slots = ["b1[1]", "bmid[1]"].map(|name| {
+        model
+            .parameter_slots()
+            .iter()
+            .find(|parameter| parameter.name == name)
+            .expect("the canonical parameter owner issues this independent bias")
+            .slot
+    });
+    assert_eq!(gradient.trainable_slots, slots);
+    let before = slots.map(|slot| model.parameters()[slot]);
+    let loss = |model: &DifferentiableModel| {
+        let rhs = model.eval_rhs(0.0).expect("evaluate the actual neural RHS");
+        rhs.iter().map(|value| value * value).sum::<f64>() / (2.0 * rhs.len() as f64)
+    };
+    for (index, slot) in slots.iter().copied().enumerate() {
+        let step = 1e-5;
+        model.params_mut()[slot] = before[index] + step;
+        let plus = loss(&model);
+        model.params_mut()[slot] = before[index] - step;
+        let minus = loss(&model);
+        model.params_mut()[slot] = before[index];
+        let expected = (plus - minus) / (2.0 * step);
+        assert!(
+            (gradient.gradients[index] - expected).abs() <= 1e-6 * (1.0 + expected.abs()),
+            "bias {index}: actual={}, finite difference={expected}",
+            gradient.gradients[index]
+        );
+    }
+    let fitted = GradientDescent::new(1e-3, 2)
+        .optimize_rhs_mse(&mut model, &objective, &trainables)
+        .expect("update the actual neural bias parameters");
+    assert!(
+        fitted.final_loss().expect("final loss") < fitted.initial_loss().expect("initial loss")
+    );
+    for (index, slot) in slots.iter().copied().enumerate() {
+        let after = model.parameters()[slot];
+        assert!(after.is_finite() && after != before[index]);
+    }
 }

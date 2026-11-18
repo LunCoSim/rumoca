@@ -508,12 +508,37 @@ pub struct ClassDef {
     /// Constraining type for replaceable classes (MLS §7.3.2)
     /// If set, redeclarations must be subtypes of this type
     pub constrainedby: Option<Name>,
+    /// Constraining-clause modifiers of a replaceable class whose merge into
+    /// its base's modifiers needs types (MLS §7.3.2, §7.2.3): a declared
+    /// binding over them, a `final` conflict, or a class with no single base.
+    /// Parsing keeps them here; instantiation merges or refuses them when the
+    /// class is used.
+    #[serde(default)]
+    pub constraining_modifications: Vec<ExtendModification>,
     /// Array subscripts for type alias definitions (e.g., `type Vector3 = Real[3]`)
     /// Stores the `[3]` part as subscripts for later use in type resolution
     pub array_subscripts: Vec<Subscript>,
     /// External function declaration (MLS §12.9).
     /// Only meaningful for function classes.
     pub external: Option<ExternalFunction>,
+    /// Partial-derivative definition `f = der(g, u1, ...)` (MLS §12.7.2).
+    ///
+    /// A class carrying this has no body of its own: its meaning is the
+    /// derivative of `g`, never `g` itself.
+    #[serde(default)]
+    pub partial_derivative: Option<PartialDerivative>,
+}
+
+/// MLS §12.7.2: the right-hand side of a der-class specifier.
+///
+/// `function f = der(g, u1, u2)` names the differentiated function `g` and the
+/// inputs `u1, u2`, applied in that order (`d/du2 d/du1 g`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartialDerivative {
+    /// The differentiated function, looked up as in a short class definition.
+    pub function: Name,
+    /// The differentiated inputs, in application order.
+    pub inputs: Vec<Token>,
 }
 
 impl Default for ClassDef {
@@ -556,8 +581,10 @@ impl Default for ClassDef {
             is_redeclare: false,
             redeclare_target_def_id: None,
             constrainedby: None,
+            constraining_modifications: Vec::new(),
             array_subscripts: Vec::new(),
             external: None,
+            partial_derivative: None,
         }
     }
 }
@@ -799,6 +826,8 @@ pub struct StatementBlock {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 
 pub struct ForIndex {
+    #[serde(default)]
+    pub binder: Option<rumoca_core::IndexBinderProvenance>,
     pub ident: Token,
     pub range: Expression,
 }
@@ -815,6 +844,8 @@ pub enum Equation {
     Connect {
         lhs: ComponentReference,
         rhs: ComponentReference,
+        /// Authored annotation arguments on the connection equation.
+        annotation: Vec<Expression>,
     },
     For {
         indices: Vec<ForIndex>,
@@ -1403,7 +1434,17 @@ impl std::fmt::Display for Equation {
         match self {
             Equation::Empty => write!(f, ""),
             Equation::Simple { lhs, rhs } => write!(f, "{} = {}", lhs, rhs),
-            Equation::Connect { lhs, rhs } => write!(f, "connect({}, {})", lhs, rhs),
+            Equation::Connect { lhs, rhs, annotation } => {
+                write!(f, "connect({lhs}, {rhs})")?;
+                if let Some((first, remaining)) = annotation.split_first() {
+                    write!(f, " annotation({first}")?;
+                    for argument in remaining {
+                        write!(f, ", {argument}")?;
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
             Equation::For { indices, equations } => format_for_equation(f, indices, equations),
             Equation::When(blocks) => format_when_equation(f, blocks),
             Equation::If {

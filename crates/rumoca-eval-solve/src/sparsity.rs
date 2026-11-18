@@ -7,21 +7,24 @@
 //! 2008, doi:10.1137/1.9780898717761, chapter 7. The pattern this produces is
 //! structural, therefore conservative: an entry can be structurally present and
 //! numerically zero, never the reverse, which is exactly the guarantee the
-//! column coloring in `rumoca_ir_solve::StructuralPattern::column_coloring`
+//! column coloring in `rumoca_ir_solve::StructuralPattern::with_column_coloring`
 //! needs. The bit-vector propagation form is C. H. Bischof, A. Carle, P.
 //! Khademi and A. Mauer, "ADIFOR 2.0: automatic differentiation of Fortran 77
 //! programs", IEEE Computational Science and Engineering 3(3):18-32, 1996,
 //! doi:10.1109/99.537089.
 
+mod reverse_invalidations;
+
 use std::collections::BTreeSet;
 
 use rumoca_core::Span;
 use rumoca_ir_solve::{
-    ComputeBlock, ComputeNode, LinearOp, PatternDerivation, PatternProvenance, ScalarProgramBlock,
-    StructuralPattern, StructuralPatternError,
+    ComputeBlock, ComputeNode, LinearOp, ScalarProgramBlock, StructuralPattern,
+    StructuralPatternError,
 };
 
 use crate::{EvalSolveError, to_scalar_program_block};
+use reverse_invalidations::derive_algebraic_reverse_invalidations;
 
 /// Lift a pattern-authority failure into this crate's error taxonomy without
 /// losing the owner span the authority reported it against.
@@ -83,13 +86,9 @@ pub fn derive_jacobian_pattern_from_jvp(
             ComputeNode::Map { .. } | ComputeNode::AffineStencil { .. }
         )
     }) {
-        // A mixed compact block has no single affine owner representation yet.
-        // Preserve the no-materialization boundary and fail conservatively to
-        // Full: it may cost compressed AD opportunities but cannot omit an edge.
-        let provenance =
-            PatternProvenance::derived(PatternDerivation::ConservativeFull, owner_span)
-                .map_err(|error| from_pattern_error(error, Some(owner_span)))?;
-        return StructuralPattern::full(rows, columns, provenance)
+        // A mixed compact block stacks its nodes' row relations, each affine
+        // node kept compact over its own domain (SPEC_0039 `Stacked`).
+        return StructuralPattern::derive_from_compute_jvp(block, rows, columns, owner_span)
             .map_err(|error| from_pattern_error(error, Some(owner_span)));
     }
     let scalar = to_scalar_program_block(block)?;
@@ -126,9 +125,11 @@ pub(crate) fn program_output_y_dependencies(
         .map_err(|error| from_pattern_error(error, span))
 }
 
-/// Derive a deterministic greedy coloring from a checked pattern.
-pub fn derive_column_coloring(pattern: &StructuralPattern) -> rumoca_ir_solve::ColumnColoring {
-    pattern.column_coloring()
+/// Issue the checked pattern owner's canonical coloring for colored construction.
+pub fn derive_column_coloring(
+    pattern: &StructuralPattern,
+) -> rumoca_ir_solve::ColoredStructuralPattern {
+    pattern.clone().with_column_coloring()
 }
 
 /// Reconstruct all derived structural artifacts from canonical Solve programs.
@@ -138,6 +139,42 @@ pub fn derive_column_coloring(pattern: &StructuralPattern) -> rumoca_ir_solve::C
 pub fn derive_solve_structural_artifacts(
     problem: &rumoca_ir_solve::SolveProblem,
     artifacts: &rumoca_ir_solve::SolveArtifacts,
+) -> Result<
+    (
+        rumoca_ir_solve::ContinuousStructuralArtifacts,
+        rumoca_ir_solve::InitializationStructuralArtifacts,
+    ),
+    EvalSolveError,
+> {
+    let assignment =
+        rumoca_ir_solve::ContinuousStructuralArtifacts::checked_assignment_for_problem(problem)
+            .map_err(|reason| sparsity_error(reason, None))?;
+    derive_structural_artifacts(problem, artifacts, assignment)
+}
+
+/// Derive from the actual finalized source table before model artifacts exist.
+pub fn derive_solve_structural_artifacts_with_calls(
+    problem: &rumoca_ir_solve::SolveProblem,
+    calls: &rumoca_ir_solve::SolvePureCallTable,
+    artifacts: &rumoca_ir_solve::SolveArtifacts,
+) -> Result<
+    (
+        rumoca_ir_solve::ContinuousStructuralArtifacts,
+        rumoca_ir_solve::InitializationStructuralArtifacts,
+    ),
+    EvalSolveError,
+> {
+    let assignment = rumoca_ir_solve::ContinuousStructuralArtifacts::checked_assignment_with_calls(
+        problem, calls,
+    )
+    .map_err(|reason| sparsity_error(reason, None))?;
+    derive_structural_artifacts(problem, artifacts, assignment)
+}
+
+fn derive_structural_artifacts(
+    problem: &rumoca_ir_solve::SolveProblem,
+    artifacts: &rumoca_ir_solve::SolveArtifacts,
+    assignment: Option<rumoca_ir_solve::ContinuousStructuralArtifacts>,
 ) -> Result<
     (
         rumoca_ir_solve::ContinuousStructuralArtifacts,
@@ -156,56 +193,60 @@ pub fn derive_solve_structural_artifacts(
                 None,
             )
         })?;
-    let implicit = derive_optional_compute_pattern(
-        &artifacts.continuous.implicit_jacobian_v,
-        problem.continuous.implicit_rhs.len()?,
-        solver_columns,
-    )?;
-    let manifold = derive_optional_compute_pattern(
-        &artifacts.continuous.manifold_jacobian_v,
-        problem.continuous.manifold_residual.len()?,
-        solver_columns,
-    )?;
-    let algebraic_projection = derive_y_projection_patterns(
-        implicit.as_ref(),
-        &problem.continuous.algebraic_projection_plan,
-    )?;
-    let algebraic_invalidates_earlier = derive_algebraic_reverse_invalidations(
-        implicit.as_ref(),
-        &problem.continuous.algebraic_projection_plan,
-    )?;
-    let manifold_projection = derive_y_projection_patterns(
-        manifold.as_ref(),
-        &problem.continuous.manifold_projection_plan,
-    )?;
-    let continuous = rumoca_ir_solve::ContinuousStructuralArtifacts::derived(
-        implicit,
-        algebraic_projection,
-        algebraic_invalidates_earlier,
-        manifold,
-        manifold_projection,
-        derive_optional_scalar_pattern(
-            &artifacts.continuous.full_jacobian_v,
-            problem.continuous.derivative_rhs.len()?,
-            full_columns,
-        )?,
-    )
-    .with_algebraic_output_evaluations(
-        &problem.continuous.algebraic_projection_plan,
-        &to_scalar_program_block(&problem.continuous.implicit_rhs)?,
-        &to_scalar_program_block(&artifacts.continuous.implicit_jacobian_v)?,
-        &artifacts.continuous.implicit_jacobian_v_scalar,
-    )
-    .with_manifold_output_evaluations(
-        &problem.continuous.manifold_projection_plan,
-        &to_scalar_program_block(&artifacts.continuous.manifold_jacobian_v)?,
-    )
-    .with_state_jacobian(
-        &problem.continuous.algebraic_projection_plan,
-        problem.solve_layout.state_scalar_count,
-        solver_columns,
-    )
-    .map_err(|error| from_pattern_error(error, None))?;
+    let continuous = if let Some(assignment) = assignment {
+        assignment
+    } else {
+        let implicit = derive_optional_compute_pattern(
+            &artifacts.continuous.implicit_jacobian_v,
+            problem.continuous.implicit_rhs.len()?,
+            solver_columns,
+        )?;
+        let manifold = derive_optional_compute_pattern(
+            &artifacts.continuous.manifold_jacobian_v,
+            problem.continuous.manifold_residual.len()?,
+            solver_columns,
+        )?;
+        let algebraic_projection = derive_y_projection_patterns(
+            implicit.as_ref(),
+            &problem.continuous.algebraic_projection_plan,
+        )?;
+        let algebraic_invalidates_earlier = derive_algebraic_reverse_invalidations(
+            implicit.as_ref(),
+            &problem.continuous.algebraic_projection_plan,
+        )?;
+        let manifold_projection = derive_y_projection_patterns(
+            manifold.as_ref(),
+            &problem.continuous.manifold_projection_plan,
+        )?;
+        rumoca_ir_solve::ContinuousStructuralArtifacts::derived(
+            implicit,
+            algebraic_projection,
+            algebraic_invalidates_earlier,
+            manifold,
+            manifold_projection,
+            derive_optional_scalar_pattern(
+                &artifacts.continuous.full_jacobian_v,
+                problem.continuous.derivative_rhs.len()?,
+                full_columns,
+            )?,
+        )
+        .with_algebraic_output_evaluations(
+            &problem.continuous.algebraic_projection_plan,
+            &to_scalar_program_block(&problem.continuous.implicit_rhs)?,
+            &to_scalar_program_block(&artifacts.continuous.implicit_jacobian_v)?,
+            &artifacts.continuous.implicit_jacobian_v_scalar,
+        )
+        .with_manifold_output_evaluations(
+            &problem.continuous.manifold_projection_plan,
+            &to_scalar_program_block(&artifacts.continuous.manifold_jacobian_v)?,
+        )
+        .with_state_jacobian(
+            &problem.continuous.algebraic_projection_plan,
+            problem.solve_layout.state_scalar_count,
+            solver_columns,
+        )
+        .map_err(|error| from_pattern_error(error, None))?
+    };
     let initialization_columns = solver_columns
         .checked_add(problem.layout.p_scalars())
         .ok_or_else(|| {
@@ -231,51 +272,6 @@ pub fn derive_solve_structural_artifacts(
     Ok((continuous, initialization))
 }
 
-fn derive_algebraic_reverse_invalidations(
-    source: Option<&StructuralPattern>,
-    plan: &rumoca_ir_solve::AlgebraicProjectionPlan,
-) -> Result<Vec<bool>, EvalSolveError> {
-    let Some(source) = source else {
-        return Ok(Vec::new());
-    };
-    let column_rows = source.column_rows();
-    let mut earlier_rows = vec![false; source.rows() as usize];
-    let mut invalidations = Vec::with_capacity(plan.blocks.len());
-    for block in &plan.blocks {
-        let invalidates =
-            block
-                .y_indices
-                .iter()
-                .copied()
-                .try_fold(false, |invalidates, column| {
-                    let affected_rows = column_rows.get(column).ok_or_else(|| {
-                        sparsity_error(
-                            format!(
-                                "projection invalidation column {column} is outside 0..{}",
-                                source.columns()
-                            ),
-                            Some(source.provenance().span()),
-                        )
-                    })?;
-                    Ok::<_, EvalSolveError>(
-                        invalidates || affected_rows.iter().any(|&row| earlier_rows[row]),
-                    )
-                })?;
-        invalidations.push(invalidates);
-        for &row in &block.rows {
-            let row_count = earlier_rows.len();
-            let Some(earlier) = earlier_rows.get_mut(row) else {
-                return Err(sparsity_error(
-                    format!("projection invalidation row {row} is outside 0..{row_count}"),
-                    Some(source.provenance().span()),
-                ));
-            };
-            *earlier = true;
-        }
-    }
-    Ok(invalidations)
-}
-
 fn derive_y_projection_patterns(
     source: Option<&StructuralPattern>,
     plan: &rumoca_ir_solve::AlgebraicProjectionPlan,
@@ -289,6 +285,7 @@ fn derive_y_projection_patterns(
     derive_projection_patterns(
         source,
         plan.blocks
+            .scalar_blocks()
             .iter()
             .map(|block| (block.rows.as_slice(), block.y_indices.clone())),
     )
@@ -489,8 +486,8 @@ mod tests {
         assert!(pattern.contains(0, 1));
         assert!(!pattern.contains(1, 1));
         let coloring = derive_column_coloring(&pattern);
-        assert_eq!(coloring.column_count(), 3);
-        assert_eq!(coloring.groups().len(), 1);
+        assert_eq!(coloring.coloring().column_count(), 3);
+        assert_eq!(coloring.coloring().groups().len(), 1);
     }
 
     #[test]
@@ -546,6 +543,7 @@ mod tests {
     fn affine_jvp_sparsity_stays_compact_and_exact() {
         let domain = StructuredIndexDomain {
             binders: vec![StructuredIndexBinder {
+                provenance: rumoca_core::IndexBinderProvenance::Generated,
                 id: 0,
                 display_name: "i".into(),
                 lower: 1,
@@ -585,5 +583,157 @@ mod tests {
         assert!(pattern.contains(99_999, 100_000));
         assert!(!pattern.contains(99_999, 99_999));
         assert_eq!(pattern.nonzero_upper_bound(), Some(100_000));
+    }
+
+    /// One scalar row summing the seeds `seeds` (at least one).
+    fn seed_sum(seeds: &[usize]) -> Vec<LinearOp> {
+        let mut program = vec![LinearOp::LoadSeed {
+            dst: 0,
+            index: seeds[0],
+        }];
+        let mut sum = 0;
+        for &seed in &seeds[1..] {
+            let load = sum + 1;
+            program.push(LinearOp::LoadSeed {
+                dst: load,
+                index: seed,
+            });
+            program.push(LinearOp::Binary {
+                dst: load + 1,
+                op: BinaryOp::Add,
+                lhs: sum,
+                rhs: load,
+            });
+            sum = load + 1;
+        }
+        program.push(LinearOp::StoreOutput { src: sum });
+        program
+    }
+
+    fn scalar_node(rows: &[&[usize]]) -> ComputeNode {
+        let programs = rows.iter().map(|seeds| seed_sum(seeds)).collect();
+        ComputeNode::ScalarPrograms(
+            ScalarProgramBlock::with_source_span(
+                programs,
+                span()
+                    .require_provenance("sparsity fixture")
+                    .expect("fixture span is source-backed"),
+            )
+            .expect("sparsity fixture is computable"),
+        )
+    }
+
+    fn affine_node(start: usize, upper: i64, seed: usize) -> ComputeNode {
+        let domain = StructuredIndexDomain {
+            binders: vec![StructuredIndexBinder {
+                provenance: rumoca_core::IndexBinderProvenance::Generated,
+                id: 0,
+                display_name: "i".into(),
+                lower: 1,
+                upper,
+                step: 1,
+            }],
+        };
+        ComputeNode::Map {
+            output_map: TensorOutputMap::dense_contiguous(start, &domain).unwrap(),
+            domain,
+            base_ops: vec![
+                LinearOp::LoadSeed {
+                    dst: 0,
+                    index: seed,
+                },
+                LinearOp::StoreOutput { src: 0 },
+            ],
+            load_strides: vec![AffineStencilLoadStride {
+                op_position: 0,
+                terms: vec![AffineStencilIndexStrideTerm {
+                    dimension: 0,
+                    stride: 1,
+                }],
+            }],
+            const_strides: Vec::new(),
+            metadata: TensorNodeMetadata::default(),
+            span: span(),
+        }
+    }
+
+    /// A block whose scalar rows and affine family rows share one owner stacks
+    /// the nodes' exact relations instead of claiming every row reads every
+    /// column, and agrees entry for entry with its scalar view.
+    #[test]
+    fn mixed_compact_jvp_stacks_exact_node_relations() {
+        let block = ComputeBlock {
+            nodes: vec![
+                scalar_node(&[&[0], &[0, 7]]),
+                affine_node(2, 4, 1),
+                scalar_node(&[&[6]]),
+            ],
+        };
+        let (rows, columns) = (7, 8);
+        let pattern = derive_jacobian_pattern_from_jvp(&block, rows, columns, span()).unwrap();
+        assert!(matches!(
+            pattern.view(),
+            StructuralPatternView::Stacked { segments: 3 }
+        ));
+        let scalar = derive_jacobian_pattern_from_scalar_jvp(
+            &to_scalar_program_block(&block).unwrap(),
+            rows,
+            columns,
+            span(),
+        )
+        .unwrap();
+        for row in 0..rows as u32 {
+            for column in 0..columns as u32 {
+                assert_eq!(
+                    pattern.contains(row, column),
+                    scalar.contains(row, column),
+                    "({row}, {column})"
+                );
+            }
+        }
+        assert_eq!(pattern.nonzero_coordinates(), scalar.nonzero_coordinates());
+        assert_eq!(pattern.column_rows(), scalar.column_rows());
+        assert_eq!(
+            pattern.clone().with_column_coloring().coloring(),
+            scalar.clone().with_column_coloring().coloring()
+        );
+        let replayed: StructuralPattern =
+            serde_json::from_str(&serde_json::to_string(&pattern).unwrap()).unwrap();
+        assert_eq!(replayed, pattern);
+    }
+
+    /// The affine segment of a stacked relation keeps its compact domain: a
+    /// family of 100000 rows beside one scalar row is never expanded.
+    #[test]
+    fn stacked_affine_segment_stays_compact() {
+        let block = ComputeBlock {
+            nodes: vec![scalar_node(&[&[0]]), affine_node(1, 100_000, 1)],
+        };
+        let pattern = derive_jacobian_pattern_from_jvp(&block, 100_001, 100_001, span()).unwrap();
+        assert!(matches!(
+            pattern.view(),
+            StructuralPatternView::Stacked { segments: 2 }
+        ));
+        assert!(pattern.contains(0, 0));
+        assert!(pattern.contains(100_000, 100_000));
+        assert!(!pattern.contains(100_000, 0));
+        assert_eq!(pattern.nonzero_upper_bound(), Some(100_001));
+    }
+
+    /// A decoded stacked relation whose segments claim one row twice is refused.
+    #[test]
+    fn stacked_replay_refuses_a_row_owned_twice() {
+        let block = ComputeBlock {
+            nodes: vec![scalar_node(&[&[0]]), affine_node(1, 3, 1)],
+        };
+        let pattern = derive_jacobian_pattern_from_jvp(&block, 4, 4, span()).unwrap();
+        let mut wire = serde_json::to_value(&pattern).unwrap();
+        let segments = wire["representation"]["stacked"]["segments"]
+            .as_array_mut()
+            .expect("stacked segments");
+        let first = segments[0].clone();
+        segments.push(first);
+        let error = serde_json::from_value::<StructuralPattern>(wire).unwrap_err();
+        assert!(error.to_string().contains("owned twice"), "{error}");
     }
 }

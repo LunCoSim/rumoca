@@ -1,19 +1,24 @@
 mod derived_wire;
+mod discrete_integer_quotients;
+mod discrete_value_selections;
 mod expression_children;
 mod external_functions;
-mod function_conditionals;
 mod function_derivatives;
 mod function_owners;
+mod function_quotients;
+mod function_regions;
 mod function_scopes;
 mod function_tensor_builtins;
 mod function_wire;
 mod linear_solve;
+mod model_conditionals;
 mod model_event_transactions;
 mod provenance;
 mod range_wire;
 mod runtime_owner_replay;
 mod runtime_owners;
 mod string_conversion;
+mod structured_quotients;
 mod temporal_wire;
 mod type_arena;
 mod wire_buffers;
@@ -291,6 +296,7 @@ fn every_expression_form_dae() -> Dae {
             domains.structured(
                 StructuredIndexDomain {
                     binders: vec![StructuredIndexBinder {
+                        provenance: rumoca_core::IndexBinderProvenance::Generated,
                         id: 0,
                         display_name: "i".to_string(),
                         lower: 1,
@@ -655,6 +661,7 @@ fn structured_families_derive_rows_and_preserve_multidimensional_domains() {
     let domain = StructuredIndexDomain {
         binders: vec![
             StructuredIndexBinder {
+                provenance: rumoca_core::IndexBinderProvenance::Generated,
                 id: 0,
                 display_name: "i".to_string(),
                 lower: 1,
@@ -662,6 +669,7 @@ fn structured_families_derive_rows_and_preserve_multidimensional_domains() {
                 step: 1,
             },
             StructuredIndexBinder {
+                provenance: rumoca_core::IndexBinderProvenance::Generated,
                 id: 1,
                 display_name: "j".to_string(),
                 lower: 1,
@@ -742,6 +750,7 @@ fn row_major_family_preserves_singleton_axes_with_equal_scalar_cardinality() {
             domains.structured(
                 StructuredIndexDomain {
                     binders: vec![StructuredIndexBinder {
+                        provenance: rumoca_core::IndexBinderProvenance::Generated,
                         id: 0,
                         display_name: "i".to_string(),
                         lower: 1,
@@ -848,6 +857,7 @@ fn binder_prefix_projection_compacts_nested_array_families() {
                 StructuredIndexDomain {
                     binders: vec![
                         StructuredIndexBinder {
+                            provenance: rumoca_core::IndexBinderProvenance::Generated,
                             id: 0,
                             display_name: "i".to_string(),
                             lower: 1,
@@ -855,6 +865,7 @@ fn binder_prefix_projection_compacts_nested_array_families() {
                             step: 1,
                         },
                         StructuredIndexBinder {
+                            provenance: rumoca_core::IndexBinderProvenance::Generated,
                             id: 1,
                             display_name: "j".to_string(),
                             lower: 1,
@@ -987,6 +998,7 @@ fn domain_binders_cannot_cross_domains_or_escape_structured_owners() {
     let dae = Dae::construct(source.map, |dae| {
         let domain = |id, display_name: &str| StructuredIndexDomain {
             binders: vec![StructuredIndexBinder {
+                provenance: rumoca_core::IndexBinderProvenance::Generated,
                 id,
                 display_name: display_name.to_string(),
                 lower: 1,
@@ -1068,6 +1080,7 @@ fn nested_comprehensions_retain_lexical_scope_provenance_and_wire_identity() {
     let sum_owner = source.source("i + j", 0);
     let singleton_domain = |name: &str, upper| StructuredIndexDomain {
         binders: vec![StructuredIndexBinder {
+            provenance: rumoca_core::IndexBinderProvenance::Generated,
             id: 0,
             display_name: name.to_string(),
             lower: 1,
@@ -1424,7 +1437,7 @@ fn assert_variable_role_round_trip(encoded: &str, discrete_action: DaeProvenance
             owner
                 .targets()
                 .iter()
-                .map(DiscreteValueId::index)
+                .map(DiscreteValueTarget::index)
                 .collect::<Vec<_>>(),
             [7]
         );
@@ -1601,4 +1614,62 @@ fn a_duplicate_variable_name_is_refused() {
         DaeConstructionError::DuplicateKey { kind: "variable", ref key, span }
             if key == "x" && span == second.span()
     ));
+}
+
+/// A walk nested in another walk's visitor must not size a stamp table to the
+/// arena again: a query from inside a visitor is the shape that made a
+/// multi-root query cost roots times arena.
+#[test]
+fn nested_expression_walks_reuse_their_stamp_tables() {
+    use crate::expr_query::STAMP_TABLE_GROWTHS;
+
+    let source = TestSource::new("1 + 1 + 1 + 1");
+    let at = source.source("1 + 1 + 1 + 1", 0);
+    let dae = Dae::construct(source.map, |dae| {
+        dae.expressions(|expressions| {
+            let mut sum = expressions.at(at).literal(DaeLiteral::Integer(1))?;
+            for _ in 0..64 {
+                let one = expressions.at(at).literal(DaeLiteral::Integer(1))?;
+                sum = expressions.at(at).binary(BinaryOperator::Add, sum, one)?;
+            }
+            Ok(())
+        })
+    })
+    .expect("expression construction succeeds");
+
+    dae.inspect(|view| {
+        let root = view
+            .expression_id(view.expression_count() - 1)
+            .expect("root");
+        let before = STAMP_TABLE_GROWTHS.with(std::cell::Cell::get);
+        let mut inner_visits = 0usize;
+        for _ in 0..50 {
+            walk_nested(view, root, 2, &mut inner_visits);
+        }
+        assert!(inner_visits > 0);
+        for _ in 0..50 {
+            let mut visits = 0usize;
+            ExpressionTraversal::new().visit_pruned(view, [root], |_, _| {
+                visits += 1;
+                true
+            });
+            assert!(visits > 0);
+        }
+        let growths = STAMP_TABLE_GROWTHS.with(std::cell::Cell::get) - before;
+        // One table per nesting depth, sized once; none per query.
+        assert!(growths <= 3, "stamp tables grew {growths} times");
+    });
+}
+
+/// Visit every node of `root`, starting a walk of `depth` further nested levels
+/// from each one.
+fn walk_nested<'dae>(view: DaeView<'dae>, root: ExprId<'dae>, depth: usize, visits: &mut usize) {
+    for_each_expression_pruned(view, root, |node, _| {
+        if depth == 0 {
+            *visits += 1;
+        } else {
+            walk_nested(view, node, depth - 1, visits);
+        }
+        true
+    });
 }

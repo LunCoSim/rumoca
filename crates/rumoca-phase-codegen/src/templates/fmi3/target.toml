@@ -33,7 +33,7 @@ parameter_initialization = true
 events = false
 static_assertions = true
 runtime_events = false
-clocks = false
+clocks = true
 dynamic_ranges = false
 dynamic_derivative_subscripts = false
 forward_ad = false
@@ -55,6 +55,7 @@ dtypes = ["f64"]
 [[files]]
 path = "modelDescription.xml"
 template = "modelDescription.xml.jinja"
+shared_as = "fmi3-modelDescription.xml.jinja"
 id = "fmu"
 
 [[files]]
@@ -119,3 +120,7 @@ name = "fmi-typed-tensors.jinja"
 [[partials]]
 template = "scalar_events.jinja"
 name = "fmi-scalar-events.jinja"
+
+[[partials]]
+template = "total_tangent.jinja"
+name = "fmi-total-tangent.jinja"

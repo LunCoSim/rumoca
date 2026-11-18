@@ -144,6 +144,11 @@ fn output_time_match_with_ulp(left: f64, right: f64) -> bool {
 }
 
 pub fn sample_time_match_with_tol(a: f64, b: f64) -> bool {
+    // An unbounded horizon coordinate scales the tolerance to infinity and
+    // would match every finite instant; only identical coordinates coincide.
+    if !a.is_finite() || !b.is_finite() {
+        return a == b;
+    }
     (a - b).abs() <= sample_time_tolerance(a, b)
 }
 
@@ -206,14 +211,6 @@ pub fn next_periodic_event_time(
     current_t: f64,
     target_t: f64,
 ) -> Option<f64> {
-    next_periodic_event_after(schedules, current_t, Some(target_t))
-}
-
-pub fn next_periodic_event_after(
-    schedules: &[solve::PeriodicEventSchedule],
-    current_t: f64,
-    target_t: Option<f64>,
-) -> Option<f64> {
     schedules
         .iter()
         .filter_map(|schedule| next_schedule_event_time(schedule, current_t, target_t))
@@ -223,7 +220,7 @@ pub fn next_periodic_event_after(
 fn next_schedule_event_time(
     schedule: &solve::PeriodicEventSchedule,
     current_t: f64,
-    target_t: Option<f64>,
+    target_t: f64,
 ) -> Option<f64> {
     let period = schedule.period_seconds();
     let phase = schedule.phase_seconds();
@@ -231,23 +228,19 @@ fn next_schedule_event_time(
         || !phase.is_finite()
         || period <= 0.0
         || !current_t.is_finite()
-        || target_t.is_some_and(|target| !target.is_finite())
+        || target_t.is_nan()
     {
         return None;
     }
     let mut tick = ((current_t - phase) / period).floor().max(0.0);
     for _ in 0..4 {
         let event_t = schedule_tick_time(schedule, tick);
-        if event_t.is_finite()
-            && event_t > current_t
-            && target_t.is_none_or(|target| event_time_in_window(event_t, current_t, target))
+        if event_time_in_window(event_t, current_t, target_t)
             && !sample_time_match_with_tol(event_t, current_t)
         {
             return Some(event_t);
         }
-        if target_t
-            .is_some_and(|target| event_t > target && !sample_time_match_with_tol(event_t, target))
-        {
+        if event_t > target_t && !sample_time_match_with_tol(event_t, target_t) {
             return None;
         }
         let tolerance = sample_time_tolerance(event_t, current_t);
@@ -311,8 +304,12 @@ pub fn periodic_schedule_matches_time(schedule: &solve::PeriodicEventSchedule, t
     if !period.is_finite() || !phase.is_finite() || period <= 0.0 || t + period < phase {
         return false;
     }
+    // The tick count is judged after rounding: a time a rounding error before
+    // the first tick (a step end `0.09 + 0.01 = 0.0999…`) lands at a count
+    // just below zero and still is that tick.
     let ticks = (t - phase) / period;
-    ticks >= 0.0 && sample_time_match_with_tol(ticks, ticks.round())
+    let tick = ticks.round();
+    tick >= 0.0 && sample_time_match_with_tol(ticks, tick)
 }
 
 pub fn scheduled_root_matches_time(root: &solve::ScheduledRootCondition, t: f64) -> bool {
@@ -478,6 +475,19 @@ mod tests {
             rumoca_core::ClockLattice::from_seconds(period, phase).unwrap(),
         )
         .unwrap()
+    }
+
+    /// A step end accumulated in floating point (`0.09 + 0.01`) lands a
+    /// rounding error before the first tick; it is still that tick.
+    #[test]
+    fn periodic_schedule_matches_a_first_tick_reached_from_below() {
+        let schedule = periodic(0.1, 0.1);
+        let end = 0.09_f64 + 0.01;
+        assert!(end < 0.1);
+        assert!(periodic_schedule_matches_time(&schedule, end));
+        assert!(periodic_schedule_matches_time(&schedule, 0.1));
+        assert!(!periodic_schedule_matches_time(&schedule, 0.05));
+        assert!(!periodic_schedule_matches_time(&schedule, 0.0));
     }
 
     #[test]
@@ -727,5 +737,31 @@ mod tests {
         assert!(sample_time_match_with_tol(events[1], 0.2));
         assert!(sample_time_match_with_tol(events[2], 0.3));
         assert!(sample_time_match_with_tol(events[3], 0.4));
+    }
+
+    #[test]
+    fn an_unbounded_horizon_still_announces_the_next_exact_tick() {
+        let schedules = [periodic(0.01, 0.0)];
+
+        let next = next_periodic_event_time(&schedules, 1.0, f64::INFINITY)
+            .expect("a periodic clock has a next tick at any time");
+
+        assert_eq!(next, 1.01);
+        let late = next_periodic_event_time(&schedules, 1.0e6, f64::INFINITY)
+            .expect("a periodic clock has a next tick at any time");
+        assert!(late > 1.0e6 && late - 1.0e6 <= 0.01 + 1.0e-9);
+    }
+
+    #[test]
+    fn an_infinite_coordinate_matches_only_itself() {
+        assert!(!sample_time_match_with_tol(1.0, f64::INFINITY));
+        assert!(!sample_time_match_with_tol(f64::INFINITY, 1.0));
+        assert!(sample_time_match_with_tol(f64::INFINITY, f64::INFINITY));
+        assert!(!scheduled_time_in_horizon(
+            f64::INFINITY,
+            0.0,
+            f64::INFINITY
+        ));
+        assert!(scheduled_time_in_horizon(5.0, 0.0, f64::INFINITY));
     }
 }

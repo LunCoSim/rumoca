@@ -4,7 +4,7 @@ mod isolated_value;
 mod tensor_affine;
 
 pub use isolated_value::{
-    IsolatedDivisor, IsolatedTerm, IsolatedValue, eval_isolated_value, register_coefficient,
+    IsolatedDivisor, IsolatedTerm, IsolatedTerms, IsolatedValue, isolated_parts,
 };
 
 /// Append the selected assignment to an already materialized source prefix at
@@ -14,33 +14,85 @@ pub fn materialize_target_assignment(
     shape: &TargetAssignmentShape,
     operations: &mut Vec<LinearOp>,
 ) -> Option<(u32, Option<u32>)> {
-    let mut builder = ExactAssignmentProgramBuilder::new(operations)?;
-    let (result, coefficient) = builder.materialize(shape)?;
-    let guarded = match coefficient {
-        Some(coefficient) => builder.poison_non_finite(result, coefficient)?,
-        None => result,
-    };
-    Some((guarded, coefficient))
+    ExactAssignmentProgramBuilder::new(operations)?.materialize_guarded(shape)
 }
 
-struct ExactAssignmentProgramBuilder<'a> {
+/// One program that assignments are appended to.
+///
+/// The first unused register is computed once, when the builder takes the
+/// program, and every later operation goes through the builder, so appending
+/// n assignments costs n appends and not n scans of the program.
+pub struct ExactAssignmentProgramBuilder<'a> {
     operations: &'a mut Vec<LinearOp>,
     next_register: u32,
+    sources: Option<std::collections::BTreeMap<u32, usize>>,
 }
 
 impl<'a> ExactAssignmentProgramBuilder<'a> {
+    /// Append the selected assignment as [`materialize_target_assignment`]
+    /// does, after the operations already in the program.
+    pub fn materialize_guarded(
+        &mut self,
+        shape: &TargetAssignmentShape,
+    ) -> Option<(u32, Option<u32>)> {
+        let (result, coefficient) = self.materialize(shape)?;
+        let guarded = match coefficient {
+            Some(coefficient) => self.poison_non_finite(result, coefficient)?,
+            None => result,
+        };
+        Some((guarded, coefficient))
+    }
+
+    /// Append one operation of the source program, reserving the registers it
+    /// defines.
+    pub fn push(&mut self, operation: LinearOp) -> Option<()> {
+        if let Some(start) = operation.dst_register() {
+            let count = u32::try_from(operation.dst_register_count()).ok()?;
+            self.next_register = self.next_register.max(start.checked_add(count)?);
+        }
+        self.append(operation);
+        Some(())
+    }
+
+    /// Store a checked native value progression. A repeated scalar value is
+    /// one TensorFill, so the canonical store keeps its nonzero stride.
+    pub(super) fn push_range_output(
+        &mut self,
+        start: u32,
+        count: usize,
+        stride: usize,
+    ) -> Option<()> {
+        let (start, stride) = if stride == 0 {
+            let dst_start = self.allocate_range(count)?;
+            self.push(LinearOp::TensorFill {
+                dst_start,
+                value_start: start,
+                count,
+                lanes: 1,
+            })?;
+            (dst_start, 1)
+        } else {
+            (start, stride)
+        };
+        self.push(LinearOp::StoreOutputRange {
+            start,
+            count,
+            stride,
+        })
+    }
+
     // Finite coefficients contribute exactly +0, preserving the value's bits;
     // an infinite/NaN coefficient makes every materialized consumer decline.
     fn poison_non_finite(&mut self, value: u32, coefficient: u32) -> Option<u32> {
         let gap = self.allocate()?;
         let result = self.allocate()?;
-        self.operations.push(LinearOp::Binary {
+        self.append(LinearOp::Binary {
             dst: gap,
             op: BinaryOp::Sub,
             lhs: coefficient,
             rhs: coefficient,
         });
-        self.operations.push(LinearOp::Binary {
+        self.append(LinearOp::Binary {
             dst: result,
             op: BinaryOp::Sub,
             lhs: value,
@@ -49,7 +101,7 @@ impl<'a> ExactAssignmentProgramBuilder<'a> {
         Some(result)
     }
 
-    fn new(operations: &'a mut Vec<LinearOp>) -> Option<Self> {
+    pub fn new(operations: &'a mut Vec<LinearOp>) -> Option<Self> {
         let next_register = operations.iter().try_fold(0, |next, operation| {
             let Some(start) = operation.dst_register() else {
                 return Some(next);
@@ -60,14 +112,39 @@ impl<'a> ExactAssignmentProgramBuilder<'a> {
         Some(Self {
             operations,
             next_register,
+            sources: None,
         })
+    }
+
+    fn append(&mut self, operation: LinearOp) {
+        if let Some(sources) = &mut self.sources
+            && let Some(register) = operation.dst_register()
+        {
+            sources.insert(register, self.operations.len());
+        }
+        self.operations.push(operation);
+    }
+
+    fn source_position(&mut self, register: u32) -> Option<usize> {
+        let sources = self.sources.get_or_insert_with(|| {
+            self.operations
+                .iter()
+                .enumerate()
+                .filter_map(|(position, operation)| {
+                    operation
+                        .dst_register()
+                        .map(|register| (register, position))
+                })
+                .collect()
+        });
+        sources.get(&register).copied()
     }
 
     fn materialize(&mut self, shape: &TargetAssignmentShape) -> Option<(u32, Option<u32>)> {
         match shape {
             TargetAssignmentShape::Zero { .. } => {
                 let dst = self.allocate()?;
-                self.operations.push(LinearOp::Const { dst, value: 0.0 });
+                self.append(LinearOp::Const { dst, value: 0.0 });
                 Some((dst, None))
             }
             TargetAssignmentShape::Direct { expr_reg, .. } => Some((*expr_reg, None)),
@@ -81,6 +158,9 @@ impl<'a> ExactAssignmentProgramBuilder<'a> {
             }
             TargetAssignmentShape::Additive { .. } => {
                 self.isolated(&IsolatedValue::of(shape)?, false)
+            }
+            TargetAssignmentShape::Reciprocal { .. } => {
+                self.isolated(&IsolatedValue::of(shape)?, true)
             }
             TargetAssignmentShape::TensorAffine { projection, .. } => {
                 let (offset, coefficient) = self.tensor_affine(projection)?;
@@ -96,7 +176,7 @@ impl<'a> ExactAssignmentProgramBuilder<'a> {
         }
     }
 
-    /// Emit `value` in the op order [`IsolatedValue::eval`] follows. A
+    /// Emit `value` in the op order of its terms, then its divisor. A
     /// `guarded` value returns its coefficient register for the non-finite
     /// poison guard (a constant one included when it is singular).
     fn isolated(&mut self, value: &IsolatedValue, guarded: bool) -> Option<(u32, Option<u32>)> {
@@ -157,13 +237,13 @@ impl<'a> ExactAssignmentProgramBuilder<'a> {
 
     fn constant(&mut self, value: f64) -> Option<u32> {
         let dst = self.allocate()?;
-        self.operations.push(LinearOp::Const { dst, value });
+        self.append(LinearOp::Const { dst, value });
         Some(dst)
     }
 
     fn negate(&mut self, arg: u32) -> Option<u32> {
         let dst = self.allocate()?;
-        self.operations.push(LinearOp::Unary {
+        self.append(LinearOp::Unary {
             dst,
             op: UnaryOp::Neg,
             arg,
@@ -173,7 +253,7 @@ impl<'a> ExactAssignmentProgramBuilder<'a> {
 
     fn binary(&mut self, op: BinaryOp, lhs: u32, rhs: u32) -> Option<u32> {
         let dst = self.allocate()?;
-        self.operations.push(LinearOp::Binary { dst, op, lhs, rhs });
+        self.append(LinearOp::Binary { dst, op, lhs, rhs });
         Some(dst)
     }
 

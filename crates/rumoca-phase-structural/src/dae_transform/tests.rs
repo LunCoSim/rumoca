@@ -1,8 +1,10 @@
 mod alternative_definitions;
 mod defining_equations;
+mod demoted_derivative_scope;
 mod demotion_bounds;
 mod demotion_owners;
 mod derivative_chains;
+mod discrete_owner_replay;
 mod equalities;
 mod forwarding_equalities;
 mod function_zeros;
@@ -13,6 +15,9 @@ mod initial_values;
 mod invariant_balances;
 mod lift_owners;
 mod manifold_fields;
+mod materialized_witnesses;
+mod model_conditionals;
+mod nested_scoped_functions;
 mod projected_initial_pins;
 mod rate_values;
 mod reconstruction_failures;
@@ -20,8 +25,10 @@ mod reduction_observation;
 mod runtime_quotients;
 mod scalar_auxiliary_blocks;
 mod scalar_state_offsets;
+mod scoped_functions;
 mod shared_differentiation;
 mod state_invariant_balances;
+mod structured_quotients;
 mod tensor_linear_map;
 mod tensor_state_blocks;
 mod value_identities;
@@ -157,6 +164,7 @@ fn fixture_domain<'dae>(
                 domains.structured(
                     rumoca_core::StructuredIndexDomain {
                         binders: vec![rumoca_core::StructuredIndexBinder {
+                            provenance: rumoca_core::IndexBinderProvenance::Generated,
                             id: 0,
                             display_name: "i".to_owned(),
                             lower: 1,

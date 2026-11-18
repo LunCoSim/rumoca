@@ -153,6 +153,7 @@ fn test_equation_visitor_collect_connects() {
 
     let equations = vec![
         Equation::Connect {
+            annotation: Vec::new(),
             lhs: make_comp_ref("a"),
             rhs: make_comp_ref("b"),
         },
@@ -161,6 +162,7 @@ fn test_equation_visitor_collect_connects() {
             rhs: make_int(1),
         },
         Equation::Connect {
+            annotation: Vec::new(),
             lhs: make_comp_ref("c"),
             rhs: make_comp_ref("d"),
         },
@@ -192,6 +194,7 @@ fn test_early_termination() {
 
     let eq = Equation::For {
         indices: vec![ForIndex {
+            binder: None,
             ident: Token {
                 text: std::sync::Arc::from("i"),
                 ..Default::default()
@@ -200,10 +203,12 @@ fn test_early_termination() {
         }],
         equations: vec![
             Equation::Connect {
+                annotation: Vec::new(),
                 lhs: make_comp_ref("first"),
                 rhs: make_comp_ref("a"),
             },
             Equation::Connect {
+                annotation: Vec::new(),
                 lhs: make_comp_ref("second"),
                 rhs: make_comp_ref("b"),
             },

@@ -149,22 +149,14 @@ pub(super) fn checked_dae_has_input_scalars(dae: &Dae) -> bool {
 }
 
 pub(super) const STAGE_WATCHDOG_LOG_INTERVAL_SECS: u64 = 15;
-/// Default parent-watchdog budget for each compiler phase of one model attempt.
+/// Focused parent-watchdog floor for each compiler phase of one model attempt.
 ///
 /// A model gets exactly one attempt. Exceeding this budget is a stable harness
 /// failure, not a reason to re-run the compiler with different limits.
 pub(super) const MODEL_ATTEMPT_TIMEOUT_SECS: f64 = 10.0;
 
 pub(super) fn model_attempt_timeout_secs() -> f64 {
-    // Raise-only: a config may extend the budget for a long-running diagnostic
-    // lane, but must never shorten it below the value the committed baseline
-    // was measured with.
-    parity_config()
-        .model_attempt_timeout_secs
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map_or(MODEL_ATTEMPT_TIMEOUT_SECS, |value| {
-            value.max(MODEL_ATTEMPT_TIMEOUT_SECS)
-        })
+    parity_config().wall_budgets().0
 }
 
 pub(super) struct StageAbortWatchdog {
@@ -496,21 +488,61 @@ struct MslSummary {
     tensor_report_errors: usize,
 }
 
+/// The checked-out commit the run measured. A prebuilt test binary carries the
+/// manifest directory of its build sandbox, which is not a checkout, so the
+/// working directory the harness runs it from is consulted next.
 fn current_git_commit() -> String {
-    let output = Command::new("git")
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    first_git_commit(
+        [Some(manifest_dir), std::env::current_dir().ok()]
+            .into_iter()
+            .flatten(),
+    )
+}
+
+fn first_git_commit(dirs: impl IntoIterator<Item = PathBuf>) -> String {
+    dirs.into_iter()
+        .find_map(|dir| git_head_commit(&dir))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn git_head_commit(dir: &Path) -> Option<String> {
+    let out = Command::new("git")
         .args(["rev-parse", "HEAD"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output();
-    match output {
-        Ok(out) if out.status.success() => {
-            let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if commit.is_empty() {
-                "unknown".to_string()
-            } else {
-                commit
-            }
-        }
-        _ => "unknown".to_string(),
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !commit.is_empty()).then_some(commit)
+}
+
+#[cfg(test)]
+mod git_commit_tests {
+    use super::*;
+
+    #[test]
+    fn a_build_directory_outside_any_checkout_falls_through_to_the_run_directory() {
+        // The run directory is a checkout of its own, so the test holds in a
+        // source snapshot that is not one (the local gate's archive).
+        let sandbox = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-c", "user.name=run", "-c", "user.email=run@localhost"])
+                .args(args)
+                .current_dir(checkout.path())
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "run"]);
+        let commit =
+            first_git_commit([sandbox.path().to_path_buf(), checkout.path().to_path_buf()]);
+        assert_eq!(commit.len(), 40, "{commit}");
+        assert!(commit.chars().all(|c| c.is_ascii_hexdigit()), "{commit}");
+        assert_eq!(first_git_commit([sandbox.path().to_path_buf()]), "unknown");
     }
 }
 

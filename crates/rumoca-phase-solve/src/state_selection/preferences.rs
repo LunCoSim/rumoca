@@ -25,7 +25,7 @@ use rumoca_phase_structural::{
 };
 
 use super::{
-    AlternateSelections, PreparedSelection, basis_names, prepare_alternate_charts,
+    AlternateSelections, PreparedSelection, basis_names, candidate_basis, prepare_alternate_charts,
     quotient_formal_candidate, select,
 };
 
@@ -34,6 +34,7 @@ pub(super) fn prefer_or_retain<'source>(
     model: &'source dae::Dae,
     prepared: PreparedDae<'source>,
     overrides: &HashMap<String, f64>,
+    input_policy: dae::InputInitializationPolicy,
 ) -> Result<PreparedSelection<'source>, StructuralError> {
     let Some(request) = PreferenceRequest::of(model, &prepared) else {
         return Ok(PreparedSelection::retained(prepared));
@@ -46,16 +47,15 @@ pub(super) fn prefer_or_retain<'source>(
         return Ok(PreparedSelection::retained(prepared));
     }
     let mut alternate_selections = AlternateSelections::default();
-    let mut basis = Vec::new();
     let candidate = match formal.construct_state_candidate_with_charts(|formal| {
-        let (selection, alternates, primary) = select(formal, overrides)?;
+        let (selection, alternates, _) = select(formal, overrides, input_policy)?;
         alternate_selections = alternates;
-        basis = basis_names(formal.source, &primary);
         Ok(selection)
     }) {
         Ok(candidate) => candidate,
         Err(error) => return request.refused(prepared, error),
     };
+    let basis = candidate_basis(&candidate)?;
     if !prepared
         .as_dae()
         .inspect(|view| ranks_above(model, &basis, view))
@@ -69,7 +69,6 @@ pub(super) fn prefer_or_retain<'source>(
         alternates,
         exchanges: alternate_selections.exchanges,
         formal_aliases,
-        basis: Some(basis),
         withheld_preferences: None,
     })
 }
@@ -89,8 +88,12 @@ pub(super) fn executes_preferred_basis(
             return Ok(None);
         }
         formal.inspect(|formal| {
-            select(formal, &HashMap::new())
-                .map(|(_, _, primary)| Some(basis_names(formal.source, &primary)))
+            select(
+                formal,
+                &HashMap::new(),
+                dae::InputInitializationPolicy::default(),
+            )
+            .map(|(_, _, primary)| Some(basis_names(formal.source, &primary)))
         })
     });
     match selected {

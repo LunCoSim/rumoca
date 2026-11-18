@@ -2,12 +2,13 @@ use rumoca_ir_dae as dae;
 use rumoca_ir_solve as solve;
 
 use crate::LowerError;
-use crate::lower::clock_ownership::expression_clock_owner;
+use crate::lower::clock_ownership::relation_clock_owner;
 
 /// Current relation truth, independent of condition-edge history and B.1c targets.
 pub(crate) struct BufferedRelations<'dae> {
     by_relation: Vec<Option<usize>>,
     by_expression: Vec<Option<usize>>,
+    root_ordinals: Vec<Option<usize>>,
     parameters: std::ops::Range<usize>,
     owner: std::marker::PhantomData<&'dae mut &'dae ()>,
 }
@@ -20,13 +21,15 @@ impl<'dae> BufferedRelations<'dae> {
         }
         let mut by_relation = vec![None; view.relation_count()];
         let mut by_expression = vec![None; view.expression_count()];
+        let mut root_ordinals = vec![None; view.root_count()];
+        let mut selected_roots = 0;
         let mut next = base;
-        for (_, root) in view.roots() {
+        for (id, root) in view.roots() {
             let relation = view
                 .relation(root.relation())
                 .expect("checked root relation");
             let expression = relation.expression();
-            if expression_clock_owner(view, expression, |variable| {
+            if relation_clock_owner(view, expression, |variable| {
                 variable_clocks[variable.index() as usize]
             })
             .is_some()
@@ -41,10 +44,13 @@ impl<'dae> BufferedRelations<'dae> {
                 slot
             };
             by_relation[root.relation().index() as usize] = Some(slot);
+            root_ordinals[id.index() as usize] = Some(selected_roots);
+            selected_roots += 1;
         }
         Ok(Self {
             by_relation,
             by_expression,
+            root_ordinals,
             parameters: base..next,
             owner: std::marker::PhantomData,
         })
@@ -67,6 +73,20 @@ impl<'dae> BufferedRelations<'dae> {
 
     pub(super) fn parameter_indices(&self) -> Vec<usize> {
         self.parameters.clone().collect()
+    }
+
+    pub(crate) fn root_ordinal(&self, root: dae::RootId<'dae>) -> Option<usize> {
+        self.root_ordinals
+            .get(root.index() as usize)
+            .copied()
+            .flatten()
+    }
+
+    pub(crate) fn continuous_root_count(&self) -> usize {
+        self.root_ordinals
+            .iter()
+            .filter(|ordinal| ordinal.is_some())
+            .count()
     }
 
     pub(super) const fn end(&self) -> usize {

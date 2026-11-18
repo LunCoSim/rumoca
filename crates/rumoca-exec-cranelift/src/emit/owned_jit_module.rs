@@ -2,28 +2,53 @@ use std::ops::{Deref, DerefMut};
 
 use cranelift_codegen::ir;
 use cranelift_jit::JITModule;
-use cranelift_module::{DataId, FuncId, Module};
+use cranelift_module::{FuncId, Module};
 
-/// Sole owner of one Cranelift code and data arena.
+use super::register_allocation::QueuedFunctions;
+use super::{CompileError, define_queued_functions};
+
+/// Sole owner of one Cranelift executable-memory arena.
 ///
 /// `JITModule` intentionally does not release code memory from `Drop`; its
 /// unsafe consuming `free_memory` operation must be called after every
 /// function pointer into the module has become unreachable. Compiled Rumoca
 /// owners keep this field last, so their pointer metadata and attached call
 /// tables are dropped before this guard releases the arena.
-pub(super) struct OwnedJitModule(Option<JITModule>);
+///
+/// It also holds the functions built for the module but not yet compiled;
+/// [`super::finalize_jit_module`] defines them before finalizing.
+pub(super) struct OwnedJitModule {
+    module: Option<JITModule>,
+    queued: QueuedFunctions,
+}
 
 impl OwnedJitModule {
     pub(super) fn new(module: JITModule) -> Self {
-        Self(Some(module))
+        Self {
+            module: Some(module),
+            queued: QueuedFunctions::default(),
+        }
     }
 
-    pub(super) fn define_function(
+    /// Queue `function`, built in `context`, to compile with the module's
+    /// other functions; `context` is left empty for the next function. A
+    /// round compiled here is guarded as finalization's is.
+    pub(super) fn queue_function(
         &mut self,
-        id: FuncId,
+        function: FuncId,
         context: &mut cranelift_codegen::Context,
-    ) -> Result<(), Box<cranelift_module::ModuleError>> {
-        crate::native_code_cache::define_function(self, id, context)
+    ) -> Result<(), CompileError> {
+        let fresh = self.make_context();
+        if self.queued.push(function, context, fresh) {
+            define_queued_functions(self)?;
+        }
+        Ok(())
+    }
+
+    /// Compile and define every queued function, in queue order.
+    pub(super) fn define_queued(&mut self) -> Result<(), String> {
+        let module = self.module.as_mut().expect("owned JIT module is present");
+        self.queued.define_into(module)
     }
 }
 
@@ -52,41 +77,23 @@ pub(super) fn declare_far_call_in_func(
     callee
 }
 
-/// Materialize a module-owned data address without assuming that writable
-/// storage is near executable code. Cached code keeps the symbolic relocation;
-/// the current JIT module supplies the data allocation when it is finalized.
-pub(super) fn declare_far_data_in_func(
-    module: &JITModule,
-    data_id: DataId,
-    func: &mut ir::Function,
-) -> Result<ir::GlobalValue, crate::CompileError> {
-    let data = module.declare_data_in_func(data_id, func);
-    let ir::GlobalValueData::Symbol { colocated, .. } = &mut func.global_values[data] else {
-        return Err(crate::CompileError::Backend(
-            "JIT data declaration did not issue a symbolic address".into(),
-        ));
-    };
-    *colocated = false;
-    Ok(data)
-}
-
 impl Deref for OwnedJitModule {
     type Target = JITModule;
 
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().expect("owned JIT module is present")
+        self.module.as_ref().expect("owned JIT module is present")
     }
 }
 
 impl DerefMut for OwnedJitModule {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut().expect("owned JIT module is present")
+        self.module.as_mut().expect("owned JIT module is present")
     }
 }
 
 impl Drop for OwnedJitModule {
     fn drop(&mut self) {
-        let Some(module) = self.0.take() else {
+        let Some(module) = self.module.take() else {
             return;
         };
         // SAFETY: the guard is the last field of every compiled owner. Dropping
@@ -103,9 +110,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use cranelift_jit::{BranchProtection, JITBuilder, JITMemoryProvider, JITModule};
-    use cranelift_module::ModuleResult;
+
+    use cranelift_codegen::ir::{AbiParam, InstBuilder, types};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use cranelift_module::{Linkage, Module, ModuleResult};
 
     use super::OwnedJitModule;
+    use crate::emit::CompileError;
+    use crate::emit::register_allocation::QUEUE_ROUND;
 
     struct CountingMemory {
         frees: Arc<AtomicUsize>,
@@ -113,7 +125,7 @@ mod tests {
 
     impl JITMemoryProvider for CountingMemory {
         fn allocate_readexec(&mut self, _size: usize, _align: u64) -> io::Result<*mut u8> {
-            unreachable!("the ownership test does not compile code")
+            panic!("these tests provide no code memory")
         }
 
         fn allocate_readwrite(&mut self, _size: usize, _align: u64) -> io::Result<*mut u8> {
@@ -141,54 +153,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cross-isa-tests")]
-    fn far_data_addresses_use_full_width_relocations_on_x86_and_arm64() {
-        use cranelift_codegen::{
-            Context,
-            ir::{AbiParam, InstBuilder, Signature},
-            isa,
-        };
-        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-        use cranelift_module::Module;
-
-        let mut module = guarded_module(Arc::new(AtomicUsize::new(0)));
-        let data = module.declare_anonymous_data(true, false).unwrap();
-        for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
-            let isa = isa::lookup(triple.parse().unwrap())
-                .unwrap()
-                .finish(module.isa().flags().clone())
-                .unwrap();
-            let pointer_type = isa.frontend_config().pointer_type();
-            let mut context = Context::new();
-            context.func.signature = Signature::new(isa.default_call_conv());
-            context
-                .func
-                .signature
-                .returns
-                .push(AbiParam::new(pointer_type));
-            let mut frontend = FunctionBuilderContext::new();
-            let mut builder = FunctionBuilder::new(&mut context.func, &mut frontend);
-            let entry = builder.create_block();
-            builder.switch_to_block(entry);
-            builder.seal_block(entry);
-            let data = super::declare_far_data_in_func(&module, data, builder.func).unwrap();
-            let address = builder.ins().global_value(pointer_type, data);
-            builder.ins().return_(&[address]);
-            builder.finalize();
-            let code = context
-                .compile(isa.as_ref(), &mut Default::default())
-                .unwrap();
-            let relocations = code.buffer.relocs();
-            assert_eq!(relocations.len(), 1, "{triple}");
-            assert_eq!(
-                relocations[0].kind,
-                cranelift_codegen::binemit::Reloc::Abs8,
-                "{triple}"
-            );
-        }
-    }
-
-    #[test]
     fn each_independent_owner_releases_exactly_its_own_arena() {
         let frees = Arc::new(AtomicUsize::new(0));
         let first = guarded_module(frees.clone());
@@ -198,5 +162,53 @@ mod tests {
         assert_eq!(frees.load(Ordering::SeqCst), 1);
         drop(second);
         assert_eq!(frees.load(Ordering::SeqCst), 2);
+    }
+
+    /// Queue a function `() -> i64` returning 0 in `module`.
+    fn queue_zero(module: &mut OwnedJitModule, index: usize) -> Result<(), CompileError> {
+        let mut context = module.make_context();
+        context
+            .func
+            .signature
+            .returns
+            .push(AbiParam::new(types::I64));
+        let function = module
+            .declare_function(
+                &format!("zero_{index}"),
+                Linkage::Local,
+                &context.func.signature,
+            )
+            .expect("declare zero function");
+        let mut frontend = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut context.func, &mut frontend);
+        let entry = builder.create_block();
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder.ins().return_(&[zero]);
+        builder.finalize();
+        module.queue_function(function, &mut context)
+    }
+
+    #[test]
+    fn a_panic_defining_a_queued_round_is_an_error_on_both_paths() {
+        // The code allocator panics, as a defect below the queue might.
+        let mut early = guarded_module(Arc::new(AtomicUsize::new(0)));
+        let results = (0..QUEUE_ROUND)
+            .map(|index| queue_zero(&mut early, index))
+            .collect::<Vec<_>>();
+        assert!(results[..QUEUE_ROUND - 1].iter().all(Result::is_ok));
+        assert!(
+            matches!(results[QUEUE_ROUND - 1], Err(CompileError::Backend(_))),
+            "{:?}",
+            results[QUEUE_ROUND - 1]
+        );
+
+        let mut tail = guarded_module(Arc::new(AtomicUsize::new(0)));
+        queue_zero(&mut tail, 0).expect("one function waits in the queue");
+        assert!(matches!(
+            crate::emit::finalize_jit_module(&mut tail),
+            Err(CompileError::Backend(_))
+        ));
     }
 }

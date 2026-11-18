@@ -7,7 +7,9 @@
 //! event-indicator inventory exposes exactly the searched rows, and generated
 //! code renders the same split. No executor classifies roots itself.
 
-use std::collections::BTreeSet;
+use crate::IndexIntervals;
+
+use std::ops::Range;
 
 use crate::{BinaryOp, LinearOp, Reg, ScalarProgramBlock, SolveProblem, StructuralPattern};
 
@@ -61,9 +63,12 @@ impl RootSearchPlan {
             .root()
             .static_causal_rows()
             .iter()
-            .map(|row| row.target_index())
-            .collect::<BTreeSet<_>>();
-        let roles = classify_block(roots, &static_y)
+            .map(|row| row.target_index());
+        let static_y = IndexIntervals::of(static_y);
+        let layout = &problem.solve_layout;
+        let inputs =
+            layout.parameter_count..layout.parameter_count + layout.input_scalar_names.len();
+        let roles = classify_block(roots, &static_y, &inputs)
             .unwrap_or_else(|| vec![RootSearchRole::Search; roots.output_count()]);
         Self {
             roles: roles.into_boxed_slice(),
@@ -100,18 +105,18 @@ pub fn root_neighborhoods(
 ) -> Result<Vec<Vec<usize>>, crate::StructuralPatternError> {
     let mut reads = Vec::new();
     for program in roots.programs() {
-        reads.extend(StructuralPattern::derive_output_y_dependencies(
+        reads.extend(StructuralPattern::derive_output_y_dependency_ranges(
             program, None,
         )?);
     }
     Ok(reads
         .iter()
         .enumerate()
-        .map(|(this, read): (usize, &BTreeSet<usize>)| {
+        .map(|(this, read): (usize, &std::sync::Arc<IndexIntervals>)| {
             reads
                 .iter()
                 .enumerate()
-                .filter(|(index, other)| *index == this || !read.is_disjoint(other))
+                .filter(|(index, other)| *index == this || !read.intersection(other).is_empty())
                 .map(|(index, _)| index)
                 .collect()
         })
@@ -120,7 +125,8 @@ pub fn root_neighborhoods(
 
 fn classify_block(
     roots: &ScalarProgramBlock,
-    static_y: &BTreeSet<usize>,
+    static_y: &IndexIntervals,
+    inputs: &Range<usize>,
 ) -> Option<Vec<RootSearchRole>> {
     if !roots.uses_local_contiguous_output_indices() {
         return None;
@@ -132,10 +138,10 @@ fn classify_block(
             return None;
         }
         let role = if output_count == 1
-            && let Some((param_index, sign)) = direct_time_root(row)
+            && let Some((param_index, sign)) = direct_time_root(row, inputs)
         {
             RootSearchRole::AnnouncedTime { param_index, sign }
-        } else if static_root(row, static_y) {
+        } else if static_root(row, static_y, inputs) {
             RootSearchRole::Static
         } else {
             RootSearchRole::Search
@@ -145,7 +151,7 @@ fn classify_block(
     (roles.len() == roots.output_count()).then_some(roles)
 }
 
-fn direct_time_root(row: &[LinearOp]) -> Option<(usize, TimeRootSign)> {
+fn direct_time_root(row: &[LinearOp], inputs: &Range<usize>) -> Option<(usize, TimeRootSign)> {
     let [
         first_load,
         second_load,
@@ -164,6 +170,12 @@ fn direct_time_root(row: &[LinearOp]) -> Option<(usize, TimeRootSign)> {
         return None;
     }
     let (time_reg, param_reg, param_index) = time_and_param_loads(first_load, second_load)?;
+    // External inputs occupy P slots too, but their crossings are not a
+    // parameter-owned announced deadline. Keep their time relations in the
+    // continuous search set even when no importer input write occurs.
+    if inputs.contains(&param_index) {
+        return None;
+    }
     if *lhs == param_reg && *rhs == time_reg {
         return Some((param_index, TimeRootSign::ParamMinusTime));
     }
@@ -193,13 +205,17 @@ fn time_and_param_loads(first: &LinearOp, second: &LinearOp) -> Option<(Reg, Reg
     }
 }
 
-/// Every P slot is fixed during one accepted interval; inputs and discrete
-/// values change only between intervals, where the host refreshes indicators
-/// before search resumes. A row reading only those, statically fixed `Y`
-/// coordinates, and no time, seed, or effect keeps its Event Mode value but
-/// offers no surface to the continuous root finder.
-fn static_root(row: &[LinearOp], static_y: &BTreeSet<usize>) -> bool {
-    let Ok(y_dependencies) = StructuralPattern::derive_output_y_dependencies(row, None) else {
+/// Every P slot but an external input is fixed during one accepted interval, as
+/// is a statically fixed `Y` coordinate: a declared parameter never changes,
+/// and a discrete value, a `pre` slot, a condition memory, or a clock lane
+/// changes only at an event, where the host refreshes the indicators. An
+/// external input is not: the importer changes it between calls, and a
+/// relation that reads one must be searched like a relation of a state
+/// (`inputs` is the range of input slots). A row reading only fixed values,
+/// and no time, seed, or effect, keeps its Event Mode value but offers no
+/// surface to the continuous root finder.
+fn static_root(row: &[LinearOp], static_y: &IndexIntervals, inputs: &Range<usize>) -> bool {
+    let Ok(y_dependencies) = StructuralPattern::derive_output_y_dependency_ranges(row, None) else {
         return false;
     };
     if y_dependencies
@@ -208,16 +224,18 @@ fn static_root(row: &[LinearOp], static_y: &BTreeSet<usize>) -> bool {
     {
         return false;
     }
-    StructuralPattern::derive_output_p_dependencies(row, None).is_ok()
-        && none_depend(StructuralPattern::derive_output_time_dependencies(
-            row, None,
-        ))
-        && none_depend(StructuralPattern::derive_output_seed_dependencies(
-            row, None,
-        ))
-        && none_depend(StructuralPattern::derive_output_effect_dependencies(
-            row, None,
-        ))
+    StructuralPattern::derive_output_p_dependency_ranges(row, None).is_ok_and(|dependencies| {
+        let inputs = IndexIntervals::range(inputs.start, inputs.end);
+        dependencies
+            .iter()
+            .all(|dependencies| dependencies.intersection(&inputs).is_empty())
+    }) && none_depend(StructuralPattern::derive_output_time_dependencies(
+        row, None,
+    )) && none_depend(StructuralPattern::derive_output_seed_dependencies(
+        row, None,
+    )) && none_depend(StructuralPattern::derive_output_effect_dependencies(
+        row, None,
+    ))
 }
 
 fn none_depend<E>(dependencies: Result<Vec<bool>, E>) -> bool {
@@ -227,6 +245,11 @@ fn none_depend<E>(dependencies: Result<Vec<bool>, E>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slot 0 and 1 are declared parameters, 2 and 3 external inputs; slots 4
+    /// and up are discrete values, `pre` slots, condition memories, and clock
+    /// lanes.
+    const INPUTS: Range<usize> = 2..4;
 
     #[test]
     fn a_plan_without_roles_is_empty() {
@@ -259,7 +282,11 @@ mod tests {
             },
             crate::LinearOp::StoreOutput { src: 2 },
         ];
-        assert!(static_root(&parameter_tensor_root, &BTreeSet::new(),));
+        assert!(static_root(
+            &parameter_tensor_root,
+            &IndexIntervals::default(),
+            &INPUTS
+        ));
 
         let state_tensor_root = vec![
             crate::LinearOp::TensorLoad {
@@ -276,8 +303,42 @@ mod tests {
                 stride: 1,
             },
         ];
-        assert!(!static_root(&state_tensor_root, &BTreeSet::from([3]),));
-        assert!(static_root(&state_tensor_root, &BTreeSet::from([3, 4]),));
+        assert!(!static_root(
+            &state_tensor_root,
+            &IndexIntervals::of([3]),
+            &INPUTS
+        ));
+        assert!(static_root(
+            &state_tensor_root,
+            &IndexIntervals::of([3, 4]),
+            &INPUTS
+        ));
+    }
+
+    #[test]
+    fn a_static_root_over_a_huge_state_range_is_decided_without_expanding_it() {
+        let wide = 1usize << 40;
+        let root = vec![
+            crate::LinearOp::TensorLoad {
+                dst_start: 0,
+                input: crate::TensorInputKind::Y,
+                input_start: 0,
+                count: wide,
+                seed_start: None,
+                lanes: 1,
+            },
+            crate::LinearOp::StoreOutputRange {
+                start: 0,
+                count: 1,
+                stride: 1,
+            },
+        ];
+        assert!(static_root(&root, &IndexIntervals::range(0, wide), &INPUTS));
+        assert!(!static_root(
+            &root,
+            &IndexIntervals::range(1, wide),
+            &INPUTS
+        ));
     }
 
     #[test]
@@ -293,7 +354,11 @@ mod tests {
             },
             crate::LinearOp::StoreOutput { src: 2 },
         ];
-        assert!(!static_root(&time_root, &BTreeSet::new()));
+        assert!(!static_root(
+            &time_root,
+            &IndexIntervals::default(),
+            &INPUTS
+        ));
     }
 
     #[test]
@@ -302,6 +367,96 @@ mod tests {
             crate::LinearOp::LoadSeed { dst: 0, index: 3 },
             crate::LinearOp::StoreOutput { src: 0 },
         ];
-        assert!(!static_root(&seed_root, &BTreeSet::new()));
+        assert!(!static_root(
+            &seed_root,
+            &IndexIntervals::default(),
+            &INPUTS
+        ));
+    }
+
+    #[test]
+    fn a_root_reading_an_external_input_is_searched_and_every_other_slot_is_static() {
+        let load = |index| {
+            vec![
+                crate::LinearOp::LoadP { dst: 0, index },
+                crate::LinearOp::StoreOutput { src: 0 },
+            ]
+        };
+        // Declared parameters, then the discrete, `pre`, condition-memory, and
+        // clock-lane slots behind the inputs, stay fixed within an interval.
+        for fixed in [0, 1, 4, 5, 9] {
+            assert!(
+                static_root(&load(fixed), &IndexIntervals::default(), &INPUTS),
+                "{fixed}"
+            );
+        }
+        for input in [2, 3] {
+            assert!(
+                !static_root(&load(input), &IndexIntervals::default(), &INPUTS),
+                "{input}"
+            );
+        }
+    }
+    fn assert_input_time_root_slot(index: usize, reverse: bool) {
+        let row = vec![
+            LinearOp::LoadP { dst: 0, index },
+            LinearOp::LoadTime { dst: 1 },
+            LinearOp::Binary {
+                dst: 2,
+                op: BinaryOp::Sub,
+                lhs: if reverse { 1 } else { 0 },
+                rhs: if reverse { 0 } else { 1 },
+            },
+            LinearOp::StoreOutput { src: 2 },
+        ];
+        let span = rumoca_core::Span::from_offsets(
+            rumoca_core::SourceId::from_source_name("input_time_root.mo"),
+            1,
+            2,
+        )
+        .require_provenance("input-time root regression")
+        .unwrap();
+        let block = ScalarProgramBlock::with_source_span(vec![row.clone()], span)
+            .expect("checked scalar root block");
+        let roles = classify_block(&block, &IndexIntervals::default(), &INPUTS)
+            .expect("contiguous root outputs classified");
+        let result = direct_time_root(&row, &INPUTS);
+        if INPUTS.contains(&index) {
+            assert_eq!(result, None, "external input slot {index}");
+            assert_eq!(roles, vec![RootSearchRole::Search]);
+            assert!(!static_root(&row, &IndexIntervals::default(), &INPUTS));
+        } else {
+            assert_eq!(
+                roles,
+                vec![RootSearchRole::AnnouncedTime {
+                    param_index: index,
+                    sign: if reverse {
+                        TimeRootSign::TimeMinusParam
+                    } else {
+                        TimeRootSign::ParamMinusTime
+                    },
+                }]
+            );
+            assert_eq!(
+                result,
+                Some((
+                    index,
+                    if reverse {
+                        TimeRootSign::TimeMinusParam
+                    } else {
+                        TimeRootSign::ParamMinusTime
+                    }
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn input_time_roots_remain_searched_while_parameter_deadlines_are_announced() {
+        for index in 0..4 {
+            for reverse in [false, true] {
+                assert_input_time_root_slot(index, reverse);
+            }
+        }
     }
 }

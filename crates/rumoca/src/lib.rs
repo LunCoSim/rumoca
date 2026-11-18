@@ -25,8 +25,12 @@
 //! let json = result.to_ir_json(rumoca::TemplateIr::Dae)?;
 //! ```
 
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 mod compiler;
 mod error;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-fmi-ls-build"))]
+pub mod native_fmi_ls;
 
 // The CLI surface — argument parsing/dispatch (`cli`) plus the per-command
 // implementations below — depends on the scheduled simulation feature
@@ -43,6 +47,8 @@ pub mod cli;
 // argument types and dispatch, these own the per-command work.
 #[cfg(feature = "scheduled-sim")]
 pub(crate) mod cache_cmd;
+#[cfg(all(not(target_arch = "wasm32"), feature = "component-build"))]
+mod component_delivery;
 #[cfg(feature = "scheduled-sim")]
 pub(crate) mod fmt_cli;
 #[cfg(feature = "scheduled-sim")]
@@ -52,6 +58,8 @@ pub(crate) mod packaging;
 pub(crate) mod sim_bench;
 #[cfg(feature = "scheduled-sim")]
 pub(crate) mod sim_inspect;
+#[cfg(feature = "scheduled-sim")]
+pub(crate) mod sim_trajectory;
 #[cfg(feature = "scheduled-sim")]
 pub(crate) mod standard_modelica;
 pub(crate) mod target_manifest;
@@ -70,6 +78,8 @@ pub use packaging::{
     ArtifactRenderContext, ArtifactSession, render_web, render_web_files, sha1_hex, topo_sort,
 };
 #[cfg(feature = "fmu-packaging")]
-pub use packaging::{PackageSpec, ZipPackage, render_and_package};
+pub use packaging::{PackageSpec, PreparedTargetPackage, ZipPackage, render_and_package};
 #[cfg(feature = "fmu-packaging")]
-pub use target_manifest::compile_packaged_target;
+pub use target_manifest::{
+    compile_packaged_target, prepare_packaged_target, publish_wasm_component,
+};

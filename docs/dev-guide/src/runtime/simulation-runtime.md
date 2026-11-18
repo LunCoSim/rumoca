@@ -150,49 +150,26 @@ selection or numerical reset.
 
 ## Fixed output execution
 
-`SolveRuntime`'s private `PreparedOutputSelection` owns checked preparation and
-execution of fixed expression memberships. Both `PreparedRootConditionPlan` and
-`PreparedVisibleValuePlan` contain this executable selection with their semantic
-metadata. A runtime cannot install a fixed plan without its prepared selection;
-root and visible readers have no per-row specialization cache or raw selection
-argument. They dispatch through the same owner.
+Root and visible observation plans store fixed `ProgramSelection` memberships
+alongside their semantic entries. A selection groups output positions by the
+complete source program that owns them. The plan evaluates those programs in
+source order through the admitted compiled lifecycle or the checked reference
+evaluator, then projects the selected offsets to the caller's output positions.
+Visible observations read eligible direct sources directly and evaluate each
+deduplicated expression group once. Root predicates use the checked event
+observation context.
 
-Selected complete source programs retain ascending program order, original
-operations and source spans. Their complete outputs feed a retained map back to
-selected global positions, including grouped, sparse and repeated requests.
-Visible direct sources and deduplicated expression groups retain their existing
-semantics; grouped visible programs use the same prepared selector. The standard
-whole-block backend receives one dispatch per nonempty selection and owns kernel
-chunking. The checked interpreter consumes that same projection if compilation
-is declined. Admitted native execution errors propagate without interpreter retry.
-Destination extents are checked before execution, and failed execution publishes
-no selected values.
-
-Only structurally equal immutable programs share code across identical selections
-or alternate charts. Changed selections compile independently and cannot execute
-superseded programs through an overlay. Numerical scratch remains runtime-owned
-and is overwritten for every evaluation. Current state, parameters, time, external
-tables and evaluator context are read on every call; no numerical value or COM
-term is memoized. Dynamic guarded event/discrete memberships retain their own
-specialization mechanism, using the common selected-program/output admission
-helper. Their membership and guard decisions are not fixed observation plans.
-
-The solver's `fixed_outputs` and `prepared_outputs::tests` cover native dispatch
-cardinality, terminal native errors, compilation decline, alternate replacement,
-grouped/sparse/duplicate ownership, signed zero and invalid destinations. The
-native adapter's `native_execution::tests::root_batches` diagnostics measure
-complete root and visible selections at 384 outputs over 512 fresh-time reads,
-asserting every f64 bit. Pair independent executables with a fixed MSL canary
-and production Rhai observation, initialization, reset and fault gates. Fixture
-throughput is not whole-worker or FPS acceptance.
+Each read evaluates the current state, parameters, time and external-table
+context. Native evaluation errors propagate to the caller. Dynamic event and
+discrete assignments derive memberships from their active guards, using the
+same program and output-position representation during execution.
 
 ## Root condition execution
 
 The root plan owns public and root-search memberships, including announced-time
-and continuously static defaults. Its prepared form carries those entries and
-both fixed output selections together. Identical public/search memberships share
-immutable preparation. The state/root refresh, root-location algorithm and
-indicator-default rules remain with their existing owners.
+and continuously static defaults. Both selections use the same admitted
+lifecycle program code. The state/root refresh and root-location algorithms
+consume the respective root-plan reads.
 
 ## Incremental visible observations
 

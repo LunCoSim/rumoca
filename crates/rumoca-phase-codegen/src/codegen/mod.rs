@@ -15,34 +15,62 @@ mod checked_dae_diagnostic_tests;
 #[cfg(test)]
 mod checked_dae_tests;
 #[cfg(test)]
+mod checked_function_region_tests;
+#[cfg(test)]
 mod codegen_test_support;
 mod dae_backend;
 mod dae_diagnostics;
+#[cfg(test)]
+mod discrete_input_render_tests;
 mod discrete_render_view;
 mod expr_config;
+mod flat_family_loops;
 mod fmi_c_assertions;
 #[cfg(test)]
 mod fmi_projection_tests;
 #[cfg(test)]
+mod fmi_reduction_tests;
+mod fmi_tangents;
+#[cfg(test)]
+mod fold_render_tests;
+#[cfg(test)]
 mod galec_golden_tests;
 #[cfg(test)]
 mod galec_manifest_template_tests;
+mod lazy_scalar_projection;
 mod me_projection;
+mod native_fmi_renderer;
+mod solve_block_renderer;
+#[cfg(test)]
+mod solve_render_fixture_tests;
+pub use native_fmi_renderer::NativeFmiTemplateRenderer;
+#[cfg(test)]
+mod native_range_render_tests;
+#[cfg(test)]
+mod native_scalar_laziness_tests;
+#[cfg(test)]
+mod native_start_render_tests;
 mod pure_call_families;
+mod real_extremum;
 mod render_expr;
 mod render_solve;
 mod render_solve_ops;
 mod render_stmt;
 #[cfg(test)]
+mod root_refinement_render_tests;
+#[cfg(test)]
 mod scalar_plan_template_tests;
 mod scalar_program_plan;
 mod scalar_region_plan;
+#[cfg(test)]
+mod sliding_modes_render_tests;
 mod solve_lazy;
 mod solve_renderer;
 #[cfg(test)]
 mod solve_sparse_output_tests;
 #[cfg(test)]
 mod solve_template_context_tests;
+mod solver_names;
 #[cfg(test)]
 mod stencil_codegen_tests;
 mod symbol_alloc;
@@ -62,11 +90,15 @@ use render_solve::{
 };
 use render_stmt::{render_equation, render_flat_equation, render_statement, render_statements};
 use symbol_alloc::{
-    allocate_symbols_function, emitted_symbol, lookup_symbol_value, symbol_function,
+    allocate_symbols_function, emitted_symbol, emitted_variable_symbol, lookup_symbol_value,
+    symbol_function,
 };
 
 pub use me_projection::me_refresh_admissible;
-pub use solve_lazy::explicit_algebraic_assignment_complete;
+pub use solve_lazy::{
+    explicit_algebraic_assignment_complete, explicit_algebraic_assignment_complete_with_calls,
+    explicit_initialization_renderable_with_calls,
+};
 
 /// Result type for internal render functions.
 pub(crate) type RenderResult = Result<String, minijinja::Error>;
@@ -159,7 +191,17 @@ fn render_with_input_context(
             render_solve_context(tmpl, problem, artifacts, name)?
         }
         (CodegenInput::Flat(flat_model), name) => {
-            require_materialized_flat_equation_view(flat_model)?;
+            // Only a template that reads the model can read a placeholder row
+            // (a file-path template reads just the name), and one that reads
+            // the loop-aware rows prints each unmaterialized `for` family as a
+            // loop instead of its rows.
+            let reads = tmpl.undeclared_variables(false);
+            if reads.contains("flat") || reads.contains("ir") {
+                require_materialized_flat_equation_view(
+                    flat_model,
+                    reads.contains(flat_family_loops::CONTEXT_KEY),
+                )?;
+            }
             render_flat_context(tmpl, flat_model, name)?
         }
         (CodegenInput::Ast(ast_tree), name) => render_ast_context(tmpl, ast_tree, name)?,
@@ -185,7 +227,10 @@ fn render_with_input_context(
     Ok(rendered)
 }
 
-fn require_materialized_flat_equation_view(flat_model: &flat::Model) -> Result<(), CodegenError> {
+fn require_materialized_flat_equation_view(
+    flat_model: &flat::Model,
+    prints_loops: bool,
+) -> Result<(), CodegenError> {
     for (partition, families) in [
         (
             "regular equations",
@@ -196,10 +241,10 @@ fn require_materialized_flat_equation_view(flat_model: &flat::Model) -> Result<(
             flat_model.initial_structured_equations.as_slice(),
         ),
     ] {
-        if let Some(family) = families
-            .iter()
-            .find(|family| !family.interiors_materialized)
-        {
+        if let Some(family) = families.iter().find(|family| {
+            let printed_as_loop = prints_loops && flat_family_loops::printable(family);
+            !family.interiors_materialized() && !printed_as_loop
+        }) {
             return Err(CodegenError::NonMaterializedStructuredFamily {
                 partition,
                 origin: family.origin.to_string(),
@@ -245,63 +290,64 @@ fn render_solve_context(
     )?)?)
 }
 
+struct PreparedSolveBlocks {
+    value: Value,
+    scalar_derivative_programs: bool,
+}
+
 fn solve_template_blocks_value(
     solve_problem: &solve::SolveProblem,
     artifacts: &solve::SolveArtifacts,
-) -> Result<Value, CodegenError> {
-    Ok(minijinja::context! {
+    pure_calls: Option<&solve::SolvePureCallTable>,
+) -> Result<PreparedSolveBlocks, CodegenError> {
+    let derivative_scalar =
+        solve_lazy::scalar_lowered_block(&solve_problem.continuous.derivative_rhs, pure_calls)?;
+    let scalar_derivative_programs = derivative_scalar.is_some();
+    let initialization = solve_lazy::initialization_blocks(solve_problem, pure_calls)?;
+    let value = minijinja::context! {
         continuous => minijinja::context! {
             implicit_rhs => solve_template_compute_block_json(&solve_problem.continuous.implicit_rhs)?,
             residual => solve_template_compute_block_json(&solve_problem.continuous.residual)?,
             derivative_rhs => solve_template_compute_block_json(&solve_problem.continuous.derivative_rhs)?,
+            // The same rows with single-lane tensor register ops lowered to
+            // scalar ops, for templates that render scalar ops only. Absent
+            // (none) when a program holds an op no scalar template renders.
+            derivative_rhs_scalar => match derivative_scalar {
+                Some(block) => solve_template_compute_block_json(&block)?,
+                None => Value::from(()),
+            },
+            // Exact algebraic refresh for pure-RHS targets: render before
+            // `derivative_rhs` so every algebraic `y` slot it reads is set.
+            // Absent (none) unless every algebraic slot has an exact assignment.
+            algebraic_assignments => match solve_lazy::explicit_algebraic_assignment_block(solve_problem, pure_calls)? {
+                Some(block) => solve_template_compute_block_json(&block)?,
+                None => Value::from(()),
+            },
+        },
+        // The explicit initialization's parameter assignments (computed
+        // parameters such as a weight matrix built from other parameters) for
+        // targets without an initialization solver: render as
+        // `init_params(p)`. Absent (none) when there are none.
+        parameter_initialization => match initialization.parameters {
+            Some(block) => solve_template_compute_block_json(&block)?,
+            None => Value::from(()),
+        },
+        // Explicit state starts computed from parameters, rendered as
+        // `init_state(p)`; absent (none) when there are none.
+        state_initialization => match initialization.states {
+            Some(block) => solve_template_compute_block_json(&block)?,
+            None => Value::from(()),
         },
         artifacts => minijinja::context! {
             continuous => minijinja::context! {
                 implicit_jacobian_v => solve_template_compute_block_json(&artifacts.continuous.implicit_jacobian_v)?,
             },
         },
+    };
+    Ok(PreparedSolveBlocks {
+        value,
+        scalar_derivative_programs,
     })
-}
-
-#[derive(Debug)]
-struct LazyScalarProgramsValue {
-    scalar: std::sync::Arc<solve::ScalarProgramBlock>,
-}
-
-impl LazyScalarProgramsValue {
-    fn new(scalar: std::sync::Arc<solve::ScalarProgramBlock>) -> Self {
-        Self { scalar }
-    }
-
-    fn scalar(&self) -> &std::sync::Arc<solve::ScalarProgramBlock> {
-        &self.scalar
-    }
-}
-
-impl minijinja::value::Object for LazyScalarProgramsValue {
-    fn repr(self: &std::sync::Arc<Self>) -> minijinja::value::ObjectRepr {
-        minijinja::value::ObjectRepr::Map
-    }
-
-    fn get_value(self: &std::sync::Arc<Self>, key: &Value) -> Option<Value> {
-        let scalar = self.scalar();
-        match key.as_str()? {
-            "programs" => Some(Value::from_object(solve_lazy::SolveProgramsObject {
-                block: scalar.clone(),
-            })),
-            "program_spans" => Some(Value::from_serialize(scalar.program_spans())),
-            "output_indices" => Some(Value::from_serialize(scalar.output_indices())),
-            _ => None,
-        }
-    }
-
-    fn enumerate(self: &std::sync::Arc<Self>) -> minijinja::value::Enumerator {
-        minijinja::value::Enumerator::Values(vec![
-            Value::from("programs"),
-            Value::from("program_spans"),
-            Value::from("output_indices"),
-        ])
-    }
 }
 
 #[derive(Debug)]
@@ -393,16 +439,15 @@ impl minijinja::value::Object for LazyDerivativeNodesValue {
 }
 
 fn solve_template_compute_block_json(block: &solve::ComputeBlock) -> Result<Value, CodegenError> {
+    lazy_scalar_projection::validate(block)?;
     let partition = render_solve::native_family_template_partition(block)?;
-    let uses_linear_solve = compute_block_uses_linear_solve_component(block);
+    let uses_linear_solve = block.uses_linear_solve_component();
     // Lazy nodes (one ComputeNode -> ops materialized on demand) so blocks whose
     // nodes contain large op programs don't materialize as eager Values.
     let nodes = solve_lazy::nodes_value(std::sync::Arc::new(block.clone()))?;
     let output_count = block.len()?;
-    let scalar = std::sync::Arc::new(rumoca_eval_solve::to_scalar_program_block(block)?);
-    let scalar_plan =
-        Value::from_object(scalar_program_plan::ScalarProgramPlan::new(scalar.clone())?);
-    let scalar_programs = Value::from_object(LazyScalarProgramsValue::new(scalar));
+    let (scalar_programs, scalar_plan) =
+        lazy_scalar_projection::views(std::sync::Arc::new(block.clone()));
     let fallback_programs = Value::from_object(render_solve::SolveRowsValue::new(
         partition.fallback_programs,
     ));
@@ -418,6 +463,7 @@ fn solve_template_compute_block_json(block: &solve::ComputeBlock) -> Result<Valu
     Ok(minijinja::context! {
         nodes => nodes,
         scalar_plan => scalar_plan,
+        jax_plan => render_solve::jax_plan_value(std::sync::Arc::new(block.clone())),
         scalar_programs => scalar_programs,
         fallback_programs => fallback_programs,
         native_families => native_families,
@@ -431,45 +477,54 @@ fn solve_template_compute_block_json(block: &solve::ComputeBlock) -> Result<Valu
     })
 }
 
-fn scalar_program_block_uses_linear_solve_component(block: &solve::ScalarProgramBlock) -> bool {
-    block
-        .programs()
-        .iter()
-        .flatten()
-        .any(|op| matches!(op, solve::LinearOp::LinearSolveComponent { .. }))
-}
-
-fn compute_block_uses_linear_solve_component(block: &solve::ComputeBlock) -> bool {
-    block.nodes.iter().any(|node| match node {
-        solve::ComputeNode::ScalarPrograms(block) => {
-            scalar_program_block_uses_linear_solve_component(block)
-        }
-        solve::ComputeNode::LinSolve { .. } => true,
-        solve::ComputeNode::Map { .. }
-        | solve::ComputeNode::AffineStencil { .. }
-        | solve::ComputeNode::MatMul { .. } => false,
-    })
-}
-
 fn render_flat_context(
     tmpl: &minijinja::Template<'_, '_>,
     flat_model: &flat::Model,
     model_name: Option<&str>,
 ) -> RenderResult {
     let flat_value = Value::from_serialize(flat_model);
+    let type_names = Value::from_serialize(qualified_enumeration_type_names(flat_model));
+    let equation_rows = Value::from_serialize(flat_family_loops::context_value(flat_model));
     match model_name {
         Some(name) => tmpl.render(minijinja::context! {
             flat => flat_value.clone(),
             ir => flat_value,
             ir_kind => "flat",
+            flat_type_names => type_names,
+            flat_equation_rows => equation_rows,
             model_name => name,
         }),
         None => tmpl.render(minijinja::context! {
             flat => flat_value.clone(),
             ir => flat_value,
             ir_kind => "flat",
+            flat_type_names => type_names,
+            flat_equation_rows => equation_rows,
         }),
     }
+}
+
+/// The fully qualified enumeration type of every enumeration-typed variable
+/// (MLS §4.9.5), keyed by variable name.
+///
+/// `variable_type_names` holds the declared short name (`Init`), which a
+/// re-parsed flat model cannot resolve outside its declaring package; the
+/// canonical declaration's qualified name (`Modelica.Blocks.Types.Init`) can.
+fn qualified_enumeration_type_names(
+    flat_model: &flat::Model,
+) -> std::collections::BTreeMap<String, String> {
+    flat_model
+        .variables
+        .iter()
+        .filter_map(|(name, variable)| {
+            let canonical = flat_model
+                .effective_types
+                .get(&variable.type_id)?
+                .canonical_type();
+            let declaration = flat_model.enumeration_declarations.get(&canonical)?;
+            Some((name.as_str().to_string(), declaration.name.clone()))
+        })
+        .collect()
 }
 
 fn render_ast_context(
@@ -583,6 +638,33 @@ pub fn render_checked_algorithm_block_template_with_sources<T: Serialize>(
         ir_kind => "algorithm_code",
         model_name,
     })?)
+}
+
+/// As [`render_checked_algorithm_block_template_with_sources`] for a C target:
+/// `refined` is `block`'s Solve refinement, and the method bodies print from it
+/// (#483). For a standalone edited block, which carries no start values.
+pub fn render_checked_algorithm_block_template_with_solve<T: Serialize>(
+    block: &rumoca_ir_galec::package::CheckedAlgorithmBlock,
+    refined: &rumoca_ir_solve::SolveAlgorithmBlock,
+    sources: &rumoca_core::SourceMap,
+    artifact: &T,
+    template: &str,
+    model_name: &str,
+) -> Result<String, CodegenError> {
+    let mut env = create_environment();
+    env.add_template("inline", template)?;
+    let tmpl = env.get_template("inline")?;
+    let view = crate::views::algorithm_code::CheckedAlgorithmBlockView::new(block, sources)
+        .map_err(CodegenError::template)?;
+    Ok(solve_block_renderer::drop_needless_void_uses(
+        &tmpl.render(minijinja::context! {
+            algorithm_code => Value::from_serialize(view),
+            solve_block => solve_block_renderer::solve_block_value(refined, sources)?,
+            artifact => Value::from_serialize(artifact),
+            ir_kind => "algorithm_code",
+            model_name,
+        })?,
+    ))
 }
 
 /// Render a DAE using a template string.
@@ -726,6 +808,10 @@ fn create_environment() -> Environment<'static> {
     // (fail closed). See `binary32_bound_str` / `int32_bound_str`.
     env.add_filter("binary32_bound", binary32_bound_filter);
     env.add_filter("int32_bound", int32_bound_filter);
+    env.add_function(
+        "inactive_assertion_message",
+        pure_call_families::inactive_assertion_message,
+    );
 
     // Helpers for target-local emitted symbols. Flattening supplies globally
     // unique Modelica names; templates provide target keyword/generated-alias policy.
@@ -734,6 +820,10 @@ fn create_environment() -> Environment<'static> {
     env.add_function("source_ref", source_ref_function);
 
     // Custom functions for expression rendering
+    env.add_function(
+        "real_extremum_prelude",
+        real_extremum::real_extremum_prelude_function,
+    );
     env.add_function("render_expr", render_expr_function);
     env.add_function("render_event_indicator", render_event_indicator_function);
     env.add_function("render_solve_row_wgsl", render_solve_row_wgsl_function);
@@ -748,6 +838,10 @@ fn create_environment() -> Environment<'static> {
     env.add_function(
         "render_solve_native_family_mlir",
         render_solve::render_solve_native_family_mlir_function,
+    );
+    env.add_function(
+        "render_solve_native_family_jax",
+        render_solve::render_solve_native_family_jax_function,
     );
     env.add_function(
         "render_solve_native_family_output_index_wgsl",
@@ -1344,5 +1438,6 @@ fn render_statements_function(stmts: Value, config: Value, indent: Value) -> Ren
 }
 
 pub use algorithm_code_renderer::AlgorithmCodeTemplateRenderer;
+pub use solve_block_renderer::SolveBlockTemplateRenderer;
 pub use solve_renderer::SolveTemplateRenderer;
 use solve_renderer::solve_render_context_value;

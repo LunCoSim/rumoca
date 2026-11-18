@@ -5,6 +5,9 @@
 //! against the extents the DAE already checked, so a projection either names an
 //! exact scalar or is rejected as not compile-time computable.
 
+#[cfg(test)]
+mod tests;
+
 use super::*;
 use rumoca_core::{flatten_coordinates, row_major_coordinates};
 
@@ -476,12 +479,15 @@ impl<'dae> ScalarSelector<'dae> {
                     )),
                 }
             }
-            dae::ExpressionOperation::Binary { operator, lhs, rhs } => integer_binary(
-                operator,
-                self.integer(lhs, scalar)?,
-                self.integer(rhs, scalar)?,
-                span,
-            ),
+            dae::ExpressionOperation::Binary { operator, lhs, rhs } => {
+                self.check_scalar_binary_projection(operator, lhs, rhs, span)?;
+                integer_binary(
+                    operator,
+                    self.integer(lhs, scalar)?,
+                    self.integer(rhs, scalar)?,
+                    span,
+                )
+            }
             dae::ExpressionOperation::Array(elements) => {
                 let first = elements.get(0).expect("checked array is nonempty");
                 let count = scalar_count(self.view, first);
@@ -491,6 +497,9 @@ impl<'dae> ScalarSelector<'dae> {
                         .expect("checked integer scalar selects an array element"),
                     scalar % count,
                 )
+            }
+            dae::ExpressionOperation::Comprehension { domain, body } => {
+                self.comprehension_integer(domain, body, scalar)
             }
             dae::ExpressionOperation::Index { base, subscripts } => {
                 let selected = self.indexed_base_scalar(
@@ -506,6 +515,63 @@ impl<'dae> ScalarSelector<'dae> {
                 span,
             )),
         }
+    }
+
+    /// A scalar projection cannot evaluate a contraction or matrix power by
+    /// selecting operand leaves; typed tensor lowering owns those operations.
+    pub(super) fn check_scalar_binary_projection(
+        &self,
+        operator: dae::BinaryOperator,
+        lhs: dae::ExprId<'dae>,
+        rhs: dae::ExprId<'dae>,
+        span: Span,
+    ) -> Result<(), LowerError> {
+        let lhs_scalar = self.node(lhs).value_type().is_scalar();
+        let shape_owned = match operator {
+            dae::BinaryOperator::Multiply => {
+                !lhs_scalar && !self.node(rhs).value_type().is_scalar()
+            }
+            dae::BinaryOperator::Power => !lhs_scalar,
+            _ => false,
+        };
+        if shape_owned {
+            return Err(LowerError::non_computable(
+                "a scalar constant probe cannot evaluate a contraction or matrix power",
+                span,
+            ));
+        }
+        Ok(())
+    }
+
+    fn comprehension_integer(
+        &self,
+        domain: dae::DomainId<'dae>,
+        body: dae::ExprId<'dae>,
+        scalar: usize,
+    ) -> Result<i64, LowerError> {
+        let span = self.node(body).provenance().span();
+        let count = scalar_count(self.view, body);
+        if count == 0 {
+            return Err(LowerError::contract(
+                "integer comprehension body is empty",
+                span,
+            ));
+        }
+        let values = self
+            .view
+            .domain(domain)
+            .ok_or_else(|| {
+                LowerError::contract("comprehension domain identity does not resolve", span)
+            })?
+            .structured()
+            .index_tuple_at(scalar / count)
+            .map_err(|error| LowerError::contract(error.to_string(), span))?
+            .ok_or_else(|| {
+                LowerError::contract("integer comprehension scalar is outside its shape", span)
+            })?;
+        let mut nested = self.clone();
+        nested.domain_points.push((domain, values));
+        nested.integer(body, scalar % count)
     }
 
     pub(in crate::lower) fn node(

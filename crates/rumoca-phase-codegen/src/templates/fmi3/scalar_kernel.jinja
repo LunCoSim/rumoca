@@ -29,8 +29,8 @@
 {%- elif operator == "And" -%}((r[{{ lhs }}] != 0.0 && r[{{ rhs }}] != 0.0) ? 1.0 : 0.0)
 {%- elif operator == "Or" -%}((r[{{ lhs }}] != 0.0 || r[{{ rhs }}] != 0.0) ? 1.0 : 0.0)
 {%- elif operator == "Atan2" -%}atan2(r[{{ lhs }}], r[{{ rhs }}])
-{%- elif operator == "Min" -%}fmin(r[{{ lhs }}], r[{{ rhs }}])
-{%- elif operator == "Max" -%}fmax(r[{{ lhs }}], r[{{ rhs }}])
+{%- elif operator == "Min" -%}rumoca_real_min(r[{{ lhs }}], r[{{ rhs }}])
+{%- elif operator == "Max" -%}rumoca_real_max(r[{{ lhs }}], r[{{ rhs }}])
 {%- else -%}{{ fail("unsupported-feature:scalar.binary." ~ operator) }}
 {%- endif -%}
 {%- endmacro %}
@@ -61,26 +61,55 @@
 {%- else %}{{ output }}[{{ targets[index].P.index }}]{% endif -%}
 {%- endmacro %}
 
-{%- macro scalar_op(op, output="m->derivative", error_status="fmi3Error", targets=none) %}
+{%- macro span_index(span, ordinal) -%}
+{{ span.start }} {% if span.descending %}-{% else %}+{% endif %} ({{ ordinal }}) * {{ span.stride }}
+{%- endmacro %}
+
+{%- macro store_range(op, output, error_status=none) -%}
+    for (size_t k=0; k<{{ op.count }}; ++k) {
+        {{ output }}[{{ span_index(op.output_span, "k") }}] = r[{{ op.start }}+k*{{ op.stride }}];
+{%- if error_status is not none %}
+        if (!isfinite({{ output }}[{{ span_index(op.output_span, "k") }}])) return {{ error_status }};
+{%- endif %}
+    }
+{%- endmacro %}
+
+{%- macro scalar_failure(error_status, observation_mode) -%}
+{ {% if observation_mode == 2 %}rmc_finish_assertion_observation(&warnings, 1); {% endif %}return {{ error_status }}; }
+{%- endmacro %}
+
+{%- macro scalar_op(op, output="m->derivative", error_status="fmi3Error", targets=none, observation_mode=1) %}
 {%- if op.kind == "Const" %}    r[{{ op.dst }}] = {{ scalar_const(op) }};
-{%- elif op.kind == "LoadTime" %}    r[{{ op.dst }}] = m->time;
+{%- elif op.kind == "LoadTime" %}    r[{{ op.dst }}] = rmc_now(m);
 {%- elif op.kind == "LoadY" %}    r[{{ op.dst }}] = m->y[{{ op.index }}];
 {%- elif op.kind == "LoadP" %}    r[{{ op.dst }}] = m->p[{{ op.index }}];
 {%- elif op.kind == "LoadSeed" %}    r[{{ op.dst }}] = seed[{{ op.index }}];
 {%- elif op.kind == "LoadIndexedP" %}    r[{{ op.dst }}] = m->p[{{ op.base }} + (size_t)fmin(fmax(round(r[{{ op.index_ref }}]), 0.0), {{ op.count - 1 if op.count > 0 else 0 }}.0)];
 {%- elif op.kind == "Move" %}    r[{{ op.dst }}] = r[{{ op.src }}];
-{%- elif op.kind == "LinearSolveComponent" %}    { double w[{{ op.n * (op.n + 1) }}]; if (!rmc_linear_solve_component(&r[{{ op.matrix_start }}], &r[{{ op.rhs_start }}], {{ op.n }}, {{ op.component }}, w, &r[{{ op.dst }}])) return {{ error_status }}; }
+{%- elif op.kind == "LinearSolveComponent" %}    { double w[{{ op.n * (op.n + 1) }}]; if (!rmc_linear_solve_component(&r[{{ op.matrix_start }}], &r[{{ op.rhs_start }}], {{ op.n }}, {{ op.component }}, w, &r[{{ op.dst }}])) {{ scalar_failure(error_status, observation_mode) }} }
 {%- elif op.kind == "Unary" %}    r[{{ op.dst }}] = {{ unary(op.operator, op.arg) }};
 {%- elif op.kind == "Binary" %}    r[{{ op.dst }}] = {{ binary(op.operator, op.lhs, op.rhs) }};
 {%- elif op.kind == "Compare" %}    r[{{ op.dst }}] = {{ compare(op.operator, op.lhs, op.rhs) }};
 {%- elif op.kind == "Select" %}    r[{{ op.dst }}] = r[{{ op.cond }}] != 0.0 ? r[{{ op.if_true }}] : r[{{ op.if_false }}];
-{%- elif op.kind == "PureCall" %}    if (rumoca_scalar_pure_{{ pure_symbol(op.owner) }}((const double*[]){ {% for start in op.input_starts %}&r[{{ start }}],{% else %}NULL{% endfor %} }, &r[{{ op.dst }}])) return {{ error_status }};
-{%- elif op.kind == "PureCallDirectional" %}    if (rumoca_scalar_pure_directional_{{ pure_symbol(op.owner) }}((const double*[]){ {% for start in op.input_starts %}&r[{{ start }}],{% else %}NULL{% endfor %} }, &r[{{ op.dst }}])) return {{ error_status }};
+{%- elif op.kind == "PureCall" or op.kind == "PureCallDirectional" or op.kind == "PureCallObservation" %}
+    {
+    RmcModelAssertionContext context={m, {{ op.owner }}, {{ observation_mode }}, {% if op.kind == "PureCallObservation" %}&r[{{ op.dst }}]{% else %}NULL{% endif %}, {% if observation_mode == 2 %}warnings.notices{% else %}NULL{% endif %}};
+    const RmcAssertionObserver observer={&context, rmc_model_assertion};
+    int status={{ "rumoca_scalar_observe_" if op.kind == "PureCallObservation" else ("rumoca_scalar_pure_directional_" if op.kind == "PureCallDirectional" else "rumoca_scalar_pure_") }}{{ pure_symbol(op.owner) }}((const double*[]){ {% for start in op.input_starts %}&r[{{ start }}],{% else %}NULL{% endfor %} }, &r[{{ op.dst }}], &observer);
+{% if observation_mode == 2 %}
+    warnings.notices=context.notices;
+    if (status) { rmc_finish_assertion_observation(&warnings, status); return {{ error_status }}; }
+{% else %}
+    rmc_finish_assertion_observation(&context, status);
+    if (status{% if op.kind == "PureCallObservation" and observation_mode == 0 %} && status!=2{% endif %}) return {{ error_status }};
+{% endif %}
+    }
 {%- elif op.kind == "TensorLoad" and op.lanes == 1 %}    for (size_t k=0; k<{{ op.count }}; ++k) r[{{ op.dst }}+k] = m->{{ op.input | lower }}[{{ op.input_start }}+k];
 {%- elif op.kind == "TensorBinary" and op.lanes == 1 %}    for (size_t k=0; k<{{ op.count }}; ++k) r[{{ op.dst }}+k] = {{ binary(op.operator, op.lhs_start ~ "+k*" ~ op.lhs_stride, op.rhs_start ~ "+k*" ~ op.rhs_stride) }};
 {%- elif op.kind == "MatrixMultiply" and op.lanes == 1 %}    for (size_t i=0; i<{{ op.rows }}; ++i) for (size_t j=0; j<{{ op.columns }}; ++j) {
+        /* The first term is its own sum; an empty dot is +0.0. */
         double sum=0.0;
-        for (size_t k=0; k<{{ op.inner }}; ++k) sum+=r[{{ op.lhs_start }}+i*{{ op.inner }}+k]*r[{{ op.rhs_start }}+k*{{ op.columns }}+j];
+        for (size_t k=0; k<{{ op.inner }}; ++k) { double t=r[{{ op.lhs_start }}+i*{{ op.inner }}+k]*r[{{ op.rhs_start }}+k*{{ op.columns }}+j]; sum = k ? sum+t : t; }
         r[{{ op.dst }}+i*{{ op.columns }}+j]=sum;
     }
 {%- elif op.kind == "TensorTranspose" and op.lanes == 1 %}    for (size_t i=0; i<{{ op.rows }}; ++i) for (size_t j=0; j<{{ op.columns }}; ++j) for (size_t k=0; k<{{ op.element_width }}; ++k)
@@ -107,10 +136,12 @@
 {%- endif %}
     }
 {%- elif op.kind == "MatrixMultiply" and op.lanes == 2 %}    for (size_t i=0; i<{{ op.rows }}; ++i) for (size_t j=0; j<{{ op.columns }}; ++j) {
+        /* The first term is its own sum; an empty dot is +0.0. */
         double re=0.0, du=0.0;
         for (size_t k=0; k<{{ op.inner }}; ++k) {
             size_t l={{ op.lhs_start }}+(i*{{ op.inner }}+k)*2, q={{ op.rhs_start }}+(k*{{ op.columns }}+j)*2;
-            re += r[l]*r[q]; du += r[l+1]*r[q] + r[l]*r[q+1];
+            double t=r[l]*r[q], dt=r[l+1]*r[q] + r[l]*r[q+1];
+            re = k ? re+t : t; du = k ? du+dt : dt;
         }
         r[{{ op.dst }}+(i*{{ op.columns }}+j)*2]=re; r[{{ op.dst }}+(i*{{ op.columns }}+j)*2+1]=du;
     }
@@ -151,11 +182,12 @@
         for (size_t l=0; l<{{ w }}; ++l) r[z+l] = c[l];
     }
 {%- elif op.kind == "MatrixMultiply" and op.lanes > 2 %}{% set w = op.lanes %}    for (size_t i=0; i<{{ op.rows }}; ++i) for (size_t j=0; j<{{ op.columns }}; ++j) {
+        /* The first term is its own sum; an empty dot is +0.0. */
         double c[{{ w }}] = {0.0};
         for (size_t k=0; k<{{ op.inner }}; ++k) {
             size_t x={{ op.lhs_start }}+(i*{{ op.inner }}+k)*{{ w }}, y={{ op.rhs_start }}+(k*{{ op.columns }}+j)*{{ w }};
-            c[0] += r[x]*r[y];
-            for (size_t l=1; l<{{ w }}; ++l) c[l] += r[x+l]*r[y] + r[x]*r[y+l];
+            double t=r[x]*r[y]; c[0] = k ? c[0]+t : t;
+            for (size_t l=1; l<{{ w }}; ++l) { double dt=r[x+l]*r[y] + r[x]*r[y+l]; c[l] = k ? c[l]+dt : dt; }
         }
         for (size_t l=0; l<{{ w }}; ++l) r[{{ op.dst }}+(i*{{ op.columns }}+j)*{{ w }}+l]=c[l];
     }
@@ -181,6 +213,8 @@
 {%- set offset.value = offset.value + source_axis %}
 {%- endfor %}
 {%- elif op.kind == "StoreOutput" %}    {{ store_target(output, targets, op.output_index) }} = r[{{ op.src }}];
+{%- elif op.kind == "StoreOutputRange" and op.output_span is defined and targets is none %}
+{{ store_range(op, output) }}
 {%- elif op.kind == "StoreOutputRange" %}{%- for output_index in op.output_indices %}    {{ store_target(output, targets, output_index) }} = r[{{ op.start + loop.index0 * op.stride }}];
 {%- endfor %}
 {%- elif op.kind == "LoadFunctionConditionalCapture" %}    r[{{ op.dst }}] = fc_captures[{{ op.index }}];
@@ -200,14 +234,14 @@
             {
                 double r[{{ arm.condition.register_count if arm.condition.register_count > 0 else 1 }}];
 {%- for region_op in arm.condition.ops %}
-{{ scalar_op(region_op, "fc_cond", error_status) }}
+{{ scalar_op(region_op, "fc_cond", error_status, observation_mode=observation_mode) }}
 {%- endfor %}
             }
             if (fc_cond[0] != 0.0) {
                 double r[{{ arm.result.register_count if arm.result.register_count > 0 else 1 }}];
                 fc_taken = 1;
 {%- for region_op in arm.result.ops %}
-{{ scalar_op(region_op, "fc_out", error_status) }}
+{{ scalar_op(region_op, "fc_out", error_status, observation_mode=observation_mode) }}
 {%- endfor %}
             }
         }
@@ -215,10 +249,163 @@
         if (!fc_taken) {
             double r[{{ op.fallback.register_count if op.fallback.register_count > 0 else 1 }}];
 {%- for region_op in op.fallback.ops %}
-{{ scalar_op(region_op, "fc_out", error_status) }}
+{{ scalar_op(region_op, "fc_out", error_status, observation_mode=observation_mode) }}
 {%- endfor %}
         }
         for (size_t k=0; k<{{ op.result_count }}; ++k) fc_outer[{{ op.dst }}+k] = fc_out[k];
+    }
+{#- Function folds follow `eval_function_fold`: the carried tuple starts from
+    its seed, every point of the rectangular row-major domain runs the update
+    region in its own register file and writes the complete next tuple, and
+    the folded tuple is the result. Update loads read the innermost fold's
+    `fold_carried`, `fold_index` and `fold_capture`; a nested fold shadows them
+    for its own block only. A guarded fold keeps its seed when inactive. A
+    nested fold (`StoreOutputFunctionFold`) seeds from enclosing registers and
+    the parent's carried tuple and writes `count` consecutive outputs of the
+    parent's next tuple: its folded values, or, when its condition selects the
+    parent, the parent's carried values at those same outputs. -#}
+{%- elif op.kind in ["FunctionFold", "GuardedFunctionFold", "StoreOutputFunctionFold"] %}{% set nested = op.kind == "StoreOutputFunctionFold" %}    {
+        double fold_seed[{{ [op.carried_count, 1]|max }}];
+        double fold_capture_seed[{{ [op.capture_count, 1]|max }}];
+{%- if nested %}
+        size_t fold_cursor = 0;
+{%- for source in op.initial %}
+{%- if source.Registers is defined %}
+        {%- if source.Registers.count > 0 %}
+        for (size_t k=0; k<{{ source.Registers.count }}; ++k) fold_seed[fold_cursor++] = r[{{ source.Registers.start }}+k];
+        {%- endif %}
+{%- else %}
+        {%- if source.ParentCarried.count > 0 %}
+        for (size_t k=0; k<{{ source.ParentCarried.count }}; ++k) fold_seed[fold_cursor++] = fold_carried[{{ source.ParentCarried.base }}+k];
+        {%- endif %}
+{%- endif %}
+{%- endfor %}
+        (void)fold_cursor;
+{%- else %}
+        {%- if op.carried_count > 0 %}
+        for (size_t k=0; k<{{ op.carried_count }}; ++k) fold_seed[k] = r[{{ op.initial_start }}+k];
+        {%- endif %}
+{%- endif %}
+        {%- if op.capture_count > 0 %}
+        for (size_t k=0; k<{{ op.capture_count }}; ++k) fold_capture_seed[k] = r[{{ op.capture_start }}+k];
+        {%- endif %}
+        (void)fold_capture_seed;
+{%- if nested and op.condition is defined and op.condition is not none %}
+        if ((r[{{ op.condition }}] != 0.0) != {{ 1 if op.nested_when_true else 0 }}) {
+            {%- if op.count > 0 %}
+            for (size_t k=0; k<{{ op.count }}; ++k) {{ output }}[{{ op.output_start }}+k] = fold_carried[{{ op.output_start }}+k];
+            {%- endif %}
+        } else
+{%- endif %}
+        {
+            double fold_carried[{{ [op.carried_count, 1]|max }}];
+            const double *const fold_capture = fold_capture_seed;
+            int64_t fold_index[{{ [op.domain.binders|length, 1]|max }}];
+            (void)fold_capture; (void)fold_index;
+            {%- if op.carried_count > 0 %}
+            for (size_t k=0; k<{{ op.carried_count }}; ++k) fold_carried[k] = fold_seed[k];
+            {%- endif %}
+            int fold_done = 0; (void)fold_done;
+{%- if op.kind == "GuardedFunctionFold" %}
+            if (r[{{ op.activation }}] != 0.0)
+{%- endif %}
+            {
+{%- for binder in op.domain.binders %}{% set directed = (binder.upper - binder.lower) * binder.step %}{% set count = 0 if directed < 0 else directed // (binder.step * binder.step) + 1 %}
+            for (int64_t i{{ loop.index0 }}=0; i{{ loop.index0 }}<{{ count }} && !fold_done; ++i{{ loop.index0 }}) {
+            fold_index[{{ loop.index0 }}] = {{ binder.lower }} + i{{ loop.index0 }}*({{ binder.step }});
+{%- endfor %}
+{%- if op.continuation is not none %}
+            {
+                double fold_predicate[1];
+                double r[{{ [op.continuation.register_count, 1]|max }}]; (void)r;
+{%- for continuation_op in op.continuation.ops %}
+{{ scalar_op(continuation_op, "fold_predicate", error_status, observation_mode=observation_mode) }}
+{%- endfor %}
+                fold_done = fold_predicate[0] == 0.0;
+            }
+{%- endif %}
+            if (!fold_done) {
+            double fold_next[{{ [op.carried_count, 1]|max }}];
+            {
+                double r[{{ [op.update.register_count, 1]|max }}]; (void)r;
+{%- for update_op in op.update.ops %}
+{{ scalar_op(update_op, "fold_next", error_status, observation_mode=observation_mode) }}
+{%- endfor %}
+            }
+            {%- if op.carried_count > 0 %}
+            for (size_t k=0; k<{{ op.carried_count }}; ++k) fold_carried[k] = fold_next[k];
+            {%- endif %}
+            }
+{%- for binder in op.domain.binders %}
+            }
+{%- endfor %}
+            }
+{%- if nested %}
+            {%- if op.count > 0 %}
+            for (size_t k=0; k<{{ op.count }}; ++k) {{ output }}[{{ op.output_start }}+k] = fold_carried[{{ op.result_base }}+k];
+            {%- endif %}
+{%- else %}
+            {%- if op.carried_count > 0 %}
+            for (size_t k=0; k<{{ op.carried_count }}; ++k) r[{{ op.dst }}+k] = fold_carried[k];
+            {%- endif %}
+{%- endif %}
+        }
+    }
+{%- elif op.kind == "LoadFoldCarried" %}    r[{{ op.dst }}] = fold_carried[{{ op.index }}];
+{%- elif op.kind == "LoadFoldCapture" %}    r[{{ op.dst }}] = fold_capture[{{ op.index }}];
+{%- elif op.kind == "LoadFoldIndex" %}    r[{{ op.dst }}] = (double)fold_index[{{ op.dimension }}];
+{#- An indexed load from registers, the fold carried tuple, or the fold
+    captures: every runtime coordinate must be an exact in-range Integer. -#}
+{%- elif op.kind in ["LoadIndexedRegister", "LoadIndexedFoldCarried", "LoadIndexedFoldCapture"] %}    {
+        size_t fold_offset = 0;
+{%- for extent in op.dimensions %}{% set index = op.indices[loop.index0] %}
+{%- if index.Constant is defined %}
+        fold_offset = fold_offset*{{ extent }} + {{ index.Constant }};
+{%- else %}
+        { double v = r[{{ index.Runtime }}]; if (!(isfinite(v) && trunc(v) == v && v >= 1.0 && v <= {{ extent }}.0)) {{ scalar_failure(error_status, observation_mode) }} fold_offset = fold_offset*{{ extent }} + (size_t)v - 1; }
+{%- endif %}
+{%- endfor %}
+        r[{{ op.dst }}] = {{ {"LoadIndexedRegister": "r", "LoadIndexedFoldCarried": "fold_carried", "LoadIndexedFoldCapture": "fold_capture"}[op.kind] }}[{{ op.base }}+fold_offset*{{ op.stride }}];
+    }
+{#- Aggregate update of the carried tensor: for every element and lane, the
+    node graph starts from the carried source (node 0); an update node takes
+    its patch value when the patch is enabled and its subscripts select this
+    element, else its base node; a select node picks between earlier nodes. -#}
+{%- elif op.kind == "StoreOutputFoldTensorUpdate" %}    for (size_t e=0; e<{{ op.dimensions|product }}; ++e) {
+        long long tu_offset[{{ [op.updates|length, 1]|max }}]; (void)tu_offset;
+{%- for update in op.updates %}
+        {
+            size_t rest = e; long long value_offset = 0; int selected = 1;
+{%- for i in range(op.dimensions|length)|reverse %}
+            size_t c{{ i }} = rest % {{ op.dimensions[i] }}; rest /= {{ op.dimensions[i] }};
+{%- endfor %}
+{%- for subscript in update.subscripts %}{% set extent = op.dimensions[loop.index0] %}
+{%- if subscript == "Whole" %}
+            value_offset = value_offset*{{ extent }} + (long long)c{{ loop.index0 }};
+{%- elif subscript.Slice is defined %}{% set slice_count = subscript.Slice.dimensions|product %}
+            { long long found = -1; for (size_t s=0; s<{{ slice_count }}; ++s) { double v = r[{{ subscript.Slice.start }}+s]; if (isfinite(v) && round(v) == v && v >= 1.0 && (size_t)v - 1 == c{{ loop.index0 }}) { found = (long long)s; break; } }
+              if (found < 0) selected = 0; else value_offset = value_offset*{{ slice_count }} + found; }
+{%- elif subscript.Index.Constant is defined %}
+            if (c{{ loop.index0 }} != {{ subscript.Index.Constant }}) selected = 0;
+{%- else %}
+            { double v = r[{{ subscript.Index.Runtime }}]; if (!(isfinite(v) && round(v) == v && v >= 1.0 && v <= {{ extent }}.0) || (size_t)v - 1 != c{{ loop.index0 }}) selected = 0; }
+{%- endif %}
+{%- endfor %}
+            tu_offset[{{ loop.index0 }}] = selected ? value_offset : -1;
+        }
+{%- endfor %}
+        for (size_t l=0; l<{{ op.lanes }}; ++l) {
+            double tu_value[{{ op.nodes|length + 1 }}];
+            tu_value[0] = fold_carried[{{ op.source_base }}+e*{{ op.source_stride }}+l];
+{%- for node in op.nodes %}
+{%- if node.Update is defined %}{% set update = op.updates[node.Update.update] %}
+            tu_value[{{ loop.index }}] = ({% if update.condition is not none %}r[{{ update.condition }}] != 0.0 && {% endif %}tu_offset[{{ node.Update.update }}] >= 0) ? r[{{ update.value_start }}+tu_offset[{{ node.Update.update }}]*{{ update.value_stride }}+l] : tu_value[{{ node.Update.base }}];
+{%- else %}
+            tu_value[{{ loop.index }}] = r[{{ node.Select.condition }}] != 0.0 ? tu_value[{{ node.Select.if_true }}] : tu_value[{{ node.Select.if_false }}];
+{%- endif %}
+{%- endfor %}
+            {{ output }}[{{ op.output_start }}+e*{{ op.lanes }}+l] = tu_value[{{ op.result }}];
+        }
     }
 {%- else %}{{ fail("unsupported-feature:scalar.op." ~ op.kind) }}
 {%- endif %}
@@ -242,22 +429,31 @@
 {#- Assertion message assembly (rumoca-eval-solve eval_event_action_message):
     literal segments verbatim, each String(...) conversion formatted as the
     linked runtime formats it. -#}
-{%- macro message_support(rows, prefix) %}
-typedef struct { char* data; size_t len; size_t cap; bool failed; } RmcMessage;
+{%- macro message_support(rows, prefix, captured=false) %}
+typedef struct { const ModelInstance* owner; char* data; size_t len; size_t cap; bool failed; } RmcMessage;
 static void rmc_message_push(RmcMessage* msg, const char* text, size_t len) {
     if (msg->failed) return;
-    if (msg->len + len + 1 > msg->cap) {
+    if (!msg->owner || msg->len == SIZE_MAX || len > SIZE_MAX - msg->len - 1) {
+        msg->failed = true; return;
+    }
+    const size_t needed = msg->len + len + 1;
+    if (needed > msg->cap) {
         size_t cap = msg->cap ? msg->cap : 64;
-        while (cap < msg->len + len + 1) cap *= 2;
-        char* data = realloc(msg->data, cap);
+        while (cap < needed) {
+            if (cap > SIZE_MAX/2) { cap = needed; break; }
+            cap *= 2;
+        }
+        char* data = rmc_instance_allocate(msg->owner, cap, sizeof(char));
         if (!data) { msg->failed = true; return; }
+        if (msg->len) memcpy(data, msg->data, msg->len);
+        rmc_instance_free(msg->owner, msg->data);
         msg->data = data; msg->cap = cap;
     }
     memcpy(msg->data + msg->len, text, len);
     msg->len += len;
     msg->data[msg->len] = '\0';
 }
-{%- if rows.programs|length > 0 %}
+{%- if rows.programs|length > 0 or captured %}
 /* Rust's `f64` Display for non-finite and zero values. */
 static int rmc_format_special(char* out, size_t cap, double value) {
     if (isnan(value)) return snprintf(out, cap, "NaN");
@@ -295,7 +491,13 @@ static void rmc_format_real(char* out, size_t cap, double value, long digits) {
     rmc_trim_fraction(out, '\0');
 }
 /* eval_event_message_conversion; `false` for an option the runtime refuses. */
-static bool rmc_message_convert(RmcMessage* msg, int source, double value, double minimum_length, double left_justified, double significant_digits) {
+static inline void rmc_message_padded(RmcMessage* msg, const char* text, size_t width, bool left_justified) {
+    size_t len=strlen(text);
+    if (len < width && !left_justified) for (size_t k=len; k<width; ++k) rmc_message_push(msg, " ", 1);
+    rmc_message_push(msg, text, len);
+    if (len < width && left_justified) for (size_t k=len; k<width; ++k) rmc_message_push(msg, " ", 1);
+}
+static inline bool rmc_message_convert(RmcMessage* msg, int source, double value, double minimum_length, double left_justified, double significant_digits) {
     char text[1400];
     if (!isfinite(minimum_length) || minimum_length != floor(minimum_length) || minimum_length < 0.0 || minimum_length > 1048576.0) return false;
     if (!isfinite(significant_digits) || significant_digits != floor(significant_digits) || significant_digits < 1.0 || significant_digits > 1024.0) return false;
@@ -303,12 +505,11 @@ static bool rmc_message_convert(RmcMessage* msg, int source, double value, doubl
     if (source == 0) rmc_format_real(text, sizeof text, value, (long)significant_digits);
     else if (source == 1) { if (!isfinite(value) || value != floor(value)) return false; snprintf(text, sizeof text, "%.0f", value); }
     else { if (value != 0.0 && value != 1.0) return false; snprintf(text, sizeof text, "%s", value == 1.0 ? "true" : "false"); }
-    size_t len = strlen(text), width = (size_t)minimum_length;
-    if (len < width && left_justified == 0.0) for (size_t k = len; k < width; ++k) rmc_message_push(msg, " ", 1);
-    rmc_message_push(msg, text, len);
-    if (len < width && left_justified != 0.0) for (size_t k = len; k < width; ++k) rmc_message_push(msg, " ", 1);
+    rmc_message_padded(msg, text, (size_t)minimum_length, left_justified != 0.0);
     return true;
 }
+{%- endif %}
+{%- if rows.programs|length > 0 %}
 static {{ prefix }}Status rmc_message_rows(ModelInstance* m, double* rows) {
 {%- for program in rows.programs %}
     {
@@ -325,7 +526,7 @@ static {{ prefix }}Status rmc_message_rows(ModelInstance* m, double* rows) {
 
 {%- macro log_message(parts, rows, prefix, sink="log_assertion") %}
         {
-        RmcMessage msg = {0};
+        RmcMessage msg = {0}; msg.owner = m;
 {%- if rows.programs|length > 0 %}
         double rows[{{ rows.programs|length }}];
         bool rows_ok = rmc_message_rows(m, rows) == {{ prefix }}OK; (void)rows_ok;
@@ -338,19 +539,99 @@ static {{ prefix }}Status rmc_message_rows(ModelInstance* m, double* rows) {
 {%- endif %}
 {%- endfor %}
         {{ sink }}(m, msg.failed || !msg.data ? "assertion failed (its message could not be formatted)" : msg.data);
-        free(msg.data);
+        rmc_instance_free(msg.owner, msg.data);
         }
 {%- endmacro %}
 
+{%- macro captured_conversion(conversion) -%}
+rmc_captured_convert(&msg, {{ 0 if conversion.source == "real" else (1 if conversion.source == "integer" else 2) }}, captures[{{ conversion.value }}], {% if conversion.minimum_length is not none %}*(const int64_t*)captures[{{ conversion.minimum_length }}]{% else %}0{% endif %}, {% if conversion.left_justified is not none %}*(const bool*)captures[{{ conversion.left_justified }}]{% else %}true{% endif %}, {% if conversion.significant_digits is not none %}*(const int64_t*)captures[{{ conversion.significant_digits }}]{% else %}6{% endif %})
+{%- endmacro %}
+
+{%- macro observers(observations) %}
+{% if observations|length > 0 -%}
+static inline bool rmc_captured_convert(RmcMessage* msg, int source, const void* value, int64_t minimum_length, bool left_justified, int64_t significant_digits) {
+    if (minimum_length < 0 || minimum_length > 1048576 || significant_digits < 1 || significant_digits > 1024) return false;
+    if (source==0) return rmc_message_convert(msg, 0, *(const double*)value, (double)minimum_length, (double)left_justified, (double)significant_digits);
+    char text[64];
+    if (source==1) snprintf(text, sizeof text, "%" PRId64, *(const int64_t*)value);
+    else snprintf(text, sizeof text, "%s", *(const bool*)value ? "true" : "false");
+    rmc_message_padded(msg, text, (size_t)minimum_length, left_justified);
+    return true;
+}
+{% endif -%}
+int rmc_model_assertion(void* context, size_t predicate, const void* const captures[], size_t count) {
+    RmcModelAssertionContext* observed=context;
+    ModelInstance* m=observed->instance;
+    (void)m; (void)predicate; (void)captures; (void)count;
+{% if observations|length > 0 %}    (void)rmc_captured_convert;
+{% endif %}
+{% for observation in observations -%}
+    if (observed->owner=={{ observation.owner }} && predicate=={{ observation.predicate }}) {
+        if (count!={{ observation.capture_count }}) return 1;
+        if (observed->predicates) observed->predicates[{{ observation.predicate_index }}]=0.0;
+{% for action in observation.actions -%}
+        if (observed->mode=={{ 1 if action.kind == "error" else 2 }}) {
+{% if action.kind == "warning" -%}
+            bool repeated=m->rmc_warned[{{ action.index }}];
+            for (RmcAssertionNotice* old=observed->notices; old; old=old->next) if (old->action=={{ action.index }}) repeated=true;
+            if (!repeated) {
+{% endif -%}
+            RmcMessage msg={0}; msg.owner=m;
+{% for part in action.parts -%}
+{% if part.text is defined %}            rmc_message_push(&msg, {{ c_string(part.text) }}, {{ part.text|length }});
+{% else %}            if (!{{ captured_conversion(part.conversion) }}) msg.failed=true;
+{% endif -%}
+{% endfor -%}
+{% if action.kind == "error" -%}
+            log_assertion(m, msg.failed ? "assertion failed (its message could not be formatted)" : (msg.data ? msg.data : ""));
+            m->assertion_failed=true;
+            rmc_instance_free(msg.owner, msg.data);
+{% else -%}
+            if (msg.failed) { rmc_instance_free(msg.owner, msg.data); return 1; }
+            RmcAssertionNotice* notice=rmc_instance_allocate(m, 1, sizeof *notice);
+            if (!notice) { rmc_instance_free(msg.owner, msg.data); return 1; }
+            notice->action={{ action.index }}; notice->message=msg.data;
+            RmcAssertionNotice** tail=&observed->notices;
+            while (*tail) tail=&(*tail)->next;
+            *tail=notice;
+            }
+{% endif -%}
+        }
+{% endfor -%}
+        return 0;
+    }
+{% endfor -%}
+    return 1;
+}
+void rmc_finish_assertion_observation(RmcModelAssertionContext* context, int status) {
+    (void)status;
+    RmcAssertionNotice* notice=context->notices;
+    while (notice) {
+        RmcAssertionNotice* next=notice->next;
+{% set warnings = namespace(present=false) %}{% for observation in observations %}{% for action in observation.actions %}{% if action.kind == "warning" %}{% set warnings.present=true %}{% endif %}{% endfor %}{% endfor %}
+{% if warnings.present %}
+        if (!status) {
+            log_warning(context->instance, notice->message ? notice->message : "");
+            context->instance->rmc_warned[notice->action]=true;
+        }
+{% endif -%}
+        rmc_instance_free(context->instance, notice->message); rmc_instance_free(context->instance, notice); notice=next;
+    }
+    context->notices=NULL;
+}
+{% endmacro %}
+
+
 {%- macro assertions(solve, fmi, messages, rows, prefix) %}
 {%- if fmi.assertions and solve.events.actions|length > 0 %}
-{{ message_support(rows, prefix) }}
+{{ message_support(rows, prefix, fmi_assertion_observations|default([])|length > 0) }}
 {%- endif %}
+{{ observers(fmi_assertion_observations|default([])) }}
 static {{ prefix }}Status check_assertions(ModelInstance* m) {
     (void)m;
 {%- if fmi.assertions and (solve.events.actions | rejectattr("kind", "equalto", "Warning") | list | length > 0) %}
     if (m->assertion_failed) return {{ prefix }}Error;
-    double actions[{{ solve.events.actions|length }}];
+    double actions[{{ solve.events.actions|length }}]; (void)actions;
 {%- for program in solve.events.action_plan.programs %}
     {
     double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
@@ -359,7 +640,7 @@ static {{ prefix }}Status check_assertions(ModelInstance* m) {
 {%- endfor %}
     }
 {%- endfor %}
-{%- for action in solve.events.actions %}{% if action.kind != "Warning" %}
+{%- for action in solve.events.actions %}{% if action.kind != "Warning" and action.assertion_projection is none %}
     if (actions[{{ loop.index0 }}] != 0.0) {
 {{- log_message(messages[loop.index0], rows, prefix) }}
         m->assertion_failed = true;
@@ -375,16 +656,18 @@ static {{ prefix }}Status check_assertions(ModelInstance* m) {
 static {{ prefix }}Status report_warnings(ModelInstance* m) {
     (void)m;
 {%- if fmi.assertions and (solve.events.actions | selectattr("kind", "equalto", "Warning") | list | length > 0) %}
-    double actions[{{ solve.events.actions|length }}];
+    RmcModelAssertionContext warnings={m, 0, 2, NULL, NULL};
+    double actions[{{ solve.events.actions|length }}]; (void)actions;
 {%- for program in solve.events.action_plan.programs %}
     {
     double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
 {%- for op in program.ops %}
-{{ scalar_op(op, "actions", prefix ~ "Error") }}
+{{ scalar_op(op, "actions", prefix ~ "Error", observation_mode=2) }}
 {%- endfor %}
     }
 {%- endfor %}
-{%- for action in solve.events.actions %}{% if action.kind == "Warning" %}
+    rmc_finish_assertion_observation(&warnings, 0);
+{%- for action in solve.events.actions %}{% if action.kind == "Warning" and action.assertion_projection is none %}
     if (actions[{{ loop.index0 }}] != 0.0 && !m->rmc_warned[{{ loop.index0 }}]) {
         m->rmc_warned[{{ loop.index0 }}] = true;
 {{- log_message(messages[loop.index0], rows, prefix, "log_warning") }}
@@ -413,10 +696,25 @@ static {{ prefix }}Status update_assertion_memory(ModelInstance* m) {
 
 {%- macro assertion_lifecycle(prefix, scalar_events=none) %}
 static {{ prefix }}Status settle_values(ModelInstance* m) {
+    if (m->assertion_failed) return {{ prefix }}Error;
     if (refresh_algebraics(m) != {{ prefix }}OK) return {{ prefix }}Error;
     return m->assertions_initialized ? check_assertions(m) : {{ prefix }}OK;
 }
+{%- if scalar_events %}
+static {{ prefix }}Status rmc_observe(ModelInstance* m);
+{%- endif %}
+/* The values a public read observes: settled, then the rows a public
+   observation recomputes. */
+static {{ prefix }}Status settle_public_values(ModelInstance* m) {
+    if (settle_values(m) != {{ prefix }}OK) return {{ prefix }}Error;
+{%- if scalar_events %}
+    return rmc_observe(m);
+{%- else %}
+    return {{ prefix }}OK;
+{%- endif %}
+}
 static {{ prefix }}Status settle_derivative_values(ModelInstance* m) {
+    if (m->assertion_failed) return {{ prefix }}Error;
     if (refresh_derivative_values(m) != {{ prefix }}OK) return {{ prefix }}Error;
     return m->assertions_initialized ? check_assertions(m) : {{ prefix }}OK;
 }
@@ -445,9 +743,22 @@ static {{ prefix }}Status settle_assertion_event(ModelInstance* m) {
 {%- endmacro %}
 
 {#- The FMI value type of one inventory entry: Real is Float64, Integer and
-    enumeration ordinals are Int32, Boolean is Boolean, String is String. -#}
-{%- macro rmc_kind(variable) -%}
-{%- if variable.value_kind == "Real" %}RMC_KIND_FLOAT64{% elif variable.value_kind in ["Integer", "Enumeration"] %}RMC_KIND_INT32{% elif variable.value_kind == "Boolean" %}RMC_KIND_BOOLEAN{% elif variable.value_kind == "String" %}RMC_KIND_STRING{% else %}{{ fail("unsupported-feature:fmi.c.value-kind " ~ variable.value_kind) }}{% endif -%}
+    enumeration ordinals are Int64, Boolean is Boolean, String is String. -#}
+{#- `enumeration_kind` is the kind an importer reads an enumeration with:
+    FMI 2 Integer, FMI 3 Int64 (FMI 3.0.2 section 2.4.7.1). -#}
+{%- macro rmc_kind(variable, enumeration_kind="RMC_KIND_INT32", integer_kind="RMC_KIND_INT32") -%}
+{%- if variable.value_kind == "Real" %}RMC_KIND_FLOAT64{% elif variable.value_kind == "Enumeration" %}{{ enumeration_kind }}{% elif variable.value_kind == "Integer" %}{{ integer_kind }}{% elif variable.value_kind == "Boolean" %}RMC_KIND_BOOLEAN{% elif variable.value_kind == "String" %}RMC_KIND_STRING{% else %}{{ fail("unsupported-feature:fmi.c.value-kind " ~ variable.value_kind) }}{% endif -%}
+{%- endmacro %}
+
+{#- Public signed Integer conversion is checked before any request output is written. -#}
+{%- macro integer_publication() %}
+static bool rmc_integer_public_value(double value, unsigned bits, size_t literals) {
+    if (!isfinite(value) || trunc(value) != value) return false;
+    /* INT64_MAX rounds to 2^63 as a double: its upper bound must be open. */
+    if (bits == 32 ? (value < -2147483648.0 || value > 2147483647.0)
+                   : (value < -0x1p63 || value >= 0x1p63)) return false;
+    return literals == 0 || (value >= 1.0 && value <= (double)literals);
+}
 {%- endmacro %}
 
 {#- Instance storage of the String texts: the current text of every String
@@ -467,14 +778,16 @@ static const char* const rmc_text_start[{{ texts|length }}] = {
 };
 static const char* rmc_text(const ModelInstance* m, size_t index) { return m->text[index]; }
 static bool rmc_set_text(ModelInstance* m, size_t index, const char* value) {
-    size_t length = strlen(value); char* copy = malloc(length + 1);
+    size_t length = strlen(value);
+    if (length == SIZE_MAX) return false;
+    char* copy = rmc_instance_allocate(m, length + 1, sizeof(char));
     if (!copy) return false;
     memcpy(copy, value, length + 1);
-    free(m->text_owned[index]); m->text_owned[index] = copy; m->text[index] = copy;
+    rmc_instance_free(m, m->text_owned[index]); m->text_owned[index] = copy; m->text[index] = copy;
     return true;
 }
 static void rmc_release_text(ModelInstance* m) {
-    for (size_t k = 0; k < {{ texts|length }}; ++k) { free(m->text_owned[k]); m->text_owned[k] = NULL; m->text[k] = rmc_text_start[k]; }
+    for (size_t k = 0; k < {{ texts|length }}; ++k) { rmc_instance_free(m, m->text_owned[k]); m->text_owned[k] = NULL; m->text[k] = rmc_text_start[k]; }
 }
 /* After a bytewise copy of `src` into `dst`, give `dst` its own copies of the
    texts `src` owns; on a failed copy `dst` keeps only start texts. */
@@ -551,9 +864,13 @@ static inline bool rmc_linear_solve_component(const double* matrix, const double
      the importer defines none.
    - The next substep is h * min(max({{ plan.safety }} * err^({{ plan.exponent }}), {{ plan.min_factor }}), {{ plan.max_factor }})
      (Hairer, Norsett and Wanner, Solving ODEs I, section II.4).
+   - A trial stage whose evaluation leaves a non-finite value (for example a
+     sqrt whose argument the trial overshoots below zero) rejects its substep
+     like an error estimate above 1, so the step retries at a smaller h.
    - A communication step whose substep underflows or which attempts more
-     than {{ plan.max_substeps }} substeps returns Discard; a failed derivative
-     evaluation returns Error. The caller rolls the state back either way.
+     than {{ plan.max_substeps }} substeps returns Discard; any other failed
+     evaluation, such as an assertion, returns Error. Each logs its reason, and
+     the caller rolls the state back either way.
    Accuracy therefore follows the tolerance, not the importer's communication
    step size: a stiff mode takes as many substeps as its stability needs. */
 static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double start, double step) {
@@ -574,18 +891,28 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
     double t = start;
     double h = m->rmc_cs_substep > 0.0 ? fmin(m->rmc_cs_substep, step) : step;
     bool start_derivative = false;
+    /* Whether the latest attempt was rejected for a non-finite trial stage, so
+       a step that runs out of retries says why. */
+    bool retrying_nonfinite = false;
     for (unsigned long attempt = 0; t < end; ++attempt) {
-        if (attempt >= {{ plan.max_substeps }}UL) { RMC_LOG(m, "Co-Simulation step exceeded its substep budget"); return {{ prefix }}Discard; }
+        if (attempt >= {{ plan.max_substeps }}UL) {
+            RMC_LOG(m, retrying_nonfinite ? "Co-Simulation step exceeded its substep budget retrying a non-finite trial stage" : "Co-Simulation step exceeded its substep budget");
+            return {{ prefix }}Discard;
+        }
         const bool last = h >= end - t;
         if (last) h = end - t;
-        if (!(h > 0.0) || t + h == t) { RMC_LOG(m, "Co-Simulation substep underflowed"); return {{ prefix }}Discard; }
+        if (!(h > 0.0) || t + h == t) {
+            RMC_LOG(m, retrying_nonfinite ? "Co-Simulation substep underflowed retrying a non-finite trial stage" : "Co-Simulation substep underflowed");
+            return {{ prefix }}Discard;
+        }
         for (size_t i = 0; i < n; ++i) y0[i] = m->y[i];
         if (!start_derivative) {
             m->time = t;
-            if (evaluate_derivatives(m) != {{ prefix }}OK) return {{ prefix }}Error;
+            if (evaluate_derivatives(m) != {{ prefix }}OK) { RMC_LOG(m, "Co-Simulation derivative evaluation failed at an accepted substep start"); return {{ prefix }}Error; }
             for (size_t i = 0; i < n; ++i) k[0][i] = m->derivative[i];
             start_derivative = true;
         }
+        bool stage_rejected = false;
         for (size_t s = 0; s < 6; ++s) {
             for (size_t i = 0; i < n; ++i) {
                 double sum = 0.0;
@@ -593,8 +920,20 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
                 m->y[i] = y0[i] + h * sum;
             }
             m->time = s >= 4 && last ? end : t + c[s] * h;
-            if (evaluate_derivatives(m) != {{ prefix }}OK) return {{ prefix }}Error;
+            m->rmc_nonfinite = false;
+            if (evaluate_derivatives(m) != {{ prefix }}OK) {
+                if (!m->rmc_nonfinite || m->assertion_failed) { RMC_LOG(m, "Co-Simulation stage evaluation failed"); return {{ prefix }}Error; }
+                stage_rejected = true;
+                break;
+            }
             for (size_t i = 0; i < n; ++i) k[s + 1][i] = m->derivative[i];
+        }
+        retrying_nonfinite = stage_rejected;
+        if (stage_rejected) {
+            for (size_t i = 0; i < n; ++i) m->y[i] = y0[i];
+            m->time = t;
+            h *= {{ plan.min_factor }};
+            continue;
         }
         double error = 0.0;
         for (size_t i = 0; i < n; ++i) {
@@ -619,11 +958,79 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
         h *= factor;
     }
     m->time = end;
-    return settle_assertion_event(m);
+    const {{ prefix }}Status settled = settle_assertion_event(m);
+    if (settled == {{ prefix }}Error) RMC_LOG(m, "Co-Simulation step failed to settle its end point");
+    return settled;
 }
 {%- endmacro %}
 
 {#- Instance storage of the warning sites already reported. -#}
 {%- macro warning_fields(solve, fmi) -%}
 {%- if fmi.assertions and (solve.events.actions | selectattr("kind", "equalto", "Warning") | list | length > 0) %} bool rmc_warned[{{ solve.events.actions|length }}];{% endif -%}
+{%- endmacro %}
+
+
+{%- macro initial_values(target, owner, prefix) %}
+{% if owner.count == 0 %}
+    memset({{ target }}, 0, sizeof({{ target }}));
+{% endif %}
+{% for run in owner.runs %}
+{% if run.kind == "repeat" %}
+    { const uint64_t bits = UINT64_C({{ run.bits }});
+      for (size_t k = 0; k < {{ run.count }}; ++k) memcpy(&{{ target }}[{{ run.start }} + k], &bits, sizeof(bits)); }
+{% else %}
+    { static const uint64_t {{ prefix }}_{{ loop.index0 }}[] = { {% for bits in run.bits %}UINT64_C({{ bits }}){{ ", " if not loop.last }}{% endfor %} };
+      memcpy(&{{ target }}[{{ run.start }}], {{ prefix }}_{{ loop.index0 }}, sizeof({{ prefix }}_{{ loop.index0 }})); }
+{% endif %}
+{% endfor %}
+{%- endmacro %}
+
+{#- The one partial-pivot LU arithmetic owner, shared by primal projection
+    and total sensitivities. No ModelInstance workspace or fallback policy. -#}
+{%- macro projection_lu_kernel() %}
+/* nalgebra LU with partial pivoting on the row-major n x n matrix `a`. An
+   exactly zero multiplier or pivot-row entry contributes nothing to a finite
+   update, so those products are skipped; the arithmetic that remains is the
+   dense factorization's, in its order. */
+static void rmc_lu(double* a, size_t n, size_t* ipiv, size_t* columns) {
+    for (size_t i = 0; i < n; ++i) {
+        size_t piv = i; double best = fabs(a[i * n + i]);
+        for (size_t row = i + 1; row < n; ++row) { double value = fabs(a[row * n + i]); if (value > best) { best = value; piv = row; } }
+        ipiv[i] = i;
+        double diag = a[piv * n + i];
+        if (diag == 0.0) continue;
+        if (piv != i) {
+            ipiv[i] = piv;
+            for (size_t col = 0; col < n; ++col) { double tmp = a[i * n + col]; a[i * n + col] = a[piv * n + col]; a[piv * n + col] = tmp; }
+        }
+        double inv = 1.0 / diag; size_t count = 0; bool finite_row = true;
+        for (size_t col = i + 1; col < n; ++col) {
+            double pivot = a[i * n + col];
+            if (pivot != 0.0) columns[count++] = col;
+            if (!isfinite(pivot)) finite_row = false;
+        }
+        for (size_t row = i + 1; row < n; ++row) {
+            double multiplier = a[row * n + i] * inv;
+            a[row * n + i] = multiplier;
+            if (multiplier == 0.0 && finite_row) continue;
+            if (!finite_row || !isfinite(multiplier)) {
+                for (size_t col = i + 1; col < n; ++col) a[row * n + col] += -a[i * n + col] * multiplier;
+                continue;
+            }
+            for (size_t c = 0; c < count; ++c) { size_t col = columns[c]; a[row * n + col] += -a[i * n + col] * multiplier; }
+        }
+    }
+}
+/* nalgebra LU::solve_mut */
+static bool rmc_lu_solve(const double* lu, size_t n, const size_t* ipiv, double* b) {
+    for (size_t i = 0; i < n; ++i) if (ipiv[i] != i) { double tmp = b[i]; b[i] = b[ipiv[i]]; b[ipiv[i]] = tmp; }
+    for (size_t i = 0; i < n; ++i) { double coeff = b[i]; for (size_t row = i + 1; row < n; ++row) b[row] += -coeff * lu[row * n + i]; }
+    for (size_t i = n; i-- > 0;) {
+        double diag = lu[i * n + i];
+        if (diag == 0.0) return false;
+        double coeff = b[i] / diag; b[i] = coeff;
+        for (size_t row = 0; row < i; ++row) b[row] += -coeff * lu[row * n + i];
+    }
+    return true;
+}
 {%- endmacro %}

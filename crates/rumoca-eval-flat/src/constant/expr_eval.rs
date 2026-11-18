@@ -36,7 +36,7 @@ pub fn eval_expr_with_span(
         Expression::Literal { value: lit, .. } => Ok(eval_literal(lit)),
         Expression::VarRef {
             name, subscripts, ..
-        } => eval_var_ref(name.as_str(), subscripts, ctx, span),
+        } => eval_var_ref(name, subscripts, ctx, span),
         Expression::Binary { op, lhs, rhs, .. } => eval_flat_binary(op, lhs, rhs, ctx, span),
         Expression::Unary { op, rhs, .. } => eval_flat_unary(op, rhs, ctx, span),
         Expression::BuiltinCall { function, args, .. } => {
@@ -99,18 +99,18 @@ pub fn eval_expr_with_span(
 
 /// Evaluate a variable reference.
 fn eval_var_ref(
-    name: &str,
+    reference: &rumoca_core::Reference,
     subscripts: &[Subscript],
     ctx: &dyn EvalEnvironment,
     span: Span,
 ) -> Result<Value, EvalError> {
-    // First try as a parameter
-    if let Some(value) = ctx.get_value(name) {
-        let value = value.into_owned();
+    let name = reference.as_str();
+    let value = ctx.get_reference_value(reference);
+    if let Some(value) = value {
         return if subscripts.is_empty() {
-            Ok(value)
+            Ok(value.into_owned())
         } else {
-            apply_subscripts(&value, subscripts, ctx, span)
+            apply_subscripts(value.as_ref(), subscripts, ctx, span)
         };
     }
     // Then try as an enum literal from context
@@ -177,7 +177,7 @@ fn eval_flat_logical(
     }
 }
 
-fn logical_value_determines_result(op: &OpBinary, value: bool) -> bool {
+pub(super) fn logical_value_determines_result(op: &OpBinary, value: bool) -> bool {
     matches!((op, value), (OpBinary::And, false) | (OpBinary::Or, true))
 }
 
@@ -412,7 +412,11 @@ fn eval_flat_index(
     span: Span,
 ) -> Result<Value, EvalError> {
     let base_val = eval_expr_with_span(base, ctx, span)?;
-    apply_subscripts(&base_val, subscripts, ctx, span)
+    if subscripts.is_empty() {
+        Ok(base_val)
+    } else {
+        apply_subscripts(&base_val, subscripts, ctx, span)
+    }
 }
 
 /// Evaluate field access on a record value.
@@ -455,7 +459,7 @@ fn apply_subscripts(
     span: Span,
 ) -> Result<Value, EvalError> {
     super::subscripts::apply_subscripts(
-        value.clone(),
+        value,
         subscripts,
         |expr| eval_expr_with_span(expr, ctx, span),
         span,

@@ -1,10 +1,9 @@
 //! Solver-neutral composition of a numerical ME plugin with the common host.
 
 use indexmap::IndexMap;
-#[cfg(feature = "solver-rk45")]
 use rumoca_solver::fmi_me::MeModelArtifact;
 use rumoca_solver::{
-    SimOptions,
+    SimExecutionEngine, SimExecutionPolicy, SimExecutionReceipt, SimOptions,
     fmi_me::{
         MeExecutionBackend, MeInstanceConfig, MeIntegratorBackend, MeModelSource, MeNumericalSetup,
         driver::{advance_live_session, batch_session_options, live_session_options},
@@ -28,26 +27,50 @@ pub(crate) struct BackendSimulationSession {
     session: MeSimulationSession<'static, 'static>,
     input_names: Vec<String>,
     variable_names: Vec<String>,
+    execution: SimExecutionReceipt,
+    execution_backend: Option<MeExecutionBackend>,
 }
 
 impl BackendSimulationSession {
     pub(crate) fn new(
-        source: MeModelSource<'_>,
+        artifact: &MeModelArtifact,
         opts: &SimOptions,
         execution_backend: Option<MeExecutionBackend>,
         instance_name: &'static str,
         integrator: IntegratorFactory,
     ) -> Result<Self, SimError> {
-        let host = initialized_host(source, opts, execution_backend, instance_name)?;
-        let variable_names = host.output_names();
+        let execution = artifact.execution_receipt().unwrap_or_else(|| {
+            SimExecutionReceipt::admission(
+                SimExecutionPolicy::Interpreter,
+                0,
+                0,
+                SimExecutionEngine::Interpreter,
+            )
+        });
+        let handle = execution_backend.clone();
+        let host = initialized_host(artifact.source(), opts, execution_backend, instance_name)?;
+        let variable_names = host.output_names()?;
         let plugin = plugin_for_host(&host, opts, integrator)?;
         let session = host.into_session(plugin)?;
-        let input_names = session.input_names();
+        let input_names = session.input_names().to_vec();
         Ok(Self {
             session,
             input_names,
             variable_names,
+            execution,
+            execution_backend: handle,
         })
+    }
+
+    /// The engine selection with the compile requests the backend has declined
+    /// so far; compilation is lazy, so the list can grow as the session runs.
+    pub(crate) fn execution_receipt(&self) -> SimExecutionReceipt {
+        let declined = self
+            .execution_backend
+            .as_ref()
+            .map(MeExecutionBackend::declined)
+            .unwrap_or_default();
+        self.execution.clone().with_declined(declined)
     }
 
     pub(crate) fn set_inputs(&mut self, inputs: &[(&str, f64)]) -> Result<(), SimError> {
@@ -122,7 +145,7 @@ pub(crate) fn initialized_host(
     let root_location = source.root_location();
     let retained = MeRetainedComponent::instantiate(
         source,
-        &instance_config(instance_name, opts, None)?,
+        &MeInstanceConfig::open_ended(instance_name, opts.rtol, opts.t_start)?,
         execution_backend,
     )?;
     let options = live_session_options(
@@ -150,7 +173,7 @@ pub(crate) fn simulate_artifact(
     let mut cursor = batch_output_cursor(&options)?;
     let retained = MeRetainedComponent::instantiate(
         artifact.source(),
-        &instance_config(instance_name, opts, Some(opts.t_end))?,
+        &instance_config(instance_name, opts)?,
         execution_backend,
     )?;
     let host = retained.into_lease(options)?;
@@ -187,12 +210,11 @@ pub(crate) fn plugin_for_host(
 pub(crate) fn instance_config(
     instance_name: &'static str,
     opts: &SimOptions,
-    stop_time: Option<f64>,
 ) -> Result<MeInstanceConfig, SimError> {
-    MeInstanceConfig::new(instance_name, opts.rtol, opts.t_start, stop_time).map_err(Into::into)
+    MeInstanceConfig::new(instance_name, opts.rtol, opts.t_start, opts.t_end).map_err(Into::into)
 }
 
-fn default_output_dt(opts: &SimOptions) -> f64 {
+pub(crate) fn default_output_dt(opts: &SimOptions) -> f64 {
     opts.dt
         .filter(|dt| dt.is_finite() && *dt > 0.0)
         .unwrap_or_else(|| ((opts.t_end - opts.t_start).abs() / 500.0).max(1.0e-3))

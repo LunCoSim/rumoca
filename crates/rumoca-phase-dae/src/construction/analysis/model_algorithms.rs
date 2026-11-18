@@ -1,6 +1,12 @@
 use super::*;
 
 pub(in crate::construction) enum ModelAlgorithmPlan {
+    /// One total tuple assignment to continuous coordinates, with no sequential
+    /// intermediate reads: the checked call owns all retained result ordinals.
+    DeclarativeFunctionCall {
+        receivers: Vec<Expression>,
+        plan: MultiOutputEquationPlan,
+    },
     Declarative {
         target: VarName,
     },
@@ -50,6 +56,9 @@ pub(super) fn analyze_model_algorithm(
     if let Some(assertions) = assertion_only_algorithm(flat, algorithm) {
         return Ok(ModelAlgorithmPlan::Assertions { assertions });
     }
+    if let Some(sections) = split_algorithm_checks(flat, algorithm) {
+        return analyze_algorithm_sections(flat, sections, roles, shapes);
+    }
     if contains_event_control(&algorithm.statements) {
         let targets = model_algorithm_targets(flat, algorithm);
         if targets.iter().any(|target| {
@@ -65,14 +74,7 @@ pub(super) fn analyze_model_algorithm(
                     algorithm.span,
                 ));
             };
-            let sections = sections
-                .into_iter()
-                .map(|section| {
-                    analyze_model_algorithm(flat, &section, roles, shapes)
-                        .map(|plan| (section, plan))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            return Ok(ModelAlgorithmPlan::Sections { sections });
+            return analyze_algorithm_sections(flat, sections, roles, shapes);
         }
         let mut tensor_loops = HashMap::new();
         analyze_event_tensor_loops(flat, &algorithm.statements, model_values, &mut tensor_loops)?;
@@ -128,29 +130,142 @@ pub(super) fn analyze_model_algorithm(
     })
 }
 
-/// The assert equations of an algorithm whose statements are all `assert`
-/// (empty statements aside), or `None` for any other algorithm.
+fn analyze_algorithm_sections(
+    flat: &flat::Model,
+    sections: Vec<flat::Algorithm>,
+    roles: &HashMap<VarName, PlannedRole>,
+    shapes: &FunctionShapeAnalysis,
+) -> Result<ModelAlgorithmPlan, ToDaeError> {
+    let sections = sections
+        .into_iter()
+        .map(|section| {
+            analyze_model_algorithm(flat, &section, roles, shapes).map(|plan| (section, plan))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ModelAlgorithmPlan::Sections { sections })
+}
+
+/// The assert equations of an algorithm whose statements only check (see
+/// [`statement_checks`]), or `None` for any other algorithm.
 fn assertion_only_algorithm(
     flat: &flat::Model,
     algorithm: &flat::Algorithm,
 ) -> Option<Vec<flat::AssertEquation>> {
+    let origin = flat::EquationOrigin::Algorithm {
+        component: algorithm.origin.clone(),
+    };
     let mut assertions = Vec::new();
     for statement in &algorithm.statements {
-        if matches!(statement, rumoca_core::Statement::Empty { .. }) {
-            continue;
+        if !statement_checks(flat, statement, None, &origin, &mut assertions) {
+            return None;
         }
-        let assertion = assertion_call(flat, statement)?;
+    }
+    (!assertions.is_empty()).then_some(assertions)
+}
+
+/// Collect the assertions of a statement that writes nothing: an `assert`, an
+/// empty statement, or an `if` whose branches hold only such statements.
+/// Returns `false` for any other statement.
+///
+/// A check inside branch `k` of an `if` chain runs when every earlier
+/// condition is false and `c_k` holds (MLS §11.2.6), so it asserts
+/// `guard implies condition` for that branch guard, the form initial
+/// algorithms give a guarded check too.
+fn statement_checks(
+    flat: &flat::Model,
+    statement: &rumoca_core::Statement,
+    guard: Option<&Expression>,
+    origin: &flat::EquationOrigin,
+    assertions: &mut Vec<flat::AssertEquation>,
+) -> bool {
+    if let Some(assertion) = assertion_call(flat, statement) {
         assertions.push(flat::AssertEquation::new(
-            assertion.condition.clone(),
+            guard_condition(guard, assertion.condition.clone(), assertion.span),
             assertion.message.clone(),
             assertion.level.cloned(),
             assertion.span,
-            flat::EquationOrigin::Algorithm {
-                component: algorithm.origin.clone(),
-            },
+            origin.clone(),
         ));
+        return true;
     }
-    (!assertions.is_empty()).then_some(assertions)
+    match statement {
+        rumoca_core::Statement::Empty { .. } => true,
+        rumoca_core::Statement::If {
+            cond_blocks,
+            else_block,
+            span,
+        } => {
+            let mut unreached = Vec::with_capacity(cond_blocks.len());
+            let branch_checks =
+                |statements: &[rumoca_core::Statement],
+                 reached: Vec<Expression>,
+                 assertions: &mut Vec<flat::AssertEquation>| {
+                    let branch_guard =
+                        conjunction(guard.cloned().into_iter().chain(reached).collect(), *span);
+                    statements.iter().all(|statement| {
+                        statement_checks(flat, statement, branch_guard.as_ref(), origin, assertions)
+                    })
+                };
+            for block in cond_blocks {
+                let reached = unreached
+                    .iter()
+                    .cloned()
+                    .chain([block.cond.clone()])
+                    .collect();
+                if !branch_checks(&block.stmts, reached, assertions) {
+                    return false;
+                }
+                unreached.push(negate(&block.cond, *span));
+            }
+            else_block
+                .as_deref()
+                .is_none_or(|fallback| branch_checks(fallback, unreached, assertions))
+        }
+        _ => false,
+    }
+}
+
+/// Split the top-level checks of an algorithm from the statements that
+/// assign, when the algorithm has both and no check reads a value the
+/// algorithm writes.
+///
+/// Such a check reads the same values wherever it stands in the section, so
+/// it is its own assertion section, and the assignments form the section that
+/// defines the algorithm's targets.
+fn split_algorithm_checks(
+    flat: &flat::Model,
+    algorithm: &flat::Algorithm,
+) -> Option<Vec<flat::Algorithm>> {
+    let origin = flat::EquationOrigin::Algorithm {
+        component: algorithm.origin.clone(),
+    };
+    let targets = model_algorithm_targets(flat, algorithm)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut checks = Vec::new();
+    let mut assigning = Vec::new();
+    for statement in &algorithm.statements {
+        let mut assertions = Vec::new();
+        if matches!(statement, rumoca_core::Statement::Empty { .. })
+            || !statement_checks(flat, statement, None, &origin, &mut assertions)
+        {
+            assigning.push(statement.clone());
+            continue;
+        }
+        let mut reads = Vec::new();
+        collect_statement_reads(statement, &mut reads);
+        if reads.iter().any(|read| targets.contains(read)) {
+            return None;
+        }
+        checks.push(statement.clone());
+    }
+    if checks.is_empty() || assigning.is_empty() {
+        return None;
+    }
+    Some(vec![
+        flat::Algorithm::new(checks, algorithm.span, algorithm.origin.clone()),
+        flat::Algorithm::new(assigning, algorithm.span, algorithm.origin.clone()),
+    ])
 }
 
 fn analyze_event_tensor_loops(
@@ -310,6 +425,7 @@ fn event_tensor_domain(
     let mut binder_spans = Vec::with_capacity(indices.len());
     for (ordinal, (index, extent)) in indices.iter().zip(dimensions).enumerate() {
         binders.push(StructuredIndexBinder {
+            provenance: index.binder,
             id: ordinal,
             display_name: index.ident.clone(),
             lower: 1,
@@ -467,6 +583,7 @@ fn analyze_separated_array_sum(
         validate_total_axis(index, subscript, *extent, model_values)?;
         let range_span = expression_span(&index.range)?;
         binders.push(StructuredIndexBinder {
+            provenance: index.binder,
             id: ordinal,
             display_name: index.ident.clone(),
             lower: 1,
@@ -650,6 +767,7 @@ fn analyze_total_array_definition(
         validate_total_axis(index, subscript, *extent, model_values)?;
         let range_span = expression_span(&index.range)?;
         binders.push(StructuredIndexBinder {
+            provenance: index.binder,
             id: ordinal,
             display_name: index.ident.clone(),
             lower: 1,
@@ -795,7 +913,7 @@ fn validate_declarative_sequence(
     Ok(assigned)
 }
 
-fn reject_read_before_definition(
+pub(super) fn reject_read_before_definition(
     expression: &Expression,
     target: &VarName,
     assigned: bool,
@@ -820,7 +938,24 @@ fn reject_read_before_definition(
 pub(in crate::construction) fn event_targets(flat: &flat::Model) -> HashSet<VarName> {
     let mut written = when_chain_targets(flat);
     for algorithm in &flat.algorithms {
-        collect_event_control_targets(&algorithm.statements, &mut written);
+        collect_event_control_targets(
+            &algorithm.statements,
+            EventTargetScope::EventControl,
+            &mut written,
+        );
+    }
+    resolve_written_targets(flat, written)
+}
+
+/// Actual when ownership, excluding an ordinary if(sample(...)) event observer.
+pub(super) fn source_when_targets(flat: &flat::Model) -> HashSet<VarName> {
+    let mut written = when_chain_targets(flat);
+    for algorithm in &flat.algorithms {
+        collect_event_control_targets(
+            &algorithm.statements,
+            EventTargetScope::WhenOnly,
+            &mut written,
+        );
     }
     resolve_written_targets(flat, written)
 }
@@ -934,8 +1069,15 @@ pub(in crate::construction) fn is_event_condition(expression: &Expression) -> bo
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventTargetScope {
+    EventControl,
+    WhenOnly,
+}
+
 fn collect_event_control_targets(
     statements: &[rumoca_core::Statement],
+    scope: EventTargetScope,
     targets: &mut HashSet<VarName>,
 ) {
     for statement in statements {
@@ -946,16 +1088,21 @@ fn collect_event_control_targets(
                 }
             }
             rumoca_core::Statement::For { equations, .. } => {
-                collect_event_control_targets(equations, targets);
+                collect_event_control_targets(equations, scope, targets);
             }
             rumoca_core::Statement::While { block, .. } => {
-                collect_event_control_targets(&block.stmts, targets);
+                collect_event_control_targets(&block.stmts, scope, targets);
             }
             rumoca_core::Statement::If {
                 cond_blocks,
                 else_block,
                 ..
-            } => collect_conditional_event_targets(cond_blocks, else_block.as_deref(), targets),
+            } => collect_conditional_event_targets(
+                cond_blocks,
+                else_block.as_deref(),
+                scope,
+                targets,
+            ),
             _ => {}
         }
     }
@@ -964,9 +1111,11 @@ fn collect_event_control_targets(
 fn collect_conditional_event_targets(
     blocks: &[rumoca_core::StatementBlock],
     fallback: Option<&[rumoca_core::Statement]>,
+    scope: EventTargetScope,
     targets: &mut HashSet<VarName>,
 ) {
-    let event_control = blocks.iter().any(|block| is_event_condition(&block.cond));
+    let event_control = scope == EventTargetScope::EventControl
+        && blocks.iter().any(|block| is_event_condition(&block.cond));
     for statements in blocks
         .iter()
         .map(|block| block.stmts.as_slice())
@@ -975,7 +1124,7 @@ fn collect_conditional_event_targets(
         if event_control {
             collect_statement_targets(statements, targets);
         } else {
-            collect_event_control_targets(statements, targets);
+            collect_event_control_targets(statements, scope, targets);
         }
     }
 }
@@ -985,6 +1134,9 @@ fn collect_when_equation_targets(equations: &[flat::WhenEquation], targets: &mut
         match equation {
             flat::WhenEquation::Assign { target, .. } => {
                 targets.insert(target.clone());
+            }
+            flat::WhenEquation::AssignElement { target, .. } => {
+                targets.insert(target.var_name().clone());
             }
             flat::WhenEquation::Conditional {
                 branches,

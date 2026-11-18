@@ -66,11 +66,7 @@ impl ExactRefreshAssignmentSchedule {
                 targets,
             })
             .collect::<Vec<_>>();
-        let segments = SharedValueSegments::derive(&programs).map_err(|error| {
-            ContinuousRefreshConstructionError {
-                reason: format!("shared-value segments cannot be constructed: {error:?}"),
-            }
-        })?;
+        let segments = SharedValueSegments::derive(&programs);
         // The checker is the construction proof that the segments compute the
         // programs' values; it runs once here, never while executing them.
         if let Err(error) = segments.check(&programs) {

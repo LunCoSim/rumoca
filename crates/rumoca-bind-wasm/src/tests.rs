@@ -8,13 +8,39 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::source_root_api::sync_workspace_sources_with_cache_root_for_tests;
 
+mod compile_wire_tests;
+#[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
+mod compiled_model_tests;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-assignments"))]
+mod function_fold_scope_tests;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-assignments"))]
+mod function_tuple_loop_tests;
+#[cfg(feature = "sim-rk45")]
+mod input_event_tests;
 mod lsp_diagnostics_tests;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-assignments"))]
+mod native_assignment_tests;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-assignments"))]
+mod native_mixed_assignment_tests;
+#[cfg(feature = "sim-rk45")]
+mod periodic_clock_tests;
 mod portable_source_root_tests;
 mod scenario_config_tests;
+mod session_recovery_tests;
 mod simulation_runtime_tests;
+mod solve_render_tests;
 mod source_modelica_roundtrip_tests;
 mod source_root_api_tests;
+mod user_guide_config_fragment_tests;
 mod user_guide_examples_tests;
+#[cfg(feature = "sim-rk45")]
+mod user_guide_fragment_tests;
+mod user_guide_inline_tests;
+mod user_guide_inventory;
+mod user_guide_samples;
+#[cfg(all(not(target_arch = "wasm32"), feature = "sim-rk45"))]
+mod user_guide_scenario_tests;
+mod user_guide_sources;
 mod wasm_cache_tests;
 mod workspace_config_api_tests;
 
@@ -215,8 +241,15 @@ fn test_get_version() {
 
 #[test]
 fn test_get_git_commit() {
-    let commit = get_git_commit();
-    assert!(!commit.is_empty());
+    let identity = rumoca_tool_build_info::build_identity();
+    assert_eq!(get_git_commit().as_deref(), identity);
+    let provenance = crate::compiler_provenance();
+    assert_eq!(provenance["git_commit"].as_str(), identity);
+    assert_eq!(
+        provenance["git_merge_parents"],
+        serde_json::json!(rumoca_tool_build_info::build_merge_parents())
+    );
+    assert_eq!(provenance["version"], env!("CARGO_PKG_VERSION"));
 }
 
 #[test]
@@ -1583,7 +1616,7 @@ fn test_render_target_wrapper_serializes_target_files() {
         .get("dae_native")
         .expect("compile response should contain dae_native");
 
-    let rendered = render_target(&native.to_string(), "SimpleDecay", "c-ode", "", "{}")
+    let rendered = render_target(&native.to_string(), "SimpleDecay", "dae-modelica", "", "{}")
         .expect("render target should succeed");
     let decoded: serde_json::Value = decode_wasm_value(rendered);
     assert!(
@@ -1591,9 +1624,9 @@ fn test_render_target_wrapper_serializes_target_files() {
             .get("files")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|files| files.iter().any(|file| {
-                file.get("path").and_then(serde_json::Value::as_str) == Some("SimpleDecay_ode.c")
+                file.get("path").and_then(serde_json::Value::as_str) == Some("SimpleDecay_dae.mo")
             })),
-        "render target should include the checked ODE RHS C target file"
+        "render target should include the canonical DAE Modelica target file"
     );
 }
 
@@ -1631,11 +1664,10 @@ fn test_compile_to_json_uses_native_only_shape() {
     );
     assert!(
         parsed
-            .get("dae_native")
-            .and_then(|dae| dae.get("__rumoca_build"))
+            .get("__rumoca_build")
             .and_then(serde_json::Value::as_object)
             .is_some(),
-        "native DAE payload should include build metadata"
+        "compile response should include build metadata outside canonical DAE payloads"
     );
 }
 

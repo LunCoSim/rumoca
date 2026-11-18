@@ -625,6 +625,23 @@ fn max_reg_in_op(
             }
             last
         }
+        LinearOp::PureCallObservation {
+            dst_start,
+            input_starts,
+            site,
+        } => {
+            let mut last =
+                checked_reg_range_last(dst_start, site.output_scalar_count(), kind, span)?;
+            for (start, value_type) in input_starts.iter().zip(site.value_site().inputs()) {
+                last = last.max(checked_reg_range_last(
+                    *start,
+                    value_type.scalar_count() as usize,
+                    kind,
+                    span,
+                )?);
+            }
+            last
+        }
         LinearOp::PureCallDirectional {
             dst_start,
             input_starts,
@@ -657,14 +674,11 @@ fn max_reg_in_op(
         } => {
             let mut last = 0;
             for update in updates {
-                let value_count = dimensions.iter().zip(update.subscripts.iter()).try_fold(
-                    1usize,
-                    |count, (&extent, subscript)| {
-                        if matches!(subscript, rumoca_ir_solve::TensorSubscript::Whole) {
-                            checked_product(count, extent as usize, kind, span)
-                        } else {
-                            Ok(count)
-                        }
+                let value_count = update.value_count(&dimensions).ok_or(
+                    ScalarizeError::RegisterIndexOverflow {
+                        kind,
+                        index: usize::MAX,
+                        span,
                     },
                 )?;
                 let element_offset = checked_product(
@@ -681,13 +695,8 @@ fn max_reg_in_op(
                     kind,
                     span,
                 )?);
-                for subscript in &update.subscripts {
-                    if let rumoca_ir_solve::TensorSubscript::Index(
-                        rumoca_ir_solve::TensorIndex::Runtime(register),
-                    ) = subscript
-                    {
-                        last = last.max(*register);
-                    }
+                if let Some(coordinate) = update.last_coordinate_register() {
+                    last = last.max(coordinate);
                 }
                 if let Some(condition) = update.condition {
                     last = last.max(condition);

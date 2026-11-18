@@ -54,6 +54,20 @@ fn assert_refused(message: &str, mutate: impl FnOnce(&mut SolveModel)) {
     );
 }
 
+#[test]
+fn c_profile_refuses_nonfinite_initialization_runs_without_dense_recovery() {
+    for value in [
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7ff8_0000_0000_1234),
+    ] {
+        assert_refused("non-finite initialization", |model| {
+            model.parameters.set(0, value).unwrap();
+            assert!(!model.parameters.has_dense_view());
+        });
+    }
+}
+
 /// One initialization residual row with the given role.
 fn one_initial_row(model: &mut SolveModel, role: InitializationRowRole) {
     let mut initialization = model.problem.initialization.clone().into_input();
@@ -70,8 +84,32 @@ const SETTLED: InitializationRowRole = InitializationRowRole::SurplusAlgebraicCh
 fn initialization_rows_over_declaration_seeds_are_refused() {
     assert_refused(
         "C initialization evaluates residual rows only on the settled algebraic refresh",
-        |model| one_initial_row(model, InitializationRowRole::SurplusCheck),
+        |model| {
+            one_initial_row(model, InitializationRowRole::SurplusCheck);
+            model.problem.layout = crate::VarLayout::from_parts(Default::default(), 1, 2);
+            model.initial_y = crate::SolveInitialValues::repeat(0.0, 1).unwrap();
+            let mut initialization = model.problem.initialization.clone().into_input();
+            initialization.residual = ComputeBlock::from_scalar_program_block(rows(vec![vec![
+                LinearOp::LoadY { dst: 0, index: 0 },
+                LinearOp::StoreOutput { src: 0 },
+            ]]));
+            model.problem.initialization =
+                crate::InitializationSolveSystem::construct(initialization)
+                    .expect("one declaration-seed row is a checked initialization");
+        },
     );
+}
+
+#[test]
+fn constant_initialization_row_is_settled_without_declaration_seed_isolation() {
+    let (mut model, input) = super::max_step_duration_local::delay_bearing_model_with_one_run();
+    model.problem.events.delays = SolveDelayPartition::default();
+    one_initial_row(&mut model, InitializationRowRole::SurplusCheck);
+    FmiComponent::construct(model, vec![input])
+        .expect("the fixture is a checked component")
+        .into_codegen_view()
+        .try_c()
+        .expect("a constant row reads no declaration seed");
 }
 
 #[test]
@@ -104,6 +142,7 @@ fn solver_coordinates_that_do_not_fill_the_y_storage_are_refused() {
         |model| {
             one_initial_row(model, SETTLED);
             model.problem.layout = crate::VarLayout::from_parts(Default::default(), 1, 2);
+            model.initial_y = crate::SolveInitialValues::repeat(0.0, 1).unwrap();
         },
     );
 }
@@ -132,12 +171,26 @@ fn one_discrete_row(model: &mut SolveModel, role: DiscreteRowRole) {
 #[test]
 fn event_edge_actions_are_refused() {
     assert_refused(
-        "event-edge discrete actions need event iteration",
+        "the C profile executes only discrete equations and condition memories",
         |model| {
             static_partition(model);
             one_discrete_row(model, DiscreteRowRole::EventAction);
         },
     );
+}
+
+#[test]
+fn sample_tick_pulse_buffers_publish_their_exact_producer() {
+    let (mut model, input) = super::max_step_duration_local::delay_bearing_model_with_one_run();
+    model.problem.events.delays = SolveDelayPartition::default();
+    static_partition(&mut model);
+    one_discrete_row(&mut model, DiscreteRowRole::PulseConditionMemory);
+    let component = FmiComponent::construct(model, vec![input]).unwrap();
+    let view = component.into_codegen_view().try_c().unwrap();
+    let events = &serde_json::to_value(view).unwrap()["scalar_events"];
+    assert_eq!(events["condition_memory_rows"], serde_json::json!([true]));
+    assert_eq!(events["pulse_rows"], serde_json::json!([0]));
+    assert_eq!(events["pulse_programs"], serde_json::json!([0]));
 }
 
 #[test]
@@ -155,24 +208,35 @@ fn clocked_previous_history_is_refused() {
     );
 }
 
+/// A pre() value the continuous kernel reads follows events, which the
+/// parameter-determined partition never runs: the event iteration takes it.
 #[test]
-fn a_pre_value_read_by_the_continuous_kernel_is_refused() {
-    assert_refused(
-        "the continuous kernel reads a condition memory or a pre() value",
-        |model| {
-            static_partition(model);
-            model.problem.solve_layout.pre_param_bindings = vec![PreParamBinding {
-                dest_p_index: 0,
-                source: PreParamSource::P { index: 1 },
-                clock_schedule: None,
-            }];
-            model.problem.continuous.residual =
-                ComputeBlock::from_scalar_program_block(rows(vec![vec![
-                    LinearOp::LoadP { dst: 0, index: 0 },
-                    LinearOp::StoreOutput { src: 0 },
-                ]]));
-        },
-    );
+fn a_pre_value_read_by_the_continuous_kernel_runs_through_the_event_iteration() {
+    let (mut model, input) = super::max_step_duration_local::delay_bearing_model_with_one_run();
+    model.problem.events.delays = SolveDelayPartition::default();
+    static_partition(&mut model);
+    model.problem.solve_layout.pre_param_bindings = vec![PreParamBinding {
+        dest_p_index: 0,
+        source: PreParamSource::P { index: 1 },
+        clock_schedule: None,
+    }];
+    model.problem.continuous.residual = ComputeBlock::from_scalar_program_block(rows(vec![vec![
+        LinearOp::LoadP { dst: 0, index: 0 },
+        LinearOp::StoreOutput { src: 0 },
+    ]]));
+    let refusal = super::static_assertions::validate(&model)
+        .map(|_| ())
+        .expect_err("the static partition refuses a pre() read");
+    assert!(matches!(
+        refusal,
+        super::static_assertions::StaticRefusal::EventIteration(message)
+            if message.contains("the continuous kernel reads a condition memory or a pre() value")
+    ));
+    FmiComponent::construct(model, vec![input])
+        .expect("the fixture is a checked component")
+        .into_codegen_view()
+        .try_c()
+        .expect("the event iteration executes the pre() read");
 }
 
 #[test]
@@ -182,6 +246,7 @@ fn a_projection_plan_without_residual_rows_is_refused() {
         |model| {
             let mut initialization = model.problem.initialization.clone().into_input();
             initialization.projection_plan = crate::InitializationProjectionPlan {
+                iterates_discretes: false,
                 blocks: vec![crate::InitializationProjectionBlock::default()],
             };
             model.problem.initialization =
@@ -218,6 +283,7 @@ fn assertion_on_parameter(model: &mut SolveModel) {
         span: span(),
         origin: "assertion fixture".into(),
         clock_owner: None,
+        assertion_projection: None,
     }];
     events.action_conditions = rows(vec![vec![
         LinearOp::LoadP { dst: 0, index: 1 },
@@ -297,6 +363,7 @@ fn a_parameter_read_only_inside_a_nested_program_stays_settable() {
     let fold = crate::FunctionFoldProgram::checked(
         rumoca_core::StructuredIndexDomain {
             binders: vec![rumoca_core::StructuredIndexBinder {
+                provenance: rumoca_core::IndexBinderProvenance::Generated,
                 id: 0,
                 display_name: "i".to_string(),
                 lower: 1,
@@ -348,4 +415,133 @@ fn a_parameter_read_only_inside_a_nested_program_stays_settable() {
         "parameter",
         "a conditional arm read keeps the parameter settable"
     );
+}
+
+#[test]
+fn a_projection_holding_discretes_is_refused() {
+    assert_refused(
+        "C initialization cannot alternate the projection with held discretes",
+        |model| {
+            let mut initialization = model.problem.initialization.clone().into_input();
+            initialization.projection_plan.iterates_discretes = true;
+            model.problem.initialization =
+                crate::InitializationSolveSystem::construct(initialization)
+                    .expect("the flag does not change the checked shape");
+        },
+    );
+}
+
+/// A model whose only event is the tick of one periodic clock.
+fn ticking_model(schedule: PeriodicEventSchedule) -> (SolveModel, crate::fmi::FmiVariableInput) {
+    let (mut model, input) = super::max_step_duration_local::delay_bearing_model_with_one_run();
+    model.problem.events.delays = SolveDelayPartition::default();
+    model.problem.clocks.periodic_event_schedules = vec![schedule];
+    model.problem.clocks.activation_parameter_indices = vec![0];
+    (model, input)
+}
+
+/// SPEC_0044 ME-EVENT-002: a periodic clock is a time event the component
+/// announces, carried as the exact ratio of its ticks.
+#[test]
+fn a_periodic_clock_is_a_time_event_with_an_exact_tick_ratio() {
+    let (model, input) = ticking_model(PeriodicEventSchedule::from_seconds(0.1, 0.0).unwrap());
+    let view = FmiComponent::construct(model, vec![input])
+        .expect("the fixture is a checked component")
+        .into_codegen_view()
+        .try_c()
+        .expect("a clock tick is a time event");
+    let events = &serde_json::to_value(&view).unwrap()["scalar_events"]["time_events"];
+    let clock = &events["clocks"][0];
+    assert_eq!(clock["denominator"], 10.0);
+    assert_eq!(clock["period_numerator"], 1.0);
+    assert_eq!(clock["phase_numerator"], 0.0);
+    assert_eq!(clock["activation"], 0);
+    assert_eq!(
+        events["match_tolerance"],
+        rumoca_core::SCHEDULE_TIME_RELATIVE_TOLERANCE
+    );
+}
+
+/// A phase anchored at the simulation start needs the experiment's start time,
+/// which the packaged component learns only when it is set up.
+#[test]
+fn a_clock_anchored_at_the_simulation_start_is_refused() {
+    let lattice = rumoca_core::ClockLattice::from_seconds(0.1, 0.0).unwrap();
+    let schedule = PeriodicEventSchedule::from_schedule(
+        rumoca_core::PeriodicClockSchedule::simulation_start_relative(lattice).unwrap(),
+    )
+    .unwrap();
+    let (model, input) = ticking_model(schedule);
+    let refused = FmiComponent::construct(model, vec![input])
+        .expect("the fixture is a checked component")
+        .into_codegen_view()
+        .try_c()
+        .expect_err("the anchor is unresolved")
+        .to_string();
+    assert!(
+        refused.contains("anchored at the simulation start"),
+        "{refused}"
+    );
+}
+
+fn mode_declaration() -> rumoca_core::EnumerationDeclaration {
+    rumoca_core::EnumerationDeclaration {
+        name: "Flight.Mode".to_string(),
+        literals: vec!["Off".to_string(), "Climb".to_string()],
+    }
+}
+
+/// SPEC_0044 ME-EVENT-002: only an enumeration variable carries an
+/// enumeration declaration, so a Real that names one is not a checked entry.
+#[test]
+fn an_enumeration_declaration_belongs_to_enumeration_variables_only() {
+    let (mut model, mut input) = super::max_step_duration_local::delay_bearing_model_with_one_run();
+    model.problem.events.delays = SolveDelayPartition::default();
+    input.enumeration = Some(mode_declaration());
+    let error = FmiComponent::construct(model, vec![input])
+        .expect_err("a Real variable has no enumeration type");
+    assert!(
+        matches!(
+            error,
+            crate::fmi::FmiComponentError::StorageTypeMismatch { .. }
+        ),
+        "{error:?}"
+    );
+}
+
+/// An enumeration variable publishes its type definition once, however many
+/// variables are declared with it.
+#[test]
+fn an_enumeration_variable_publishes_its_type_definition() {
+    let (mut model, mut input) = super::max_step_duration_local::delay_bearing_model_with_one_run();
+    model.problem.events.delays = SolveDelayPartition::default();
+    let kind = crate::SolveVariableValueKind::Enumeration;
+    model.problem.solve_layout.variable_storage_runs[0].value_kind = kind;
+    model.problem.solve_layout.variable_declarations = vec![crate::SolveVariableDeclaration::new(
+        crate::SolveVariableStorageRole::Parameter,
+        kind,
+    )];
+    input.value_kind = kind;
+    input.start = crate::SolveDeclarationStart::Enumeration(
+        crate::SolveExactInitialValues::construct(
+            1,
+            vec![crate::SolveExactInitialRun::Literal {
+                start: 0,
+                values: vec![2],
+            }],
+        )
+        .unwrap(),
+    );
+    input.enumeration = Some(mode_declaration());
+    let view = FmiComponent::construct(model, vec![input])
+        .expect("an enumeration variable with its declaration is checked")
+        .into_codegen_view()
+        .try_c()
+        .expect("an enumeration parameter is exported");
+    let json = serde_json::to_value(&view).unwrap();
+    assert_eq!(
+        json["enumerations"],
+        serde_json::json!([{"name": "Flight.Mode", "literals": ["Off", "Climb"]}])
+    );
+    assert_eq!(json["variables"][0]["enumeration"]["name"], "Flight.Mode");
 }

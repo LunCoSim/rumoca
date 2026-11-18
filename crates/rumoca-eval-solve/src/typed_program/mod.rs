@@ -1,24 +1,49 @@
+mod algorithm_block;
+mod assertions;
+mod assigned_state;
+mod elements;
 mod linear_solve;
-mod number;
+mod native;
+pub(crate) mod number;
+mod observation;
+mod payload;
 mod tensor;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, hash_map::Entry};
-
 use rumoca_core::Span;
 use rumoca_core::StructuredIndexDomain;
 use rumoca_ir_solve::{
-    SolveBinaryOperator, SolveOperation, SolveProgramRegion, SolvePureCallOwner,
-    SolvePureCallOwnerId, SolvePureCallTable, SolveRealFormat, SolveReductionOperator,
-    SolveRegisterId, SolveScalarType, SolveSlotId, SolveTensorViewAxis, SolveValue, SolveValueKind,
-    SolveValueType, TypedProgram,
+    SolveAlgorithmBlock, SolveBinaryOperator, SolveOperation, SolveProgramRegion,
+    SolvePureCallOwner, SolvePureCallOwnerId, SolvePureCallTable, SolveRealFormat,
+    SolveReductionOperator, SolveRegisterId, SolveScalarType, SolveSlotId, SolveStorageClass,
+    SolveTensorViewAxis, SolveValue, SolveValueKind, SolveValueType, TypedProgram,
 };
 
+pub use algorithm_block::eval_algorithm_method;
+pub use assertions::TypedAssertionFailure;
+use assertions::{AssertionStop, InvocationCompletion, ObservedAssertion};
+pub(crate) use elements::element_matches_type;
+use elements::{
+    ResolvedTensorViewAxis, increment_coordinate, invalid, invalid_error, project_slice,
+    project_tensor_view, row_major_offset, scalar_boolean, scalar_element, scalar_integer,
+    select_modelica_element, tensor_view_coordinate,
+};
 use number::{
     eval_binary_element, eval_binary_typed, eval_compare_typed, eval_convert_typed,
     eval_unary_typed,
 };
+pub use observation::{
+    AssertionInvocationEvaluation, AssertionReport, eval_assertion_invocation,
+    render_retained_message,
+};
+use payload::Payload;
+
+#[cfg(test)]
+thread_local! {
+    /// Payload copies made by aggregate updates on this thread.
+    static PAYLOAD_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// One runtime value for one typed register or slot.
 ///
@@ -28,7 +53,8 @@ use number::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypedValue {
     value_type: SolveValueType,
-    elements: Box<[SolveValueKind]>,
+    // Registers expose immutable payloads; updates construct a distinct value.
+    elements: Payload,
 }
 
 impl TypedValue {
@@ -36,6 +62,17 @@ impl TypedValue {
         value_type: SolveValueType,
         elements: Vec<SolveValueKind>,
     ) -> Result<Self, TypedValueConstructionError> {
+        Self::check_elements(&value_type, &elements)?;
+        Ok(Self {
+            value_type,
+            elements: Payload::of(elements),
+        })
+    }
+
+    fn check_elements(
+        value_type: &SolveValueType,
+        elements: &[SolveValueKind],
+    ) -> Result<(), TypedValueConstructionError> {
         if elements.len() != value_type.scalar_count() as usize {
             return Err(TypedValueConstructionError::ScalarCountMismatch);
         }
@@ -46,10 +83,7 @@ impl TypedValue {
         {
             return Err(TypedValueConstructionError::ElementTypeMismatch);
         }
-        Ok(Self {
-            value_type,
-            elements: elements.into_boxed_slice(),
-        })
+        Ok(())
     }
 
     #[must_use]
@@ -58,15 +92,46 @@ impl TypedValue {
     }
 
     #[must_use]
-    pub const fn elements(&self) -> &[SolveValueKind] {
+    pub fn elements(&self) -> &[SolveValueKind] {
         &self.elements
     }
 
     fn scalar(value: &SolveValue) -> Self {
         Self {
             value_type: value.value_type().clone(),
-            elements: Box::new([value.kind()]),
+            elements: Payload::Scalar(value.kind()),
         }
+    }
+
+    /// This value with elements rewritten by `update`, which writes exactly
+    /// `written`. The payload is rewritten in place when no other
+    /// value shares it and copied first otherwise (value semantics).
+    fn updated(
+        mut self,
+        value_type: SolveValueType,
+        written: &[SolveValueKind],
+        provenance: Span,
+        update: impl FnOnce(&mut [SolveValueKind]) -> Option<()>,
+    ) -> Result<Self, TypedProgramEvalError> {
+        let invalid = || invalid_error("update aggregate", provenance);
+        if value_type.scalar_count() as usize != self.elements.len()
+            || value_type.element_type() != self.value_type.element_type()
+        {
+            return Err(invalid());
+        }
+        if written
+            .iter()
+            .any(|element| !element_matches_type(*element, value_type.element_type()))
+        {
+            return Err(invalid());
+        }
+        #[cfg(test)]
+        if self.elements.is_shared() {
+            PAYLOAD_COPIES.with(|copies| copies.set(copies.get() + 1));
+        }
+        update(self.elements.make_mut()).ok_or_else(invalid)?;
+        self.value_type = value_type;
+        Ok(self)
     }
 
     fn checked(
@@ -79,6 +144,29 @@ impl TypedValue {
                 operation: "construct runtime value",
                 provenance,
             }
+        })
+    }
+
+    fn checked_elements(
+        value_type: SolveValueType,
+        mut elements: impl ExactSizeIterator<Item = Result<SolveValueKind, TypedProgramEvalError>>,
+        provenance: Span,
+    ) -> Result<Self, TypedProgramEvalError> {
+        if elements.len() != 1 {
+            return Self::checked(
+                value_type,
+                elements.collect::<Result<Vec<_>, _>>()?,
+                provenance,
+            );
+        }
+        let element = elements
+            .next()
+            .ok_or_else(|| invalid_error("construct runtime value", provenance))??;
+        Self::check_elements(&value_type, std::slice::from_ref(&element))
+            .map_err(|_| invalid_error("construct runtime value", provenance))?;
+        Ok(Self {
+            value_type,
+            elements: Payload::Scalar(element),
         })
     }
 }
@@ -102,8 +190,17 @@ impl std::error::Error for TypedValueConstructionError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TypedProgramEvalError {
+    AssertionFailed {
+        failure: TypedAssertionFailure,
+    },
     UnknownOwner {
         owner: SolvePureCallOwnerId,
+    },
+    /// A block lifecycle method could not run or complete as a whole: the
+    /// caller's state does not bind the block's slots, or the method stopped
+    /// on an assertion. It concerns the block, not one source construct.
+    InvalidBlockMethod {
+        operation: &'static str,
     },
     InvalidArgument {
         index: usize,
@@ -120,8 +217,25 @@ pub enum TypedProgramEvalError {
     InvalidIntegerConversion {
         provenance: Span,
     },
+    TensorIndexOutOfBounds {
+        axis: usize,
+        index: i64,
+        extent: u32,
+        provenance: Span,
+    },
     LinearSolve {
         reason: String,
+        provenance: Span,
+    },
+    /// A SPEC_0040 DAE-C30 native body reported its foreign error.
+    NativeBody {
+        reason: String,
+        provenance: Span,
+    },
+    /// A SOLVE-C62 recursive call would exceed its group's declared depth
+    /// limit; `provenance` is that call.
+    RecursionDepthExceeded {
+        limit: u32,
         provenance: Span,
     },
 }
@@ -130,12 +244,16 @@ impl TypedProgramEvalError {
     #[must_use]
     pub const fn source_span(&self) -> Option<Span> {
         match self {
-            Self::UnknownOwner { .. } => None,
+            Self::UnknownOwner { .. } | Self::InvalidBlockMethod { .. } => None,
+            Self::AssertionFailed { failure } => Some(failure.source_span()),
             Self::InvalidArgument { provenance, .. }
             | Self::InvalidCheckedProgram { provenance, .. }
             | Self::IntegerArithmetic { provenance, .. }
             | Self::InvalidIntegerConversion { provenance }
-            | Self::LinearSolve { provenance, .. } => Some(*provenance),
+            | Self::TensorIndexOutOfBounds { provenance, .. }
+            | Self::LinearSolve { provenance, .. }
+            | Self::NativeBody { provenance, .. }
+            | Self::RecursionDepthExceeded { provenance, .. } => Some(*provenance),
         }
     }
 }
@@ -143,11 +261,20 @@ impl TypedProgramEvalError {
 impl std::fmt::Display for TypedProgramEvalError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AssertionFailed { .. } => formatter.write_str("source function assertion failed"),
             Self::LinearSolve { reason, .. } => {
                 write!(formatter, "tensor linear solve failed: {reason}")
             }
+            Self::NativeBody { reason, .. } => write!(formatter, "native body failed: {reason}"),
+            Self::RecursionDepthExceeded { limit, .. } => write!(
+                formatter,
+                "recursive call exceeds the execution profile's depth limit of {limit} active invocations"
+            ),
             Self::UnknownOwner { owner } => {
                 write!(formatter, "unknown pure-call owner {}", owner.index())
+            }
+            Self::InvalidBlockMethod { operation } => {
+                write!(formatter, "invalid algorithm block method: {operation}")
             }
             Self::InvalidArgument { index, .. } => {
                 write!(
@@ -167,11 +294,42 @@ impl std::fmt::Display for TypedProgramEvalError {
             Self::InvalidIntegerConversion { .. } => {
                 formatter.write_str("Real-to-Integer conversion left the checked target domain")
             }
+            Self::TensorIndexOutOfBounds {
+                axis,
+                index,
+                extent,
+                ..
+            } => write!(
+                formatter,
+                "tensor index {index} is outside axis {axis} with extent {extent}"
+            ),
         }
     }
 }
 
 impl std::error::Error for TypedProgramEvalError {}
+
+impl From<TypedProgramEvalError> for crate::EvalSolveError {
+    fn from(error: TypedProgramEvalError) -> Self {
+        match error {
+            TypedProgramEvalError::TensorIndexOutOfBounds {
+                axis,
+                index,
+                extent,
+                provenance,
+            } => Self::TensorIndexOutOfBounds {
+                axis,
+                index,
+                extent,
+                span: Some(provenance),
+            },
+            error => Self::InvalidRow {
+                message: error.to_string(),
+                span: error.source_span(),
+            },
+        }
+    }
+}
 
 /// Evaluate one compiler-issued pure-call owner with compact typed arguments.
 pub fn eval_pure_call(
@@ -182,7 +340,16 @@ pub fn eval_pure_call(
     let owner = table
         .owner(owner)
         .ok_or(TypedProgramEvalError::UnknownOwner { owner })?;
-    eval_owner(table, owner, arguments)
+    let chain = RecursionChain::ROOT.enter(table, owner.id(), owner.provenance())?;
+    eval_owner_in_scope(
+        table,
+        owner,
+        arguments,
+        EvaluationMode::primal(AssertionPolicy::Value),
+        chain,
+        None,
+    )?
+    .into_complete()
 }
 
 /// Evaluate the construction-issued compact directional relation of one
@@ -196,55 +363,176 @@ pub fn eval_pure_call_directional(
     let owner = table
         .owner(owner)
         .ok_or(TypedProgramEvalError::UnknownOwner { owner })?;
-    eval_directional_owner(table, owner, arguments)
+    let chain = RecursionChain::ROOT.enter(table, owner.id(), owner.provenance())?;
+    eval_owner_in_scope(
+        table,
+        owner,
+        arguments,
+        EvaluationMode::directional(AssertionPolicy::Value),
+        chain,
+        None,
+    )?
+    .into_complete()
+}
+
+/// Evaluate one owner with its source assertions in force: the first failed
+/// Error-level assertion ends the call and is returned as the diagnostic
+/// failure. Rows never evaluate this way; it serves diagnostics and the
+/// construction tests of the assertion owner.
+pub fn eval_pure_call_checked(
+    table: &SolvePureCallTable,
+    owner: SolvePureCallOwnerId,
+    arguments: &[TypedValue],
+) -> Result<Vec<TypedValue>, TypedProgramEvalError> {
+    let owner = table
+        .owner(owner)
+        .ok_or(TypedProgramEvalError::UnknownOwner { owner })?;
+    let chain = RecursionChain::ROOT.enter(table, owner.id(), owner.provenance())?;
+    eval_owner(table, owner, arguments, chain)?.into_complete()
+}
+
+/// The directional counterpart of [`eval_pure_call_checked`].
+pub fn eval_pure_call_directional_checked(
+    table: &SolvePureCallTable,
+    owner: SolvePureCallOwnerId,
+    arguments: &[TypedValue],
+) -> Result<Vec<TypedValue>, TypedProgramEvalError> {
+    let owner = table
+        .owner(owner)
+        .ok_or(TypedProgramEvalError::UnknownOwner { owner })?;
+    let chain = RecursionChain::ROOT.enter(table, owner.id(), owner.provenance())?;
+    eval_directional_owner(table, owner, arguments, chain)?.into_complete()
+}
+
+/// The owner of one evaluated frame and its position in a SOLVE-C62
+/// recursive group chain: `depth` counts the active invocations of that
+/// owner's group along the chain and is zero outside every group.
+#[derive(Clone, Copy)]
+struct RecursionChain {
+    owner: Option<SolvePureCallOwnerId>,
+    depth: u32,
+}
+
+impl RecursionChain {
+    const ROOT: Self = Self {
+        owner: None,
+        depth: 0,
+    };
+
+    /// The chain of a call from this frame to `callee`. Entering a group
+    /// from outside it has depth 1; each member-to-member call adds 1.
+    fn enter(
+        self,
+        table: &SolvePureCallTable,
+        callee: SolvePureCallOwnerId,
+        provenance: Span,
+    ) -> Result<Self, TypedProgramEvalError> {
+        let Some(group) = table.recursive_group(callee) else {
+            return Ok(Self {
+                owner: Some(callee),
+                depth: 0,
+            });
+        };
+        let depth = if self.owner.is_some_and(|caller| group.contains(caller)) {
+            self.depth.saturating_add(1)
+        } else {
+            1
+        };
+        if depth > group.depth_limit() {
+            return Err(TypedProgramEvalError::RecursionDepthExceeded {
+                limit: group.depth_limit(),
+                provenance,
+            });
+        }
+        Ok(Self {
+            owner: Some(callee),
+            depth,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
-enum EvaluationMode {
+enum Direction {
     Primal,
     Directional,
 }
 
-fn eval_owner(
-    table: &SolvePureCallTable,
-    owner: &SolvePureCallOwner,
+/// What an Error-level source assertion does to the evaluation that reaches it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AssertionPolicy {
+    /// The invocation stops at the failed assertion and reports it as an
+    /// observation; only the checked observation adapter evaluates this way.
+    Stop,
+    /// A value row: predicate and message outputs are ordinary values and the
+    /// scheduled assertion owner alone raises failures.
+    Value,
+}
+
+#[derive(Clone, Copy)]
+struct EvaluationMode {
+    direction: Direction,
+    policy: AssertionPolicy,
+}
+
+impl EvaluationMode {
+    const fn primal(policy: AssertionPolicy) -> Self {
+        Self {
+            direction: Direction::Primal,
+            policy,
+        }
+    }
+
+    const fn directional(policy: AssertionPolicy) -> Self {
+        Self {
+            direction: Direction::Directional,
+            policy,
+        }
+    }
+}
+
+fn eval_owner<'model>(
+    table: &'model SolvePureCallTable,
+    owner: &'model SolvePureCallOwner,
     arguments: &[TypedValue],
-) -> Result<Vec<TypedValue>, TypedProgramEvalError> {
-    let mut invocations = InvocationScope::new(table);
+    chain: RecursionChain,
+) -> Result<InvocationCompletion<'model, Vec<TypedValue>>, TypedProgramEvalError> {
     eval_owner_in_scope(
         table,
         owner,
         arguments,
-        &mut invocations,
-        EvaluationMode::Primal,
+        EvaluationMode::primal(AssertionPolicy::Stop),
+        chain,
+        None,
     )
 }
 
-fn eval_directional_owner(
-    table: &SolvePureCallTable,
-    owner: &SolvePureCallOwner,
+fn eval_directional_owner<'model>(
+    table: &'model SolvePureCallTable,
+    owner: &'model SolvePureCallOwner,
     arguments: &[TypedValue],
-) -> Result<Vec<TypedValue>, TypedProgramEvalError> {
-    let mut invocations = InvocationScope::new(table);
+    chain: RecursionChain,
+) -> Result<InvocationCompletion<'model, Vec<TypedValue>>, TypedProgramEvalError> {
     eval_owner_in_scope(
         table,
         owner,
         arguments,
-        &mut invocations,
-        EvaluationMode::Directional,
+        EvaluationMode::directional(AssertionPolicy::Stop),
+        chain,
+        None,
     )
 }
 
-fn eval_owner_in_scope(
-    table: &SolvePureCallTable,
-    owner: &SolvePureCallOwner,
+fn eval_owner_in_scope<'model>(
+    table: &'model SolvePureCallTable,
+    owner: &'model SolvePureCallOwner,
     arguments: &[TypedValue],
-    invocations: &mut InvocationScope,
     mode: EvaluationMode,
-) -> Result<Vec<TypedValue>, TypedProgramEvalError> {
-    let (inputs, outputs, body) = match mode {
-        EvaluationMode::Primal => (owner.inputs(), owner.outputs(), owner.body()),
-        EvaluationMode::Directional => {
+    chain: RecursionChain,
+    block: Option<&'model SolveAlgorithmBlock>,
+) -> Result<InvocationCompletion<'model, Vec<TypedValue>>, TypedProgramEvalError> {
+    let (inputs, outputs, body) = match mode.direction {
+        Direction::Primal => (owner.inputs(), owner.outputs(), owner.body()),
+        Direction::Directional => {
             let directional =
                 owner
                     .directional()
@@ -260,51 +548,46 @@ fn eval_owner_in_scope(
         }
     };
     validate_arguments(inputs, arguments, owner.provenance())?;
-    let mut frame = EvalFrame::new(table, body, invocations, mode);
-    for (slot, value) in frame.slots.iter_mut().zip(arguments) {
+    let mut storage = FrameStorage::default();
+    let mut frame = EvalFrame::new(table, body, &mut storage, mode, chain, owner.id());
+    frame.block = block;
+    frame.bound = block.is_some();
+    for (slot, value) in frame.storage.slots.iter_mut().zip(arguments) {
         *slot = Some(value.clone());
     }
-    frame.run()?;
+    frame.run();
+    frame.retain_invocation(owner, arguments);
+    if let Some(error) = frame.fault.take() {
+        let status = frame.raised_status();
+        return Ok(InvocationCompletion::Fault {
+            error,
+            observations: frame.observations,
+            status,
+        });
+    }
+    if let Some(stop) = frame.stopped.take() {
+        return Ok(InvocationCompletion::Stopped(stop));
+    }
     let output_start = arguments.len();
-    outputs
+    let values = outputs
         .iter()
         .enumerate()
         .map(|(output, _)| {
             frame
+                .storage
                 .slots
-                .get(output_start + output)
-                .and_then(Clone::clone)
+                .get_mut(output_start + output)
+                .and_then(Option::take)
                 .ok_or(TypedProgramEvalError::InvalidCheckedProgram {
                     operation: "read pure-call output",
                     provenance: owner.provenance(),
                 })
         })
-        .collect()
-}
-
-#[cfg(test)]
-fn eval_pure_call_with_invocation_counts(
-    table: &SolvePureCallTable,
-    owner: SolvePureCallOwnerId,
-    arguments: &[TypedValue],
-) -> Result<(Vec<TypedValue>, Vec<u32>), TypedProgramEvalError> {
-    let owner = table
-        .owner(owner)
-        .ok_or(TypedProgramEvalError::UnknownOwner { owner })?;
-    let mut invocations = InvocationScope::new(table);
-    let outputs = eval_owner_in_scope(
-        table,
-        owner,
-        arguments,
-        &mut invocations,
-        EvaluationMode::Primal,
-    )?;
-    let counts = table
-        .owners()
-        .iter()
-        .map(|owner| invocations.misses.get(&owner.id()).copied().unwrap_or(0))
-        .collect();
-    Ok((outputs, counts))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(InvocationCompletion::Complete {
+        values,
+        observations: frame.observations,
+    })
 }
 
 fn validate_arguments(
@@ -326,18 +609,90 @@ fn validate_arguments(
     }
 }
 
-fn eval_region(
-    table: &SolvePureCallTable,
-    region: &SolveProgramRegion,
-    arguments: &[TypedValue],
-    invocations: &mut InvocationScope,
+fn eval_region<'model>(
+    table: &'model SolvePureCallTable,
+    region: &'model SolveProgramRegion,
+    arguments: Vec<TypedValue>,
+    storage: &mut FrameStorage,
     mode: EvaluationMode,
-) -> Result<Vec<TypedValue>, TypedProgramEvalError> {
+    chain: RecursionChain,
+    (owner, block): (SolvePureCallOwnerId, Option<&'model SolveAlgorithmBlock>),
+) -> Result<InvocationCompletion<'model, Vec<TypedValue>>, TypedProgramEvalError> {
+    let completed = eval_region_assigned(
+        table,
+        region,
+        (arguments, Vec::new()),
+        storage,
+        mode,
+        chain,
+        (owner, block),
+    )?;
+    Ok(match completed {
+        InvocationCompletion::Complete {
+            values,
+            observations,
+        } => {
+            if !values.states.is_empty() {
+                return invalid(
+                    "normal region exposed internal assigned state",
+                    region.provenance(),
+                );
+            }
+            InvocationCompletion::Complete {
+                values: values.normal,
+                observations,
+            }
+        }
+        InvocationCompletion::Stopped(stop) => InvocationCompletion::Stopped(stop),
+        InvocationCompletion::Fault {
+            error,
+            observations,
+            status,
+        } => InvocationCompletion::Fault {
+            error,
+            observations,
+            status,
+        },
+    })
+}
+
+struct AssignedRegionValues {
+    normal: Vec<TypedValue>,
+    states: Vec<Option<TypedValue>>,
+}
+
+fn eval_region_assigned<'model>(
+    table: &'model SolvePureCallTable,
+    region: &'model SolveProgramRegion,
+    arguments: (Vec<TypedValue>, Vec<Option<TypedValue>>),
+    storage: &mut FrameStorage,
+    mode: EvaluationMode,
+    chain: RecursionChain,
+    (owner, block): (SolvePureCallOwnerId, Option<&'model SolveAlgorithmBlock>),
+) -> Result<InvocationCompletion<'model, AssignedRegionValues>, TypedProgramEvalError> {
+    let (arguments, state_arguments) = arguments;
+    if region.body().assigned_state_inputs().len() != state_arguments.len()
+        || region
+            .body()
+            .assigned_state_inputs()
+            .iter()
+            .zip(&state_arguments)
+            .any(|(expected, actual)| {
+                actual
+                    .as_ref()
+                    .is_some_and(|actual| actual.value_type() != expected)
+            })
+    {
+        return invalid(
+            "bind structured assigned-state captures",
+            region.provenance(),
+        );
+    }
     if region.inputs().len() != arguments.len()
         || region
             .inputs()
             .iter()
-            .zip(arguments)
+            .zip(&arguments)
             .any(|(expected, actual)| expected != actual.value_type())
     {
         return Err(TypedProgramEvalError::InvalidCheckedProgram {
@@ -345,112 +700,150 @@ fn eval_region(
             provenance: region.provenance(),
         });
     }
-    let mut frame = EvalFrame::new(table, region.body(), invocations, mode);
-    for (slot, value) in frame.slots.iter_mut().zip(arguments) {
-        *slot = Some(value.clone());
-    }
-    frame.run()?;
+    let mut frame = EvalFrame::new(table, region.body(), storage, mode, chain, owner);
+    // A region frame hands the block to its callees but owns no status slots:
+    // a callee's payload passes through it to the bound frame.
+    frame.block = block;
+    frame.storage.assigned_inputs = state_arguments;
     let output_start = arguments.len();
-    region
+    for (slot, value) in frame.storage.slots.iter_mut().zip(arguments) {
+        *slot = Some(value);
+    }
+    frame.run();
+    if let Some(error) = frame.fault.take() {
+        return Ok(InvocationCompletion::Fault {
+            error,
+            observations: frame.observations,
+            status: frame.pending.take(),
+        });
+    }
+    if let Some(stop) = frame.stopped.take() {
+        return Ok(InvocationCompletion::Stopped(stop));
+    }
+    let values = region
         .outputs()
         .iter()
         .enumerate()
         .map(|(output, _)| {
             frame
+                .storage
                 .slots
-                .get(output_start + output)
-                .and_then(Clone::clone)
+                .get_mut(output_start + output)
+                .and_then(Option::take)
                 .ok_or(TypedProgramEvalError::InvalidCheckedProgram {
                     operation: "read structured region output",
                     provenance: region.provenance(),
                 })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let states = frame
+        .storage
+        .assigned_outputs
+        .iter_mut()
+        .map(|state| {
+            state.take().ok_or_else(|| {
+                invalid_error("read structured assigned-state output", region.provenance())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(InvocationCompletion::Complete {
+        values: AssignedRegionValues {
+            normal: values,
+            states,
+        },
+        observations: frame.observations,
+    })
 }
 
-/// Results already issued in one exact function/domain invocation.
-///
-/// Conditional regions inherit this scope because they are lazy projections
-/// of the same sequential function invocation. A compact `Map` or `Fold`
-/// creates one fresh scope per domain point because its binder values are part
-/// of the invocation coordinate.
-/// Only executed calls occupy result storage; unrelated model owners require
-/// no slots, including in leaf calls and per-coordinate loop scopes.
-struct InvocationScope {
-    owner_count: usize,
-    calls: HashMap<SolvePureCallOwnerId, Vec<TypedValue>>,
-    #[cfg(test)]
-    misses: HashMap<SolvePureCallOwnerId, u32>,
+/// Register and slot storage one frame runs in. A loop evaluates its body once
+/// per domain point in the same storage, so a point allocates none.
+#[derive(Default)]
+struct FrameStorage {
+    slots: Vec<Option<TypedValue>>,
+    registers: Vec<Option<TypedValue>>,
+    assigned_states: Vec<Option<Option<TypedValue>>>,
+    assigned_inputs: Vec<Option<TypedValue>>,
+    assigned_outputs: Vec<Option<Option<TypedValue>>>,
 }
 
-impl InvocationScope {
-    fn new(table: &SolvePureCallTable) -> Self {
-        Self {
-            owner_count: table.owners().len(),
-            calls: HashMap::new(),
-            #[cfg(test)]
-            misses: HashMap::new(),
-        }
-    }
-
-    fn get(&self, owner: SolvePureCallOwnerId) -> Option<&[TypedValue]> {
-        self.calls.get(&owner).map(Vec::as_slice)
-    }
-
-    fn insert(
-        &mut self,
-        owner: SolvePureCallOwnerId,
-        values: Vec<TypedValue>,
-        provenance: Span,
-    ) -> Result<(), TypedProgramEvalError> {
-        if owner.index() as usize >= self.owner_count {
-            return Err(TypedProgramEvalError::UnknownOwner { owner });
-        }
-        match self.calls.entry(owner) {
-            Entry::Vacant(destination) => {
-                destination.insert(values);
-            }
-            Entry::Occupied(_) => return invalid("redefine pure-call invocation", provenance),
-        }
-        #[cfg(test)]
-        {
-            *self.misses.entry(owner).or_default() += 1;
-        }
-        Ok(())
+impl FrameStorage {
+    /// Empty storage for one run of `program`.
+    fn reset(&mut self, program: &TypedProgram) {
+        self.slots.clear();
+        self.slots.resize_with(program.slots().len(), || None);
+        self.registers.clear();
+        self.registers
+            .resize_with(program.register_types().len(), || None);
+        self.assigned_states.clear();
+        self.assigned_states
+            .resize_with(program.assigned_state_types().len(), || None);
+        self.assigned_inputs.clear();
+        self.assigned_outputs.clear();
+        self.assigned_outputs
+            .resize_with(program.assigned_state_outputs().len(), || None);
     }
 }
 
 struct EvalFrame<'model, 'scope> {
+    owner: SolvePureCallOwnerId,
+    /// The algorithm block whose method or function this frame runs, when
+    /// its functions' status bits must survive a fault (#483 EL007).
+    block: Option<&'model SolveAlgorithmBlock>,
+    /// Whether this frame's slots are status-bound: a lifecycle method or a
+    /// bound function owner, never a region frame inside one.
+    bound: bool,
+    /// Status a faulted callee carried into this region frame, passed on
+    /// to the bound frame with this frame's own fault.
+    pending: Option<Box<[bool]>>,
+    stopped: Option<AssertionStop<'model>>,
+    fault: Option<TypedProgramEvalError>,
+    observations: Vec<ObservedAssertion<'model>>,
     table: &'model SolvePureCallTable,
     program: &'model TypedProgram,
-    invocations: &'scope mut InvocationScope,
     mode: EvaluationMode,
-    slots: Vec<Option<TypedValue>>,
-    registers: Vec<Option<TypedValue>>,
+    chain: RecursionChain,
+    storage: &'scope mut FrameStorage,
+    /// Index of the operation being evaluated.
+    operation: usize,
 }
 
 impl<'model, 'scope> EvalFrame<'model, 'scope> {
     fn new(
         table: &'model SolvePureCallTable,
         program: &'model TypedProgram,
-        invocations: &'scope mut InvocationScope,
+        storage: &'scope mut FrameStorage,
         mode: EvaluationMode,
+        chain: RecursionChain,
+        owner: SolvePureCallOwnerId,
     ) -> Self {
+        storage.reset(program);
         Self {
+            owner,
+            block: None,
+            bound: false,
+            pending: None,
+            stopped: None,
+            fault: None,
+            observations: Vec::new(),
             table,
             program,
-            invocations,
             mode,
-            slots: vec![None; program.slots().len()],
-            registers: vec![None; program.register_types().len()],
+            chain,
+            storage,
+            operation: 0,
         }
     }
 
-    fn run(&mut self) -> Result<(), TypedProgramEvalError> {
-        for operation in self.program.operations() {
-            self.eval_operation(operation.operation(), operation.provenance())?;
+    fn run(&mut self) {
+        for (index, operation) in self.program.operations().iter().enumerate() {
+            self.operation = index;
+            if let Err(error) = self.eval_operation(operation.operation(), operation.provenance()) {
+                self.fault = Some(error);
+            }
+            if self.stopped.is_some() || self.fault.is_some() {
+                break;
+            }
         }
-        Ok(())
     }
 
     // SPEC_0021: exhaustive dispatch over the closed typed operation vocabulary.
@@ -458,15 +851,36 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
     #[allow(clippy::too_many_lines)]
     fn eval_operation(
         &mut self,
-        operation: &SolveOperation,
+        operation: &'model SolveOperation,
         provenance: Span,
     ) -> Result<(), TypedProgramEvalError> {
         match operation {
+            SolveOperation::AssignedState { operation } => {
+                self.eval_assigned_state(operation, provenance)
+            }
+            SolveOperation::AssignedConditional { program } => {
+                self.eval_assigned_conditional(program, provenance)
+            }
+            SolveOperation::CheckAssertion {
+                predicate_output,
+                message_outputs,
+                condition,
+                captures,
+                destinations,
+                message,
+            } => self.eval_assertion(
+                (*predicate_output, message_outputs),
+                *condition,
+                captures,
+                destinations,
+                message,
+                provenance,
+            ),
             SolveOperation::Constant { destination, value } => {
                 self.write(*destination, TypedValue::scalar(value), provenance)
             }
             SolveOperation::Load { destination, slot } => {
-                let value = self.read_slot(*slot, provenance)?.clone();
+                let value = self.load_slot(*slot, provenance)?;
                 self.write(*destination, value, provenance)
             }
             SolveOperation::Store { slot, source } => {
@@ -562,14 +976,16 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
                 domain,
                 initial,
                 captures,
+                state_captures,
                 destinations,
                 transition,
+                continuation,
             } => self.eval_fold(
                 domain,
                 initial,
-                captures,
+                (captures, state_captures),
                 destinations,
-                transition,
+                (transition, continuation.as_deref()),
                 provenance,
             ),
             SolveOperation::Scale {
@@ -688,7 +1104,13 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
                 owner,
                 arguments,
                 destinations,
+                ..
             } => self.eval_call(*owner, arguments, destinations, provenance),
+            SolveOperation::Native {
+                body,
+                operands,
+                destinations,
+            } => self.eval_native(*body, operands, destinations, provenance),
         }
     }
 
@@ -709,39 +1131,73 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
         &mut self,
         domain: &StructuredIndexDomain,
         initial: &[SolveRegisterId],
-        captures: &[SolveRegisterId],
+        (captures, state_captures): (&[SolveRegisterId], &[rumoca_ir_solve::SolveAssignedStateId]),
         destinations: &[SolveRegisterId],
-        transition: &SolveProgramRegion,
+        (transition, continuation): (
+            &'model SolveProgramRegion,
+            Option<&'model SolveProgramRegion>,
+        ),
         provenance: Span,
     ) -> Result<(), TypedProgramEvalError> {
         let mut carried = initial
             .iter()
-            .map(|value| self.read(*value, provenance).cloned())
+            .map(|value| self.read_owned(*value, provenance))
             .collect::<Result<Vec<_>, _>>()?;
         let captures = captures
             .iter()
-            .map(|value| self.read(*value, provenance).cloned())
+            .map(|value| self.read_owned(*value, provenance))
+            .collect::<Result<Vec<_>, _>>()?;
+        let state_captures = state_captures
+            .iter()
+            .map(|state| self.read_assigned(*state, provenance).cloned())
             .collect::<Result<Vec<_>, _>>()?;
         let tuples = domain
             .index_tuple_iter()
             .map_err(|_| invalid_error("iterate compact fold domain", provenance))?;
+        let mut storage = FrameStorage::default();
         for tuple in tuples {
+            // MLS §11.2.3: a bounded `while` stops before the first pass whose
+            // condition is false, with the tuple that pass would have read.
+            let continues = match continuation {
+                Some(continuation) => self.fold_continues(
+                    continuation,
+                    (&carried, &captures),
+                    &state_captures,
+                    &tuple,
+                    provenance,
+                )?,
+                None => Some(true),
+            };
+            match continues {
+                None => return Ok(()),
+                Some(false) => break,
+                Some(true) => {}
+            }
             let mut arguments = carried;
             arguments.extend(captures.iter().cloned());
             arguments.extend(
                 tuple
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .map(|value| self.fold_binder(value, provenance))
                     .collect::<Result<Vec<_>, _>>()?,
             );
-            let mut iteration = InvocationScope::new(self.table);
-            carried = eval_region(
+            let completed = eval_region_assigned(
                 self.table,
                 transition,
-                &arguments,
-                &mut iteration,
+                (arguments, state_captures.clone()),
+                &mut storage,
                 self.mode,
+                self.chain,
+                (self.owner, self.block),
             )?;
+            let Some(updated) = self.accept_completion_at(completed, Some(&tuple)) else {
+                return Ok(());
+            };
+            if !updated.states.is_empty() {
+                return invalid("fold publishes optional carried outputs", provenance);
+            }
+            carried = updated.normal;
         }
         if carried.len() != destinations.len() {
             return invalid("transfer compact fold outputs", provenance);
@@ -752,12 +1208,53 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
         Ok(())
     }
 
+    /// Whether an early-exit fold runs its next pass: its continuation region
+    /// evaluated on the carried tuple, the captures and the pass's binders.
+    fn fold_continues(
+        &mut self,
+        continuation: &'model SolveProgramRegion,
+        (carried, captures): (&[TypedValue], &[TypedValue]),
+        state_captures: &[Option<TypedValue>],
+        point: &[i64],
+        provenance: Span,
+    ) -> Result<Option<bool>, TypedProgramEvalError> {
+        let mut arguments = carried.to_vec();
+        arguments.extend(captures.iter().cloned());
+        arguments.extend(
+            point
+                .iter()
+                .copied()
+                .map(|value| self.fold_binder(value, provenance))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let completed = eval_region_assigned(
+            self.table,
+            continuation,
+            (arguments, state_captures.to_vec()),
+            &mut FrameStorage::default(),
+            self.mode,
+            self.chain,
+            (self.owner, self.block),
+        )?;
+        let Some(predicate) = self.accept_completion_at(completed, Some(point)) else {
+            return Ok(None);
+        };
+        if !predicate.states.is_empty() {
+            return invalid("fold predicate publishes internal state", provenance);
+        }
+        match predicate.normal.as_slice() {
+            [value] if value.elements() == [SolveValueKind::Boolean(false)] => Ok(Some(false)),
+            [value] if value.elements() == [SolveValueKind::Boolean(true)] => Ok(Some(true)),
+            _ => invalid("evaluate compact fold continuation", provenance),
+        }
+    }
+
     fn eval_map(
         &mut self,
         domain: &StructuredIndexDomain,
         captures: &[SolveRegisterId],
         destination: SolveRegisterId,
-        body: &SolveProgramRegion,
+        body: &'model SolveProgramRegion,
         provenance: Span,
     ) -> Result<(), TypedProgramEvalError> {
         let captures = captures
@@ -769,16 +1266,28 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
         let tuples = domain
             .index_tuple_iter()
             .map_err(|_| invalid_error("iterate compact map domain", provenance))?;
+        let mut storage = FrameStorage::default();
         for tuple in tuples {
             let mut arguments = captures.clone();
             arguments.extend(
                 tuple
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .map(|value| self.fold_binder(value, provenance))
                     .collect::<Result<Vec<_>, _>>()?,
             );
-            let mut iteration = InvocationScope::new(self.table);
-            let outputs = eval_region(self.table, body, &arguments, &mut iteration, self.mode)?;
+            let completed = eval_region(
+                self.table,
+                body,
+                arguments,
+                &mut storage,
+                self.mode,
+                self.chain,
+                (self.owner, self.block),
+            )?;
+            let Some(outputs) = self.accept_completion_at(completed, Some(&tuple)) else {
+                return Ok(());
+            };
             let [output] = outputs.as_slice() else {
                 return invalid("collect compact map output", provenance);
             };
@@ -805,8 +1314,8 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
         condition: SolveRegisterId,
         captures: &[SolveRegisterId],
         destinations: &[SolveRegisterId],
-        if_true: &SolveProgramRegion,
-        if_false: &SolveProgramRegion,
+        if_true: &'model SolveProgramRegion,
+        if_false: &'model SolveProgramRegion,
         provenance: Span,
     ) -> Result<(), TypedProgramEvalError> {
         let selected = if scalar_boolean(self.read(condition, provenance)?, provenance)? {
@@ -816,9 +1325,20 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
         };
         let captures = captures
             .iter()
-            .map(|capture| self.read(*capture, provenance).cloned())
+            .map(|capture| self.read_owned(*capture, provenance))
             .collect::<Result<Vec<_>, _>>()?;
-        let outputs = eval_region(self.table, selected, &captures, self.invocations, self.mode)?;
+        let completed = eval_region(
+            self.table,
+            selected,
+            captures,
+            &mut FrameStorage::default(),
+            self.mode,
+            self.chain,
+            (self.owner, self.block),
+        )?;
+        let Some(outputs) = self.accept_completion(completed) else {
+            return Ok(());
+        };
         if outputs.len() != destinations.len() {
             return invalid("transfer structured region outputs", provenance);
         }
@@ -916,8 +1436,8 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
             .iter()
             .map(|index| scalar_integer(self.read(*index, provenance)?, provenance))
             .collect::<Result<Vec<_>, _>>()?;
-        let element = select_modelica_element(self.read(aggregate, provenance)?, &coordinates)
-            .ok_or(invalid_error("project aggregate element", provenance))?;
+        let element =
+            select_modelica_element(self.read(aggregate, provenance)?, &coordinates, provenance)?;
         let value = TypedValue::checked(
             self.destination_type(destination, provenance)?.clone(),
             vec![element],
@@ -939,8 +1459,15 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
             .map(|index| scalar_integer(self.read(*index, provenance)?, provenance))
             .collect::<Result<Vec<_>, _>>()?;
         let fallback = scalar_element(self.read(out_of_range, provenance)?, provenance)?;
-        let element = select_modelica_element(self.read(aggregate, provenance)?, &coordinates)
-            .unwrap_or(fallback);
+        let element = match select_modelica_element(
+            self.read(aggregate, provenance)?,
+            &coordinates,
+            provenance,
+        ) {
+            Ok(element) => element,
+            Err(TypedProgramEvalError::TensorIndexOutOfBounds { .. }) => fallback,
+            Err(error) => return Err(error),
+        };
         let value = TypedValue::checked(
             self.destination_type(destination, provenance)?.clone(),
             vec![element],
@@ -970,16 +1497,15 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
             })
             .collect::<Option<Vec<_>>>()
             .ok_or(invalid_error("update aggregate element", provenance))?;
-        let aggregate = self.read(aggregate, provenance)?;
+        let element = scalar_element(self.read(value, provenance)?, provenance)?;
+        let aggregate = self.read_owned(aggregate, provenance)?;
         let offset = row_major_offset(aggregate.value_type.dimensions(), &coordinates)
             .ok_or(invalid_error("update aggregate element", provenance))?;
-        let mut elements = aggregate.elements.to_vec();
-        elements[offset] = scalar_element(self.read(value, provenance)?, provenance)?;
-        let value = TypedValue::checked(
-            self.destination_type(destination, provenance)?.clone(),
-            elements,
-            provenance,
-        )?;
+        let destination_type = self.destination_type(destination, provenance)?.clone();
+        let value = aggregate.updated(destination_type, &[element], provenance, |elements| {
+            *elements.get_mut(offset)? = element;
+            Some(())
+        })?;
         self.write(destination, value, provenance)
     }
 
@@ -991,29 +1517,33 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
         origin: &[u32],
         provenance: Span,
     ) -> Result<(), TypedProgramEvalError> {
-        let aggregate = self.read(aggregate, provenance)?;
-        let update = self.read(value, provenance)?;
-        let mut elements = aggregate.elements.to_vec();
+        let update = self.read(value, provenance)?.clone();
+        let aggregate = self.read_owned(aggregate, provenance)?;
+        let aggregate_dimensions = aggregate.value_type.dimensions().to_vec();
         let dimensions = update.value_type.dimensions();
         let mut coordinate = vec![0u32; dimensions.len()];
-        for element in update.elements.iter().copied() {
+        let mut offsets = Vec::with_capacity(update.elements.len());
+        for _ in update.elements.iter() {
             let destination_coordinate = coordinate
                 .iter()
                 .zip(origin)
                 .map(|(coordinate, origin)| coordinate.checked_add(*origin))
                 .collect::<Option<Vec<_>>>()
                 .ok_or(invalid_error("update aggregate slice", provenance))?;
-            let offset =
-                row_major_offset(aggregate.value_type.dimensions(), &destination_coordinate)
-                    .ok_or(invalid_error("update aggregate slice", provenance))?;
-            elements[offset] = element;
+            offsets.push(
+                row_major_offset(&aggregate_dimensions, &destination_coordinate)
+                    .ok_or(invalid_error("update aggregate slice", provenance))?,
+            );
             increment_coordinate(&mut coordinate, dimensions);
         }
-        let value = TypedValue::checked(
-            self.destination_type(destination, provenance)?.clone(),
-            elements,
-            provenance,
-        )?;
+        let destination_type = self.destination_type(destination, provenance)?.clone();
+        let value =
+            aggregate.updated(destination_type, &update.elements, provenance, |elements| {
+                for (offset, element) in offsets.iter().zip(update.elements.iter()) {
+                    *elements.get_mut(*offset)? = *element;
+                }
+                Some(())
+            })?;
         self.write(destination, value, provenance)
     }
 
@@ -1026,24 +1556,28 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
         provenance: Span,
     ) -> Result<(), TypedProgramEvalError> {
         let axes = self.resolve_tensor_view_axes(axes, provenance)?;
-        let aggregate = self.read(aggregate, provenance)?;
-        let update = self.read(value, provenance)?;
-        let mut elements = aggregate.elements.to_vec();
+        let update = self.read(value, provenance)?.clone();
+        let aggregate = self.read_owned(aggregate, provenance)?;
+        let aggregate_dimensions = aggregate.value_type.dimensions().to_vec();
         let dimensions = update.value_type.dimensions();
         let mut coordinate = vec![0u32; dimensions.len()];
-        for element in update.elements.iter().copied() {
+        let mut offsets = Vec::with_capacity(update.elements.len());
+        for _ in update.elements.iter() {
             let destination_coordinate = tensor_view_coordinate(&axes, &coordinate, provenance)?;
-            let offset =
-                row_major_offset(aggregate.value_type.dimensions(), &destination_coordinate)
-                    .ok_or(invalid_error("update aggregate view", provenance))?;
-            elements[offset] = element;
+            offsets.push(
+                row_major_offset(&aggregate_dimensions, &destination_coordinate)
+                    .ok_or(invalid_error("update aggregate view", provenance))?,
+            );
             increment_coordinate(&mut coordinate, dimensions);
         }
-        let value = TypedValue::checked(
-            self.destination_type(destination, provenance)?.clone(),
-            elements,
-            provenance,
-        )?;
+        let destination_type = self.destination_type(destination, provenance)?.clone();
+        let value =
+            aggregate.updated(destination_type, &update.elements, provenance, |elements| {
+                for (offset, element) in offsets.iter().zip(update.elements.iter()) {
+                    *elements.get_mut(*offset)? = *element;
+                }
+                Some(())
+            })?;
         self.write(destination, value, provenance)
     }
 
@@ -1075,9 +1609,6 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
         destinations: &[SolveRegisterId],
         provenance: Span,
     ) -> Result<(), TypedProgramEvalError> {
-        if let Some(outputs) = self.invocations.get(owner).map(<[TypedValue]>::to_vec) {
-            return self.transfer_call_outputs(outputs, destinations, provenance);
-        }
         let arguments = arguments
             .iter()
             .map(|argument| self.read(*argument, provenance).cloned())
@@ -1086,13 +1617,86 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
             .table
             .owner(owner)
             .ok_or(TypedProgramEvalError::UnknownOwner { owner })?;
-        let outputs = match self.mode {
-            EvaluationMode::Primal => eval_owner(self.table, called, &arguments)?,
-            EvaluationMode::Directional => eval_directional_owner(self.table, called, &arguments)?,
+        let chain = self.chain.enter(self.table, owner, provenance)?;
+        // Status is a primal effect: directional evaluation never carries it.
+        let block = self
+            .block
+            .filter(|_| matches!(self.mode.direction, Direction::Primal));
+        let completed =
+            eval_owner_in_scope(self.table, called, &arguments, self.mode, chain, block)?;
+        let Some(outputs) = self.accept_completion(completed) else {
+            return Ok(());
         };
-        self.invocations
-            .insert(owner, outputs.clone(), provenance)?;
         self.transfer_call_outputs(outputs, destinations, provenance)
+    }
+
+    /// This frame's status slots, in signal order: the block's signal status
+    /// slots for a lifecycle method, its binding's slots for a function.
+    /// `None` for a frame with no status channels: one outside a block, a
+    /// region frame, or a function the block does not bind.
+    fn status_slots(&self) -> Option<Vec<usize>> {
+        let block = self.block.filter(|_| self.bound)?;
+        if self.owner == SolvePureCallOwnerId::LIFECYCLE_METHOD {
+            return Some(
+                block
+                    .slots()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, slot)| slot.storage() == SolveStorageClass::SignalStatus)
+                    .map(|(index, _)| index)
+                    .collect(),
+            );
+        }
+        block
+            .status_binding(self.owner)
+            .map(|binding| binding.slots().iter().map(|slot| slot.index()).collect())
+    }
+
+    /// The bits this frame has raised so far, when it is a bound function.
+    fn raised_status(&self) -> Option<Box<[bool]>> {
+        if self.owner == SolvePureCallOwnerId::LIFECYCLE_METHOD {
+            return None;
+        }
+        Some(
+            self.status_slots()?
+                .into_iter()
+                .map(|slot| {
+                    self.storage
+                        .slots
+                        .get(slot)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|value| value.elements() == [SolveValueKind::Boolean(true)])
+                })
+                .collect(),
+        )
+    }
+
+    /// Take a faulted callee's or region's raised bits before the fault
+    /// unwinds further: a bound frame unions them into its status slots
+    /// (earlier bits stay), a region frame keeps them for its own fault.
+    pub(super) fn absorb_status(&mut self, status: &[bool]) {
+        if !self.bound {
+            let pending = self
+                .pending
+                .get_or_insert_with(|| vec![false; status.len()].into_boxed_slice());
+            for (kept, &raised) in pending.iter_mut().zip(status) {
+                *kept |= raised;
+            }
+            return;
+        }
+        self.union_status(status);
+    }
+
+    /// Union `status` into this bound frame's status slots.
+    fn union_status(&mut self, status: &[bool]) {
+        let Some(slots) = self.status_slots() else {
+            return;
+        };
+        for (&raised, slot) in status.iter().zip(slots) {
+            if raised && let Some(value) = self.storage.slots.get_mut(slot) {
+                *value = Some(TypedValue::scalar(&SolveValue::boolean(true)));
+            }
+        }
     }
 
     fn transfer_call_outputs(
@@ -1110,12 +1714,50 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
         Ok(())
     }
 
+    /// The value of `register`, moved out when this operation is its last
+    /// reader and shared otherwise.
+    fn read_owned(
+        &mut self,
+        register: SolveRegisterId,
+        provenance: Span,
+    ) -> Result<TypedValue, TypedProgramEvalError> {
+        if self.program.register_moves_at(register, self.operation)
+            && let Some(value) = self
+                .storage
+                .registers
+                .get_mut(register.index())
+                .and_then(Option::take)
+        {
+            return Ok(value);
+        }
+        self.read(register, provenance).cloned()
+    }
+
+    /// The value of `slot`, moved out at the last load of a read-only slot.
+    fn load_slot(
+        &mut self,
+        slot: SolveSlotId,
+        provenance: Span,
+    ) -> Result<TypedValue, TypedProgramEvalError> {
+        if self.program.slot_last_load_at(slot, self.operation)
+            && let Some(value) = self
+                .storage
+                .slots
+                .get_mut(slot.index())
+                .and_then(Option::take)
+        {
+            return Ok(value);
+        }
+        self.read_slot(slot, provenance).cloned()
+    }
+
     fn read(
         &self,
         register: SolveRegisterId,
         provenance: Span,
     ) -> Result<&TypedValue, TypedProgramEvalError> {
-        self.registers
+        self.storage
+            .registers
             .get(register.index())
             .and_then(Option::as_ref)
             .ok_or(invalid_error("read register", provenance))
@@ -1131,6 +1773,7 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
             return invalid("write register", provenance);
         }
         let destination = self
+            .storage
             .registers
             .get_mut(register.index())
             .ok_or(invalid_error("write register", provenance))?;
@@ -1156,7 +1799,8 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
         slot: SolveSlotId,
         provenance: Span,
     ) -> Result<&TypedValue, TypedProgramEvalError> {
-        self.slots
+        self.storage
+            .slots
             .get(slot.index())
             .and_then(Option::as_ref)
             .ok_or(invalid_error("read slot", provenance))
@@ -1177,195 +1821,11 @@ impl<'model, 'scope> EvalFrame<'model, 'scope> {
             return invalid("write slot", provenance);
         }
         let destination = self
+            .storage
             .slots
             .get_mut(slot.index())
             .ok_or(invalid_error("write slot", provenance))?;
         *destination = Some(value);
         Ok(())
-    }
-}
-
-fn element_matches_type(value: SolveValueKind, scalar: SolveScalarType) -> bool {
-    match (value, scalar) {
-        (
-            SolveValueKind::Real32(_),
-            SolveScalarType::Real {
-                format: SolveRealFormat::Binary32,
-                ..
-            },
-        )
-        | (
-            SolveValueKind::Real64(_),
-            SolveScalarType::Real {
-                format: SolveRealFormat::Binary64,
-                ..
-            },
-        )
-        | (SolveValueKind::Boolean(_), SolveScalarType::Boolean) => true,
-        (SolveValueKind::Integer(value), SolveScalarType::Integer(domain)) => {
-            domain.contains(value)
-        }
-        _ => false,
-    }
-}
-
-fn scalar_element(
-    value: &TypedValue,
-    provenance: Span,
-) -> Result<SolveValueKind, TypedProgramEvalError> {
-    if !value.value_type.dimensions().is_empty() || value.elements.len() != 1 {
-        return invalid("read scalar value", provenance);
-    }
-    Ok(value.elements[0])
-}
-
-fn scalar_boolean(value: &TypedValue, provenance: Span) -> Result<bool, TypedProgramEvalError> {
-    match scalar_element(value, provenance)? {
-        SolveValueKind::Boolean(value) => Ok(value),
-        _ => invalid("read Boolean condition", provenance),
-    }
-}
-
-fn scalar_integer(value: &TypedValue, provenance: Span) -> Result<i64, TypedProgramEvalError> {
-    match scalar_element(value, provenance)? {
-        SolveValueKind::Integer(value) => Ok(value),
-        _ => invalid("read Integer index", provenance),
-    }
-}
-
-fn row_major_offset(dimensions: &[u32], indices: &[u32]) -> Option<usize> {
-    if dimensions.len() != indices.len() {
-        return None;
-    }
-    dimensions
-        .iter()
-        .copied()
-        .zip(indices.iter().copied())
-        .try_fold(0usize, |offset, (extent, index)| {
-            if index >= extent {
-                return None;
-            }
-            offset
-                .checked_mul(extent as usize)?
-                .checked_add(index as usize)
-        })
-}
-
-fn select_modelica_element(value: &TypedValue, indices: &[i64]) -> Option<SolveValueKind> {
-    let indices = indices
-        .iter()
-        .copied()
-        .map(|index| {
-            index
-                .checked_sub(1)
-                .and_then(|index| u32::try_from(index).ok())
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let offset = row_major_offset(value.value_type.dimensions(), &indices)?;
-    value.elements.get(offset).copied()
-}
-
-fn project_slice(
-    aggregate: &TypedValue,
-    origin: &[u32],
-    destination_type: &SolveValueType,
-    provenance: Span,
-) -> Result<Vec<SolveValueKind>, TypedProgramEvalError> {
-    let dimensions = destination_type.dimensions();
-    let mut coordinate = vec![0u32; dimensions.len()];
-    let mut elements = Vec::with_capacity(destination_type.scalar_count() as usize);
-    for _ in 0..destination_type.scalar_count() {
-        let source = coordinate
-            .iter()
-            .zip(origin)
-            .map(|(coordinate, origin)| coordinate.checked_add(*origin))
-            .collect::<Option<Vec<_>>>()
-            .ok_or(invalid_error("project aggregate slice", provenance))?;
-        let offset = row_major_offset(aggregate.value_type.dimensions(), &source)
-            .ok_or(invalid_error("project aggregate slice", provenance))?;
-        elements.push(
-            aggregate
-                .elements
-                .get(offset)
-                .copied()
-                .ok_or(invalid_error("project aggregate slice", provenance))?,
-        );
-        increment_coordinate(&mut coordinate, dimensions);
-    }
-    Ok(elements)
-}
-
-#[derive(Clone, Copy)]
-enum ResolvedTensorViewAxis {
-    Index(u32),
-    Span { origin: u32 },
-}
-
-fn project_tensor_view(
-    aggregate: &TypedValue,
-    axes: &[ResolvedTensorViewAxis],
-    destination_type: &SolveValueType,
-    provenance: Span,
-) -> Result<Vec<SolveValueKind>, TypedProgramEvalError> {
-    let dimensions = destination_type.dimensions();
-    let mut coordinate = vec![0u32; dimensions.len()];
-    let mut elements = Vec::with_capacity(destination_type.scalar_count() as usize);
-    for _ in 0..destination_type.scalar_count() {
-        let source = tensor_view_coordinate(axes, &coordinate, provenance)?;
-        let offset = row_major_offset(aggregate.value_type.dimensions(), &source)
-            .ok_or(invalid_error("project aggregate view", provenance))?;
-        elements.push(
-            aggregate
-                .elements
-                .get(offset)
-                .copied()
-                .ok_or(invalid_error("project aggregate view", provenance))?,
-        );
-        increment_coordinate(&mut coordinate, dimensions);
-    }
-    Ok(elements)
-}
-
-fn tensor_view_coordinate(
-    axes: &[ResolvedTensorViewAxis],
-    coordinate: &[u32],
-    provenance: Span,
-) -> Result<Vec<u32>, TypedProgramEvalError> {
-    let mut retained = coordinate.iter().copied();
-    let result = axes
-        .iter()
-        .map(|axis| match *axis {
-            ResolvedTensorViewAxis::Index(index) => Some(index),
-            ResolvedTensorViewAxis::Span { origin } => origin.checked_add(retained.next()?),
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or(invalid_error(
-            "resolve aggregate view coordinate",
-            provenance,
-        ))?;
-    if retained.next().is_some() {
-        return invalid("resolve aggregate view coordinate", provenance);
-    }
-    Ok(result)
-}
-
-fn increment_coordinate(coordinate: &mut [u32], dimensions: &[u32]) {
-    for axis in (0..coordinate.len()).rev() {
-        coordinate[axis] += 1;
-        if coordinate[axis] < dimensions[axis] {
-            return;
-        }
-        coordinate[axis] = 0;
-    }
-}
-
-fn invalid<T>(operation: &'static str, provenance: Span) -> Result<T, TypedProgramEvalError> {
-    Err(invalid_error(operation, provenance))
-}
-
-fn invalid_error(operation: &'static str, provenance: Span) -> TypedProgramEvalError {
-    TypedProgramEvalError::InvalidCheckedProgram {
-        operation,
-        provenance,
     }
 }

@@ -80,7 +80,8 @@ pub(super) fn for_each_eager_call<'dae>(
         | dae::ExpressionOperation::Comprehension { .. }
         | dae::ExpressionOperation::FunctionValue { .. }
         | dae::ExpressionOperation::FunctionFoldParameter { .. }
-        | dae::ExpressionOperation::FunctionFoldOutput { .. } => {}
+        | dae::ExpressionOperation::FunctionFoldOutput { .. }
+        | dae::ExpressionOperation::FunctionConditionalOutput { .. } => {}
         dae::ExpressionOperation::Call {
             owner, arguments, ..
         } => {
@@ -244,6 +245,17 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
             .get(selected)
             .expect("checked flattened function output resolves")
             .clone();
+        if indices.is_empty()
+            && selected_scalar_type == gast::ScalarType::Integer
+            && let Some(bounds) = integer_call_bounds::derive(
+                self.view,
+                call,
+                &self.emission.call_sites.parameter_ranges,
+            )
+        {
+            self.local_integer_bounds
+                .insert(name.lexeme().to_owned(), bounds);
+        }
         Ok(TypedExpression {
             expression: gast::Expression::Ref(gast::Reference::Local(gast::RefPart {
                 name,
@@ -684,10 +696,7 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
             }
         }
 
-        if let dae::ExpressionOperation::FunctionValue { definition, .. } = node.operation() {
-            if self.function_scope != Some(definition.id().function()) {
-                return Ok(None);
-            }
+        if let Some(definition) = self.local_function_definition(node) {
             let value = self
                 .view
                 .function(definition.id().function())
@@ -826,6 +835,18 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
     /// Project one field of a checked current record directly to its flattened
     /// GALEC storage. `FunctionValue` carries the exact reaching definition,
     /// so this does not recover identity from source names.
+    fn local_function_definition(
+        &self,
+        node: dae::ExpressionView<'dae>,
+    ) -> Option<dae::FunctionDefinitionView<'dae>> {
+        let definition = match node.operation() {
+            dae::ExpressionOperation::FunctionValue { definition, .. }
+            | dae::ExpressionOperation::FunctionConditionalOutput { definition, .. } => definition,
+            _ => return None,
+        };
+        (self.function_scope == Some(definition.id().function())).then_some(definition)
+    }
+
     pub(super) fn direct_record_function_argument(
         &self,
         argument: dae::ExprId<'dae>,
@@ -836,29 +857,27 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
             .expression(argument)
             .expect("checked record function argument resolves");
         let span = node.provenance().span();
+        if let Some(definition) = self.local_function_definition(node) {
+            let value = self
+                .view
+                .function(definition.id().function())
+                .expect("checked function identity resolves")
+                .values()
+                .find(|value| value.id() == definition.target())
+                .expect("checked record definition target resolves");
+            let (field_name, _) = self
+                .view
+                .record_field(value.value_type(), field)
+                .expect("checked record value field resolves");
+            return Ok(Some(gast::Expression::Ref(gast::Reference::Local(
+                gast::RefPart {
+                    name: user_functions::record_value_field_name(value, field_name)?,
+                    subscripts: Vec::new(),
+                    span,
+                },
+            ))));
+        }
         match node.operation() {
-            dae::ExpressionOperation::FunctionValue { definition, .. }
-                if self.function_scope == Some(definition.id().function()) =>
-            {
-                let value = self
-                    .view
-                    .function(definition.id().function())
-                    .expect("checked function identity resolves")
-                    .values()
-                    .find(|value| value.id() == definition.target())
-                    .expect("checked record definition target resolves");
-                let (field_name, _) = self
-                    .view
-                    .record_field(value.value_type(), field)
-                    .expect("checked record value field resolves");
-                Ok(Some(gast::Expression::Ref(gast::Reference::Local(
-                    gast::RefPart {
-                        name: user_functions::record_value_field_name(value, field_name)?,
-                        subscripts: Vec::new(),
-                        span,
-                    },
-                ))))
-            }
             dae::ExpressionOperation::Coordinate(dae::CoordinateView::FunctionParameter(
                 parameter,
             )) if self.function_scope == Some(parameter.function()) => {
@@ -908,7 +927,7 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
         self.direct_whole_aggregate_reference(field)
     }
 
-    fn materialize_aggregate_function_argument(
+    pub(super) fn materialize_aggregate_function_argument(
         &mut self,
         value: gast::Expression,
         dimensions: &[u32],
@@ -1262,6 +1281,21 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
                     level: dae::AssertionLevel::Warning,
                     ..
                 } => {}
+                dae::FunctionStatementView::Conditional { conditional } => {
+                    return Err(unsupported(
+                        "function-conditional-assertion-owner",
+                        "inline assertion projection requires the ordered branch statement owner"
+                            .to_owned(),
+                        conditional.declaration().span(),
+                    ));
+                }
+                dae::FunctionStatementView::RequireAssigned { provenance, .. } => {
+                    return Err(unsupported(
+                        "function-assigned-state",
+                        "inline assertion projection does not represent an optional executed-path value".to_owned(),
+                        provenance.span(),
+                    ));
+                }
                 dae::FunctionStatementView::For {
                     fold,
                     statements,
@@ -1460,6 +1494,23 @@ impl<'a, 'dae> ExpressionLowerer<'a, 'dae> {
             ),
             dae::ExpressionOperation::FunctionValue { definition, .. } => self
                 .lower_function_value_record_field(definition, field, indices, scalar_type, span),
+            dae::ExpressionOperation::FunctionConditionalOutput { definition, .. } => {
+                if self.function_scope != Some(definition.id().function()) {
+                    return Err(unsupported(
+                        "function-conditional-owner",
+                        "record projection requires its ordered function statement owner"
+                            .to_owned(),
+                        span,
+                    ));
+                }
+                self.lower_function_value_record_field(
+                    definition,
+                    field,
+                    indices,
+                    scalar_type,
+                    span,
+                )
+            }
             dae::ExpressionOperation::Coordinate(dae::CoordinateView::FunctionParameter(
                 parameter,
             )) => self.lower_function_parameter_record_field(

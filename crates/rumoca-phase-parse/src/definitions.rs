@@ -643,8 +643,10 @@ fn convert_standard_class_specifier(
         is_redeclare: false,
         redeclare_target_def_id: None,
         constrainedby: None,
+        constraining_modifications: Vec::new(),
         array_subscripts: vec![],
         external: body.external,
+        partial_derivative: None,
     };
     validate_class_restrictions(&class_def)?;
     Ok(class_def)
@@ -714,8 +716,10 @@ fn convert_extends_class_specifier(
         is_redeclare: false,
         redeclare_target_def_id: None,
         constrainedby: None,
+        constraining_modifications: Vec::new(),
         array_subscripts: vec![],
         external: body.external,
+        partial_derivative: None,
     };
     validate_class_restrictions(&class_def)?;
     Ok(class_def)
@@ -725,15 +729,15 @@ fn convert_extends_class_specifier(
 fn convert_enum_class_specifier(
     enum_spec: &modelica_grammar_trait::EnumClassSpecifier,
     ctx: &ClassConversionContext,
-) -> rumoca_ir_ast::ClassDef {
+) -> anyhow::Result<rumoca_ir_ast::ClassDef> {
     let enum_literals = extract_enum_literals(&enum_spec.enum_class_specifier_group);
-    rumoca_ir_ast::ClassDef {
+    Ok(rumoca_ir_ast::ClassDef {
         def_id: None,
         scope_id: None,
         name: enum_spec.ident.clone(),
         class_type: rumoca_core::ClassType::Type,
         class_type_token: ctx.class_type_token.clone(),
-        description: vec![],
+        description: enum_spec.description.description_string.tokens.clone(),
         location: enum_spec.ident.location.clone(),
         extends: vec![],
         imports: vec![],
@@ -756,7 +760,7 @@ fn convert_enum_class_specifier(
         initial_algorithm_keyword: None,
         end_name_token: None,
         enum_literals,
-        annotation: vec![],
+        annotation: crate::elements::extract_annotation(&enum_spec.description)?,
         is_protected: false,
         is_final: false,
         is_inner: false,
@@ -765,16 +769,18 @@ fn convert_enum_class_specifier(
         is_redeclare: false,
         redeclare_target_def_id: None,
         constrainedby: None,
+        constraining_modifications: Vec::new(),
         array_subscripts: vec![],
         external: None, // Enums don't have external declarations
-    }
+        partial_derivative: None,
+    })
 }
 
 /// Convert a type class specifier to ClassDef.
 fn convert_type_class_specifier(
     type_spec: &modelica_grammar_trait::TypeClassSpecifier,
     ctx: &ClassConversionContext,
-) -> rumoca_ir_ast::ClassDef {
+) -> anyhow::Result<rumoca_ir_ast::ClassDef> {
     let base_type_name = type_spec.type_specifier.name.clone();
     let causality = extract_causality_from_base_prefix(&type_spec.base_prefix);
     let array_subscripts = extract_type_array_subscripts(&type_spec.type_class_specifier_opt);
@@ -790,13 +796,13 @@ fn convert_type_class_specifier(
         annotation: vec![],
     };
 
-    rumoca_ir_ast::ClassDef {
+    Ok(rumoca_ir_ast::ClassDef {
         def_id: None,
         scope_id: None,
         name: type_spec.ident.clone(),
         class_type: ctx.class_type.clone(),
         class_type_token: ctx.class_type_token.clone(),
-        description: vec![],
+        description: type_spec.description.description_string.tokens.clone(),
         location: type_spec.ident.location.clone(),
         extends: vec![extend],
         imports: vec![],
@@ -819,7 +825,7 @@ fn convert_type_class_specifier(
         initial_algorithm_keyword: None,
         end_name_token: None,
         enum_literals: vec![],
-        annotation: vec![],
+        annotation: crate::elements::extract_annotation(&type_spec.description)?,
         is_protected: false,
         is_final: false,
         is_inner: false,
@@ -828,9 +834,11 @@ fn convert_type_class_specifier(
         is_redeclare: false,
         redeclare_target_def_id: None,
         constrainedby: None,
+        constraining_modifications: Vec::new(),
         array_subscripts,
         external: None, // Type aliases don't have external declarations
-    }
+        partial_derivative: None,
+    })
 }
 
 /// Convert a function partial class specifier to ClassDef.
@@ -876,7 +884,7 @@ fn convert_function_partial_class_specifier(
         name: partial_spec.ident.clone(),
         class_type: ctx.class_type.clone(),
         class_type_token: ctx.class_type_token.clone(),
-        description: vec![],
+        description: partial_spec.description.description_string.tokens.clone(),
         location: partial_spec.ident.location.clone(),
         extends: vec![extend],
         imports: vec![],
@@ -899,7 +907,7 @@ fn convert_function_partial_class_specifier(
         initial_algorithm_keyword: None,
         end_name_token: None,
         enum_literals: vec![],
-        annotation: vec![],
+        annotation: crate::elements::extract_annotation(&partial_spec.description)?,
         is_protected: false,
         is_final: false,
         is_inner: false,
@@ -908,34 +916,39 @@ fn convert_function_partial_class_specifier(
         is_redeclare: false,
         redeclare_target_def_id: None,
         constrainedby: None,
+        constraining_modifications: Vec::new(),
         array_subscripts: vec![],
         external: None, // Function partial applications don't have external declarations
+        partial_derivative: None,
     })
 }
 
 /// Convert a der class specifier to ClassDef.
 ///
-/// Modelica short form:
+/// Modelica short form (MLS §12.7.2):
 /// `function f_der = der(f, x, y);`
 ///
-/// This is represented as a short-form class extending the referenced base function.
-/// The derivative variable list is accepted by the parser and retained in source,
-/// but is not yet lowered into dedicated derivative metadata in ClassDef.
+/// The class records the differentiated function and inputs as
+/// [`rumoca_ir_ast::PartialDerivative`] and has no body: its meaning is the
+/// partial derivative of `f`, which no inheritance relation states.
 fn convert_der_class_specifier(
     der_spec: &modelica_grammar_trait::DerClassSpecifier,
     ctx: &ClassConversionContext,
-) -> rumoca_ir_ast::ClassDef {
-    let extend = rumoca_ir_ast::Extend {
-        base_name: der_spec.type_specifier.name.clone(),
-        base_def_id: None,
-        location: der_spec.ident.location.clone(),
-        modifications: vec![],
-        break_names: vec![],
-        is_protected: false,
-        annotation: vec![],
+) -> anyhow::Result<rumoca_ir_ast::ClassDef> {
+    let inputs = std::iter::once(der_spec.ident0.clone())
+        .chain(
+            der_spec
+                .der_class_specifier_list
+                .iter()
+                .map(|item| item.ident.clone()),
+        )
+        .collect();
+    let partial_derivative = rumoca_ir_ast::PartialDerivative {
+        function: der_spec.type_specifier.name.clone(),
+        inputs,
     };
 
-    rumoca_ir_ast::ClassDef {
+    Ok(rumoca_ir_ast::ClassDef {
         def_id: None,
         scope_id: None,
         name: der_spec.ident.clone(),
@@ -943,7 +956,7 @@ fn convert_der_class_specifier(
         class_type_token: ctx.class_type_token.clone(),
         description: der_spec.description.description_string.tokens.clone(),
         location: der_spec.ident.location.clone(),
-        extends: vec![extend],
+        extends: vec![],
         imports: vec![],
         classes: IndexMap::default(),
         equations: vec![],
@@ -964,7 +977,7 @@ fn convert_der_class_specifier(
         initial_algorithm_keyword: None,
         end_name_token: None,
         enum_literals: vec![],
-        annotation: vec![],
+        annotation: crate::elements::extract_annotation(&der_spec.description)?,
         is_protected: false,
         is_final: false,
         is_inner: false,
@@ -973,9 +986,11 @@ fn convert_der_class_specifier(
         is_redeclare: false,
         redeclare_target_def_id: None,
         constrainedby: None,
+        constraining_modifications: Vec::new(),
         array_subscripts: vec![],
         external: None,
-    }
+        partial_derivative: Some(partial_derivative),
+    })
 }
 
 impl TryFrom<&modelica_grammar_trait::ClassDefinition> for rumoca_ir_ast::ClassDef {
@@ -998,16 +1013,16 @@ impl TryFrom<&modelica_grammar_trait::ClassDefinition> for rumoca_ir_ast::ClassD
                 }
             }
             modelica_grammar_trait::ClassSpecifier::DerClassSpecifier(spec) => {
-                Ok(convert_der_class_specifier(&spec.der_class_specifier, &ctx))
+                convert_der_class_specifier(&spec.der_class_specifier, &ctx)
             }
             modelica_grammar_trait::ClassSpecifier::ShortClassSpecifier(short) => {
                 match &short.short_class_specifier {
-                    modelica_grammar_trait::ShortClassSpecifier::EnumClassSpecifier(spec) => Ok(
-                        convert_enum_class_specifier(&spec.enum_class_specifier, &ctx),
-                    ),
-                    modelica_grammar_trait::ShortClassSpecifier::TypeClassSpecifier(spec) => Ok(
-                        convert_type_class_specifier(&spec.type_class_specifier, &ctx),
-                    ),
+                    modelica_grammar_trait::ShortClassSpecifier::EnumClassSpecifier(spec) => {
+                        convert_enum_class_specifier(&spec.enum_class_specifier, &ctx)
+                    }
+                    modelica_grammar_trait::ShortClassSpecifier::TypeClassSpecifier(spec) => {
+                        convert_type_class_specifier(&spec.type_class_specifier, &ctx)
+                    }
                     modelica_grammar_trait::ShortClassSpecifier::FunctionPartialClassSpecifier(
                         spec,
                     ) => convert_function_partial_class_specifier(

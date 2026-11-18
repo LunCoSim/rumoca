@@ -16,7 +16,7 @@ use rumoca_eval_solve::tensor_policy::{LinearSolveKernel, select_linear_solve_ke
 
 pub(crate) struct SeedBlockLinearization {
     solver: SeedSolver,
-    jacobian: DMatrix<f64>,
+    jacobian: BlockJacobian,
 }
 
 enum SeedSolver {
@@ -41,7 +41,7 @@ enum StructuredSolve {
 
 impl StructuredSolve {
     /// The structured solve of a sparse-candidate block of `n` rows.
-    fn select(structure: Option<&solve::JacobianStructure>, n: usize) -> Option<Self> {
+    fn select(structure: Option<&solve::ColoredJacobianStructure>, n: usize) -> Option<Self> {
         let structure = structure?;
         let pattern = structure.pattern();
         if pattern.rows() as usize != n
@@ -92,7 +92,7 @@ impl SeedBlockLinearization {
                     site,
                 }))
             }
-            _ => SeedSolver::Dense(jacobian.clone().lu()),
+            _ => SeedSolver::Dense(jacobian.as_dense().into_owned().lu()),
         };
         Ok(Self { solver, jacobian })
     }
@@ -110,7 +110,7 @@ impl SeedBlockLinearization {
             seed,
             block,
             &self.jacobian,
-            structure.map(solve::JacobianStructure::pattern),
+            structure.map(solve::ColoredJacobianStructure::pattern),
         )
         .0
     }
@@ -131,7 +131,7 @@ impl SeedBlockLinearization {
         let mut cache = cache.borrow_mut();
         let structured = match kind {
             StructuredSolve::Torn(layout) => {
-                cache.solve_torn_scaled(&self.jacobian, rhs, unit, unit, layout)
+                cache.solve_torn_scaled(&self.jacobian, rhs, (unit, unit), layout, None)
             }
             StructuredSolve::Sparse(pattern) => {
                 cache.solve_scaled(&self.jacobian, rhs, unit, unit, pattern)
@@ -139,7 +139,9 @@ impl SeedBlockLinearization {
         };
         structured.or_else(|| {
             note_block_fallback(*site, ProjectionFallback::SeedDense);
-            dense.get_or_init(|| self.jacobian.clone().lu()).solve(rhs)
+            dense
+                .get_or_init(|| self.jacobian.as_dense().into_owned().lu())
+                .solve(rhs)
         })
     }
 
@@ -168,7 +170,7 @@ impl SeedBlockLinearization {
             variables = ?variables,
             matrix_rows = self.jacobian.nrows(),
             matrix_columns = self.jacobian.ncols(),
-            matrix_column_major = ?self.jacobian.as_slice(),
+            matrix_column_major = ?self.jacobian.as_dense().as_slice(),
             rhs = ?rhs.as_slice(),
             point_y = ?y,
             parameters = ?args.parameters,
@@ -188,15 +190,16 @@ pub(super) fn certify_with_refinement<M: ImplicitProjectionModel>(
 ) -> Result<(), RuntimeSolveError> {
     let rows = projection_rows(plan);
     for iteration in 0..=2 {
-        let residual = implicit_selected_jacobian_v_rows(
-            model,
-            y,
-            args.parameters,
-            args.time,
-            seed,
-            &rows,
-            "algebraic projection sensitivity",
-        )?;
+        let mut residual = Vec::with_capacity(rows.len());
+        for (index, block) in plan.blocks.scalar_blocks().iter().enumerate() {
+            residual.extend(block_jacobian_v_rows(
+                model,
+                (y, args.parameters, args.time),
+                seed,
+                (index, block),
+                "algebraic projection sensitivity",
+            )?);
+        }
         if scaled_residual_converged(&residual, &row_scales, args.tolerance) {
             return Ok(());
         }
@@ -211,9 +214,9 @@ pub(super) fn certify_with_refinement<M: ImplicitProjectionModel>(
             ));
         }
         row_scales.clear();
-        for (index, block) in plan.blocks.iter().enumerate() {
+        for (index, block) in plan.blocks.scalar_blocks().iter().enumerate() {
             let linearization = model.algebraic_seed_linearization(index, block, y, args)?;
-            refine_direction(model, block, &linearization, y, args, seed)?;
+            refine_direction(model, (index, block), &linearization, y, args, seed)?;
             row_scales.extend(linearization.row_scales(model, index, block, seed));
         }
     }
@@ -222,7 +225,7 @@ pub(super) fn certify_with_refinement<M: ImplicitProjectionModel>(
 
 fn refine_direction<M: ImplicitProjectionModel>(
     model: &M,
-    block: &solve::AlgebraicProjectionBlock,
+    (block_index, block): (usize, &solve::AlgebraicProjectionBlock),
     linearization: &SeedBlockLinearization,
     y: &[f64],
     args: AlgebraicProjectionArgs<'_>,
@@ -234,20 +237,18 @@ fn refine_direction<M: ImplicitProjectionModel>(
     }
     // Refine the same assembled linear system, not an inconsistent combined
     // JVP. Later blocks see corrected predecessor directions in their RHS.
-    let base = DVector::from_vec(implicit_selected_jacobian_v_rows(
+    let base = DVector::from_vec(block_jacobian_v_rows(
         model,
-        y,
-        args.parameters,
-        args.time,
+        (y, args.parameters, args.time),
         &inputs,
-        &block.rows,
+        (block_index, block),
         "algebraic sensitivity refinement rhs",
     )?);
     let values = DVector::from_iterator(
         block.y_indices.len(),
         block.y_indices.iter().map(|&index| seed[index]),
     );
-    let residual = &linearization.jacobian * values + base;
+    let residual = linearization.jacobian.mul_vector(&values) + base;
     if residual.iter().all(|&value| value == 0.0) {
         return Ok(());
     }

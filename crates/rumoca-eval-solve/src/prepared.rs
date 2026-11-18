@@ -12,6 +12,9 @@ mod assignment_shape_tests;
 mod capability_tests;
 mod construction;
 mod dependency;
+mod isolated_value;
+#[cfg(test)]
+mod isolated_value_tests;
 #[cfg(test)]
 mod isolation_chain_tests;
 mod isolation_program;
@@ -22,6 +25,7 @@ mod prepared_compute_block_tests;
 #[cfg(test)]
 mod replaced_programs_tests;
 mod support;
+mod target_value_plan;
 mod tensor_affine_assignment;
 #[cfg(test)]
 mod tensor_affine_assignment_tests;
@@ -72,6 +76,7 @@ use rumoca_ir_solve::{
 };
 pub(crate) use support::non_causal_linear_op;
 use support::*;
+pub use target_value_plan::PreparedTargetValuePlan;
 pub use torn_sweep::{PreparedTornSweep, TornSweepComposite, TornSweepStatus};
 
 pub(crate) fn assignment_shape_for_program_output(
@@ -79,11 +84,11 @@ pub(crate) fn assignment_shape_for_program_output(
     output_offset: usize,
     target_y_index: usize,
 ) -> Result<Option<TargetAssignmentShape>, EvalSolveError> {
-    Ok(target_assignment_shapes_with_output_offsets(program)?
-        .into_iter()
-        .find_map(|(output, shape)| {
-            (output == output_offset && shape.target_y_index() == target_y_index).then_some(shape)
-        }))
+    Ok(rumoca_ir_solve::derive_target_assignment_shape_for_output(
+        program,
+        output_offset,
+        target_y_index,
+    ))
 }
 
 pub(crate) fn program_certifies_direct_target(
@@ -116,7 +121,11 @@ pub struct PreparedScalarProgramBlock {
     row_requirements: Vec<RowInputRequirements>,
     row_reverse_y_gradient_supported: Vec<bool>,
     row_is_causal: Vec<bool>,
+    /// Programs holding an assertion observation, which only the checked
+    /// event-action adapter evaluates, so no execution backend compiles them.
+    row_requires_checked_observation: Vec<bool>,
     row_assignment_shapes: Vec<Box<[(usize, TargetAssignmentShape)]>>,
+    target_value_families: RefCell<target_value_plan::TargetValueFamilies>,
     row_tensor_affine_assignments: Vec<tensor_affine_assignment::PreparedTensorAffineAssignments>,
     row_parameter_indices: Vec<Box<[usize]>>,
     row_parameter_static_y_gradient_params: Vec<Option<Box<[usize]>>>,
@@ -573,6 +582,17 @@ impl PreparedScalarProgramBlock {
                 .is_some()
     }
 
+    /// Whether program `row_idx` holds an assertion observation, a fact fixed
+    /// when the block is prepared: its execution needs an issued source/action
+    /// observation adapter that retains exact invocation captures.
+    #[must_use]
+    pub fn program_requires_checked_observation(&self, row_idx: usize) -> bool {
+        self.row_requires_checked_observation
+            .get(row_idx)
+            .copied()
+            .unwrap_or(false)
+    }
+
     fn is_causal_row(&self, row_idx: usize) -> bool {
         self.row_is_causal.get(row_idx).copied().unwrap_or(false)
     }
@@ -935,18 +955,10 @@ impl PreparedScalarProgramBlock {
                     span: self.block.program_span(request.row_idx),
                 })?;
         let shape = request.shape;
-        if let TargetAssignmentShape::TensorAffine {
-            projection,
-            target_y_index,
-            ..
-        } = shape
-        {
-            let assignment = self.row_tensor_affine_assignments[request.row_idx]
-                .get(&(projection.output_register(), *target_y_index))
-                .ok_or_else(|| {
-                    invalid_prepared_row("issued tensor-affine materialization is missing")
-                })?;
+        if matches!(shape, TargetAssignmentShape::TensorAffine { .. }) {
             let span = self.block.program_span(request.row_idx);
+            let assignment =
+                self.row_tensor_affine_assignments[request.row_idx].selected(row, shape, span)?;
             return assignment.eval(request, span);
         }
         eval_prevalidated_discard_output_program(
@@ -2050,4 +2062,15 @@ impl PreparedComputeNode {
             }
         }
     }
+}
+
+/// The parameter slots keying `program`'s certified parameter-static solver-Y
+/// gradient (SPEC_0043), as [`PreparedScalarProgramBlock::parameter_static_y_gradient_params`]
+/// records it per row; `None` when the gradient is not certified invariant
+/// under solver Y and time.
+#[must_use]
+pub fn parameter_static_y_gradient_params(
+    program: &[rumoca_ir_solve::LinearOp],
+) -> Option<Vec<usize>> {
+    parameter_static_y_gradient(program).then(|| row_parameter_indices(program))
 }

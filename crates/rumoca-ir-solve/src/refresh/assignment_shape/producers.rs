@@ -1,21 +1,17 @@
 //! Compact, source-bound ownership of disjoint destination ranges.
 
+use std::collections::BTreeMap;
+
 use crate::{LinearOp, Reg};
 
-struct DestinationRange {
-    start: Reg,
-    end: u64,
-    position: usize,
-}
-
-pub(super) struct UniqueProgram<'a> {
+pub(in crate::refresh) struct UniqueProgram<'a> {
     operations: &'a [LinearOp],
-    ranges: Vec<DestinationRange>,
+    ranges: BTreeMap<Reg, (u64, usize)>,
 }
 
 impl<'a> UniqueProgram<'a> {
-    pub(super) fn new(operations: &'a [LinearOp]) -> Option<Self> {
-        let mut ranges = Vec::new();
+    pub(in crate::refresh) fn new(operations: &'a [LinearOp]) -> Option<Self> {
+        let mut ranges = BTreeMap::<Reg, (u64, usize)>::new();
         for (position, operation) in operations.iter().enumerate() {
             let Some(start) = operation.dst_register() else {
                 continue;
@@ -25,26 +21,24 @@ impl<'a> UniqueProgram<'a> {
                 continue;
             }
             let end = u64::from(start).checked_add(count)?;
-            if end > u64::from(Reg::MAX) + 1 {
+            if end > u64::from(Reg::MAX) + 1
+                || ranges
+                    .range(..=start)
+                    .next_back()
+                    .is_some_and(|(_, (previous_end, _))| *previous_end > u64::from(start))
+                || ranges
+                    .range(start..)
+                    .next()
+                    .is_some_and(|(next_start, _)| u64::from(*next_start) < end)
+            {
                 return None;
             }
-            ranges.push(DestinationRange {
-                start,
-                end,
-                position,
-            });
-        }
-        ranges.sort_unstable_by_key(|range| range.start);
-        if ranges
-            .windows(2)
-            .any(|pair| pair[0].end > u64::from(pair[1].start))
-        {
-            return None;
+            ranges.insert(start, (end, position));
         }
         Some(Self { operations, ranges })
     }
 
-    pub(super) fn view(&self) -> ProgramPrefix<'_> {
+    pub(in crate::refresh) fn view(&self) -> ProgramPrefix<'_> {
         ProgramPrefix {
             operations: self.operations,
             ranges: &self.ranges,
@@ -53,35 +47,89 @@ impl<'a> UniqueProgram<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct ProgramPrefix<'a> {
+pub(in crate::refresh) struct ProgramPrefix<'a> {
     operations: &'a [LinearOp],
-    ranges: &'a [DestinationRange],
+    ranges: &'a BTreeMap<Reg, (u64, usize)>,
 }
 
 impl<'a> ProgramPrefix<'a> {
-    pub(super) fn before(self, position: usize) -> Option<Self> {
+    pub(in crate::refresh) fn operations(self) -> &'a [LinearOp] {
+        self.operations
+    }
+
+    pub(in crate::refresh) fn before(self, position: usize) -> Option<Self> {
         Some(Self {
             operations: self.operations.get(..position)?,
             ranges: self.ranges,
         })
     }
 
-    pub(super) fn len(self) -> usize {
+    pub(in crate::refresh) fn len(self) -> usize {
         self.operations.len()
     }
 
-    pub(super) fn operation(self, position: usize) -> Option<&'a LinearOp> {
+    pub(in crate::refresh) fn operation(self, position: usize) -> Option<&'a LinearOp> {
         self.operations.get(position)
     }
 
-    pub(super) fn producer_position(self, register: Reg) -> Option<usize> {
-        let index = self
+    pub(in crate::refresh) fn producer_position(self, register: Reg) -> Option<usize> {
+        let (_, &(end, position)) = self.ranges.range(..=register).next_back()?;
+        (u64::from(register) < end && position < self.operations.len()).then_some(position)
+    }
+
+    /// Every register is produced by this exact prefix, checked by ranges.
+    pub(in crate::refresh) fn contains_range(self, start: Reg, count: usize) -> bool {
+        let Some(end) = u64::from(start).checked_add(count as u64) else {
+            return false;
+        };
+        if end > u64::from(Reg::MAX) + 1 {
+            return false;
+        }
+        let mut cursor = u64::from(start);
+        while cursor < end {
+            let Some((_, &(limit, position))) = self.ranges.range(..=cursor as Reg).next_back()
+            else {
+                return false;
+            };
+            if limit <= cursor || position >= self.operations.len() {
+                return false;
+            }
+            cursor = limit.min(end);
+        }
+        true
+    }
+
+    /// Query compact producer ranges without enumerating tensor registers.
+    /// The enclosing prefix excludes current/later producers, including when
+    /// destinations are nonmonotone or a source begins inside a tensor range.
+    pub(in crate::refresh) fn any_producer_in_range(
+        self,
+        start: Reg,
+        count: usize,
+        mut predicate: impl FnMut(usize) -> bool,
+    ) -> Option<bool> {
+        let end = u64::from(start).checked_add(u64::try_from(count).ok()?)?;
+        if end > u64::from(Reg::MAX) + 1 {
+            return None;
+        }
+        if count == 0 {
+            return Some(false);
+        }
+        let first = self
             .ranges
-            .partition_point(|range| range.start <= register)
-            .checked_sub(1)?;
-        let range = &self.ranges[index];
-        (u64::from(register) < range.end && range.position < self.operations.len())
-            .then_some(range.position)
+            .range(..=start)
+            .next_back()
+            .map_or(start, |(&key, _)| key);
+        Some(
+            self.ranges
+                .range(first..)
+                .take_while(|(key, _)| u64::from(**key) < end)
+                .any(|(_, &(limit, position))| {
+                    limit > u64::from(start)
+                        && position < self.operations.len()
+                        && predicate(position)
+                }),
+        )
     }
 }
 
@@ -102,96 +150,9 @@ mod tests {
 
     fn reference_producer(operations: &[LinearOp], register: Reg) -> Option<usize> {
         operations.iter().position(|operation| {
-            operation.dst_register().is_some_and(|start| {
-                let start = u64::from(start);
-                let end = start + operation.dst_register_count() as u64;
-                (start..end).contains(&u64::from(register))
-            })
+            let start = operation.dst_register().unwrap();
+            (start..start + operation.dst_register_count() as u32).contains(&register)
         })
-    }
-
-    #[test]
-    fn prefix_index_matches_linear_reference_for_sparse_permuted_ranges() {
-        for count in [0, 1, 2, 7, 31, 257] {
-            let base = Reg::MAX - (count * 8) as Reg;
-            let mut operations = Vec::new();
-            let mut registers = vec![0, Reg::MAX, base];
-            for i in (0..count).rev() {
-                let start = base + (i * 8) as Reg;
-                let width = [0, 1, 3, 7][i % 4];
-                operations.push(tensor(start, width));
-                operations.push(LinearOp::StoreOutput { src: start });
-                registers.extend([start - 1, start, start + width as Reg, start + 7]);
-            }
-            assert_prefixes_match(&operations, &registers);
-        }
-    }
-
-    fn assert_prefixes_match(operations: &[LinearOp], registers: &[Reg]) {
-        let source = UniqueProgram::new(operations).unwrap();
-        for limit in 0..=operations.len() {
-            let prefix = source.view().before(limit).unwrap();
-            assert_eq!(prefix.len(), limit);
-            for &register in registers {
-                assert_eq!(
-                    prefix.producer_position(register),
-                    reference_producer(&operations[..limit], register)
-                );
-            }
-        }
-        assert!(source.view().before(operations.len() + 1).is_none());
-    }
-
-    #[cfg(feature = "diagnostic-benchmarks")]
-    fn measure_index(
-        operations: &[LinearOp],
-        queries: &[(usize, Reg, Option<usize>)],
-        iterations: usize,
-    ) -> u128 {
-        let started = std::time::Instant::now();
-        for _ in 0..iterations {
-            let source = UniqueProgram::new(std::hint::black_box(operations)).unwrap();
-            for &(prefix, register, expected) in queries {
-                assert_eq!(
-                    source
-                        .view()
-                        .before(prefix)
-                        .unwrap()
-                        .producer_position(register),
-                    expected
-                );
-            }
-            std::hint::black_box(source);
-        }
-        started.elapsed().as_nanos()
-    }
-
-    #[test]
-    #[cfg(feature = "diagnostic-benchmarks")]
-    fn producer_index_diagnostic() {
-        for count in [4, 64, 1024, 8192] {
-            let operations: Vec<_> = (0..count)
-                .map(|i| tensor((((i * 37) % count) * 8 + 1024) as Reg, 3))
-                .collect();
-            let queries: Vec<_> = (0..(count * 8).min(4096))
-                .map(|i| {
-                    let prefix = (i * 29) % (count + 1);
-                    let register = ((i * 13) % (count * 8) + 1024) as Reg;
-                    (
-                        prefix,
-                        register,
-                        reference_producer(&operations[..prefix], register),
-                    )
-                })
-                .collect();
-            let iterations = 131_072 / count;
-            for (with_queries, selected) in [(false, &[][..]), (true, queries.as_slice())] {
-                let elapsed = measure_index(&operations, selected, iterations);
-                println!(
-                    "PRODUCER_INDEX count={count} queries={with_queries} iterations={iterations} elapsed_ns={elapsed}"
-                );
-            }
-        }
     }
 
     #[test]
