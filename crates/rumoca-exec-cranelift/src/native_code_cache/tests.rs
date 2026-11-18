@@ -1,4 +1,5 @@
 use super::*;
+use cranelift_jit::JITModule;
 use rumoca_core::{SourceId, Span};
 use rumoca_ir_solve::{BinaryOp, LinearOp, ScalarProgramBlock, UnaryOp};
 use std::{

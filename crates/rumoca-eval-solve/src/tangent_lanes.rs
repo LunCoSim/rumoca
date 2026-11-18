@@ -112,7 +112,14 @@ pub struct TornTangentEvaluator {
     /// The JVP rows a one-direction plan evaluates.
     directions: Option<std::rc::Rc<crate::PreparedScalarProgramBlock>>,
     /// The sweep buffers, kept between evaluations; see [`LaneBuffers`].
-    buffers: RefCell<LaneBuffers>,
+    buffers: Rc<RefCell<LaneBuffers>>,
+}
+
+/// Prepare several torn plans over the same directional programs and scratch.
+pub struct TornTangentPreparation<'a> {
+    jvp: &'a rumoca_ir_solve::ScalarProgramBlock,
+    directions: Option<Rc<crate::PreparedScalarProgramBlock>>,
+    buffers: Rc<RefCell<LaneBuffers>>,
 }
 
 impl TornTangentEvaluator {
@@ -121,24 +128,32 @@ impl TornTangentEvaluator {
         plan: TornTangentPlan,
         jvp: &rumoca_ir_solve::ScalarProgramBlock,
     ) -> Result<Self, EvalSolveError> {
-        Self::sharing_directions(plan, jvp, &mut None)
+        TornTangentPreparation::new(jvp).prepare(plan)
+    }
+}
+
+impl<'a> TornTangentPreparation<'a> {
+    #[must_use]
+    pub fn new(jvp: &'a rumoca_ir_solve::ScalarProgramBlock) -> Self {
+        Self {
+            jvp,
+            directions: None,
+            buffers: Rc::default(),
+        }
     }
 
-    /// [`Self::new`] for one of several evaluators over the same JVP rows
-    /// `jvp`: the first one-direction plan prepares them into `shared`, and
-    /// every later one reads that same preparation.
-    pub fn sharing_directions(
+    /// Prepare a plan against this construction's JVP rows.
+    pub fn prepare(
+        &mut self,
         plan: TornTangentPlan,
-        jvp: &rumoca_ir_solve::ScalarProgramBlock,
-        shared: &mut Option<std::rc::Rc<crate::PreparedScalarProgramBlock>>,
-    ) -> Result<Self, EvalSolveError> {
+    ) -> Result<TornTangentEvaluator, EvalSolveError> {
         let directions = if plan.directional() {
-            if shared.is_none() {
-                *shared = Some(std::rc::Rc::new(crate::PreparedScalarProgramBlock::new(
-                    jvp.clone(),
+            if self.directions.is_none() {
+                self.directions = Some(Rc::new(crate::PreparedScalarProgramBlock::new(
+                    self.jvp.clone(),
                 )?));
             }
-            shared.clone()
+            self.directions.clone()
         } else {
             None
         };
@@ -148,14 +163,16 @@ impl TornTangentEvaluator {
             .cloned()
             .map(PreparedTangentLaneProgram::new)
             .collect();
-        Ok(Self {
+        Ok(TornTangentEvaluator {
             plan,
             programs,
             directions,
-            buffers: RefCell::new(LaneBuffers::default()),
+            buffers: Rc::clone(&self.buffers),
         })
     }
+}
 
+impl TornTangentEvaluator {
     #[must_use]
     pub const fn plan(&self) -> &TornTangentPlan {
         &self.plan
@@ -186,22 +203,43 @@ impl TornTangentEvaluator {
         } else {
             self.plan.lanes()
         };
-        let mut buffers = self.buffers.borrow_mut();
-        let LaneBuffers { seed, out } = &mut *buffers;
-        if seed.len() != point.y.len() * lanes {
-            seed.clear();
-            seed.resize(point.y.len() * lanes, 0.0);
+        let len = point.y.len();
+        let extent = len
+            .checked_mul(lanes)
+            .ok_or_else(|| EvalSolveError::ShapeContract {
+                message: "torn tangent seed extent overflows".into(),
+                span: None,
+            })?;
+        let targets = self
+            .plan
+            .tear_targets()
+            .iter()
+            .copied()
+            .chain(self.plan.steps().iter().map(|step| step.target));
+        for target in targets.clone() {
+            if target >= len {
+                return Err(EvalSolveError::MissingInput {
+                    vector: "y",
+                    index: target,
+                    len,
+                    span: None,
+                }
+                .into());
+            }
         }
+
+        // A native callback may evaluate another plan over the same workspace.
+        let mut buffers = self.buffers.take();
+        let LaneBuffers { seed, out } = &mut buffers;
+        seed.resize(extent, 0.0);
         let result = match &self.directions {
             Some(directions) => self.eval_directions(directions, point, call, (seed, out)),
             None => self.eval_lanes_through(point, seed, out).map_err(E::from),
         };
-        for &target in self.plan.tear_targets() {
+        for target in targets {
             seed[target * lanes..(target + 1) * lanes].fill(0.0);
         }
-        for step in self.plan.steps() {
-            seed[step.target * lanes..(step.target + 1) * lanes].fill(0.0);
-        }
+        self.buffers.replace(buffers);
         result
     }
 

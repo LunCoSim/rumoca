@@ -20,8 +20,8 @@ fn selectable_programs_bound_native_function_preparation() {
         compile_selectable_expression_scalar_program_block(&block, None).unwrap()
     });
     assert_eq!(
-        usage.attempts, 2,
-        "64 small programs require two bounded dispatch functions"
+        usage.attempts, 3,
+        "64 small programs use two dispatch functions and one whole-set batch"
     );
     for (index, expected) in inputs.iter().copied().enumerate() {
         assert_eq!(
@@ -34,7 +34,7 @@ fn selectable_programs_bound_native_function_preparation() {
     let (jacobian, usage) = with_native_code_cache(store, || {
         compile_jacobian_scalar_program_block(&block).unwrap()
     });
-    assert_eq!(usage.attempts, 2);
+    assert_eq!(usage.attempts, 3);
     let mut output = [0.0; 64];
     jacobian.call(&inputs, &[], 0.0, &[], &mut output).unwrap();
     assert_eq!(output.as_slice(), inputs);

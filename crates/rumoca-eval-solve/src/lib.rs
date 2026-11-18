@@ -114,7 +114,8 @@ pub use table_runtime::{
 };
 pub use tangent_lanes::{
     ColoredTangentEvaluator, DirectionCall, PreparedLaneCatalog, PreparedTangentLaneProgram,
-    TangentPoint, TornTangentEvaluator, TornTangentJacobian, causal_coefficient_is_finite,
+    TangentPoint, TornTangentEvaluator, TornTangentJacobian, TornTangentPreparation,
+    causal_coefficient_is_finite,
 };
 pub use typed_program::{
     AssertionInvocationEvaluation, AssertionReport, TypedAssertionFailure, TypedProgramEvalError,

@@ -52,6 +52,61 @@ fn plan_row_keeps_seed_rows_on_general_runtime_plan() {
 }
 
 #[test]
+fn native_batch_budget_counts_expanded_tensor_values() {
+    let width = 128;
+    let count = 192;
+    let rows = (0..count)
+        .map(|row| {
+            vec![
+                LinearOp::TensorLoad {
+                    dst_start: 0,
+                    input: rumoca_ir_solve::TensorInputKind::Y,
+                    input_start: row * width,
+                    count: width,
+                    seed_start: None,
+                    lanes: 1,
+                },
+                LinearOp::TensorBinary {
+                    dst_start: width as u32,
+                    op: BinaryOp::Mul,
+                    lhs_start: 0,
+                    rhs_start: 0,
+                    count: width,
+                    lhs_stride: 1,
+                    rhs_stride: 1,
+                    lanes: 1,
+                },
+                LinearOp::StoreOutputRange {
+                    start: width as u32,
+                    count: width,
+                    stride: 1,
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        rows.iter()
+            .map(|row| residual_program_cost(row))
+            .sum::<usize>()
+            <= RESIDUAL_BATCH_OPS
+    );
+
+    let input = (0..width * count)
+        .map(|value| value as f64)
+        .collect::<Vec<_>>();
+    let mut output = vec![0.0; input.len()];
+    let compiled = compile_residual_rows(&rows).unwrap();
+    compiled.call(&input, &[], 0.0, &mut output).unwrap();
+    assert!(compiled.jit_call_count() > 1);
+    assert!(
+        output
+            .iter()
+            .zip(input)
+            .all(|(output, input)| *output == input * input)
+    );
+}
+
+#[test]
 fn compile_residual_rows_accepts_linear_solve_component() {
     let row = vec![
         LinearOp::Const { dst: 0, value: 0.0 },

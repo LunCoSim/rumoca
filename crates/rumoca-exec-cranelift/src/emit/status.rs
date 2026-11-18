@@ -18,6 +18,7 @@ const SCALAR_PAYLOAD_FAILURE: i64 = 7;
 const INTEGER_ARITHMETIC_FAILURE: i64 = 8;
 /// A table callback retained its checked source fault in this invocation.
 pub(super) const TABLE_FAILURE: u8 = 10;
+const INVALID_DISPATCH_SELECTOR: u8 = 11;
 
 pub(super) fn check(status: u8) -> Result<(), CompileError> {
     if let Some(fault) = super::native_fault::take(status) {
@@ -78,6 +79,9 @@ pub(super) fn check(status: u8) -> Result<(), CompileError> {
         scratch::FAILURE => Err(CompileError::Backend(
             "native scratch allocation or frame contract failed".into(),
         )),
+        INVALID_DISPATCH_SELECTOR => Err(CompileError::Backend(
+            "invalid native dispatch selector".into(),
+        )),
         _ => Err(CompileError::Backend(format!(
             "unknown native kernel status {status}"
         ))),
@@ -88,6 +92,14 @@ pub(super) fn succeed(builder: &mut FunctionBuilder<'_>) {
     let success = builder.ins().iconst(types::I8, 0);
     scratch::leave(builder);
     builder.ins().return_(&[success]);
+}
+
+pub(super) fn reject_dispatch(builder: &mut FunctionBuilder<'_>) {
+    let status = builder
+        .ins()
+        .iconst(types::I8, i64::from(INVALID_DISPATCH_SELECTOR));
+    scratch::leave(builder);
+    builder.ins().return_(&[status]);
 }
 
 pub(super) fn propagate(builder: &mut FunctionBuilder<'_>, status: Value) {

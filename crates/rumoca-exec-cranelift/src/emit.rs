@@ -39,6 +39,7 @@ mod register_storage;
 #[cfg(test)]
 mod register_storage_tests;
 mod scratch;
+mod selected_dispatch;
 mod selected_jvp;
 mod selected_residual;
 mod status;
@@ -104,6 +105,10 @@ struct CompiledResidualJit {
 
 enum ResidualJit {
     Whole(ResidualRowFn),
+    Selected {
+        function: selected_dispatch::ResidualFn,
+        index: u32,
+    },
     Chunked(Box<[ResidualChunkFn]>),
 }
 
@@ -125,7 +130,7 @@ enum LoweredConditionalOutput {
 
 struct CompiledJacobianRow {
     plan: RowPlan,
-    jit: JacobianRowFn,
+    jit: selected_dispatch::JacobianEntry,
     scratch: scratch::ScratchOwner,
     #[cfg(test)]
     interpreter_supported: bool,
@@ -716,6 +721,7 @@ pub(crate) enum RowKind {
 
 enum ResidualFuncIds {
     Whole(FuncId),
+    Selected { function: FuncId, index: u32 },
     Chunked(Vec<FuncId>),
 }
 
@@ -723,6 +729,9 @@ const MAX_STATIC_MATRIX_WORK: usize = 64;
 const RESIDUAL_CHUNK_THRESHOLD: usize = 16_000;
 const RESIDUAL_CHUNK_OPS: usize = 4_000;
 const RESIDUAL_BATCH_OPS: usize = 12_000;
+// A typed operation can emit thousands of SSA values through tensor copies
+// and call ABI packing. Bound optional batching by the expanded Cranelift IR.
+const ROW_BATCH_VALUE_BUDGET: usize = 32_768;
 static NEXT_FOLD_KERNEL_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_RESIDUAL_KERNEL_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_ASSIGNMENT_KERNEL_ID: AtomicUsize = AtomicUsize::new(0);
@@ -840,7 +849,7 @@ fn compile_residual_functions(
         row_start = rows.len();
     }
     while row_start < rows.len() {
-        if selectable || residual_program_cost(&rows[row_start]) > RESIDUAL_CHUNK_THRESHOLD {
+        if residual_program_cost(&rows[row_start]) > RESIDUAL_CHUNK_THRESHOLD {
             let output_count = plans[row_start].output_count();
             pending.push((
                 emitter.compile_residual_program(&rows[row_start], row_start)?,
@@ -850,6 +859,29 @@ fn compile_residual_functions(
             ));
             output_start += output_count;
             row_start += 1;
+            continue;
+        }
+        if selectable {
+            let (end, function) = emitter.compile_selected_prefix(
+                rows,
+                row_start,
+                RowKind::Residual,
+                &format!("rumoca_selected_residual_{row_start}"),
+            )?;
+            for (index, plan) in plans[row_start..end].iter().enumerate() {
+                let count = plan.output_count();
+                pending.push((
+                    ResidualFuncIds::Selected {
+                        function,
+                        index: index as u32,
+                    },
+                    plan.register_count(),
+                    output_start,
+                    count,
+                ));
+                output_start += count;
+            }
+            row_start = end;
             continue;
         }
         let mut row_end = row_start;
@@ -864,18 +896,29 @@ fn compile_residual_functions(
             operation_count = next;
             row_end += 1;
         }
-        let output_count = plans[row_start..row_end]
-            .iter()
-            .map(RowPlan::output_count)
-            .sum();
-        let func_id = emitter.compile_row_batch(&rows[row_start..row_end], RowKind::Residual)?;
-        pending.push((
-            ResidualFuncIds::Whole(func_id),
-            0,
-            output_start,
-            output_count,
-        ));
-        output_start += output_count;
+        let mut batches = Vec::new();
+        emitter.compile_independent_row_batches(
+            &rows[row_start..row_end],
+            RowKind::Residual,
+            &mut batches,
+        )?;
+        let mut start = row_start;
+        for (count, function) in batches {
+            let (functions, registers) = match function {
+                Some(function) => (ResidualFuncIds::Whole(function), 0),
+                None => (
+                    emitter.compile_residual_program(&rows[start], start)?,
+                    plans[start].register_count(),
+                ),
+            };
+            let outputs = plans[start..start + count]
+                .iter()
+                .map(RowPlan::output_count)
+                .sum();
+            pending.push((functions, registers, output_start, outputs));
+            output_start += outputs;
+            start += count;
+        }
         row_start = row_end;
     }
     Ok(pending)
@@ -906,6 +949,10 @@ fn finalize_residual_jits(
             ResidualFuncIds::Whole(func_id) => {
                 ResidualJit::Whole(finalized_residual_fn(module, func_id)?)
             }
+            ResidualFuncIds::Selected { function, index } => ResidualJit::Selected {
+                function: selected_dispatch::finalize_residual(module, function)?,
+                index,
+            },
             ResidualFuncIds::Chunked(func_ids) => ResidualJit::Chunked(
                 func_ids
                     .into_iter()
@@ -977,7 +1024,12 @@ pub(crate) fn compile_exact_assignment_schedule(
     shared: &rumoca_ir_solve::SharedAssignmentSchedule,
     pure_calls: Option<Rc<typed_program::CompiledPureCallTable>>,
 ) -> Result<CompiledAssignmentSchedule, CompileError> {
-    let rows: Vec<_> = shared.block().programs().iter().map(Vec::as_slice).collect();
+    let rows: Vec<_> = shared
+        .block()
+        .programs()
+        .iter()
+        .map(Vec::as_slice)
+        .collect();
     let targets: Vec<_> = shared.target_rows().iter().flatten().copied().collect();
     compile_assignment_schedule_slices(&rows, &targets, pure_calls)
 }
@@ -1048,21 +1100,26 @@ fn compile_jacobian_rows_attached(
     let mut emitter = CraneliftEmitter::new(pure_calls.clone())?;
     let plans = plan_rows(rows)?;
     let mut func_ids = checked_vec_with_capacity(rows.len(), "Jacobian row function ids")?;
-    for (index, row) in rows.iter().enumerate() {
+    for row in rows {
         validate_row_supported_by_jit(row, RowKind::JacobianV)?;
+    }
+    let mut start = 0;
+    while start < rows.len() {
         let name = match projection {
-            Some(block) => format!("rumoca_projection_{block}_jacobian_row_{index}"),
-            None => format!("rumoca_jacobian_row_{index}"),
+            Some(block) => format!("rumoca_projection_{block}_jacobian_group_{start}"),
+            None => format!("rumoca_jacobian_group_{start}"),
         };
-        let func_id = emitter.compile_row(row, RowKind::JacobianV, &name)?;
-        func_ids.push(func_id);
+        let (end, function) =
+            emitter.compile_selected_prefix(rows, start, RowKind::JacobianV, &name)?;
+        func_ids.extend((0..end - start).map(|index| (function, index as u32)));
+        start = end;
     }
     let whole_ids = compile_jacobian_whole(&mut emitter, rows)?;
     finalize_jit_module(&mut emitter.module)?;
     let input_requirements = input_requirements_for_plans(&plans);
     let mut compiled_rows = checked_vec_with_capacity(rows.len(), "compiled Jacobian rows")?;
-    for ((plan, func_id), _source) in plans.into_iter().zip(func_ids).zip(rows) {
-        let jit = finalized_jacobian_fn(&emitter.module, func_id)?;
+    for ((plan, (function, index)), _source) in plans.into_iter().zip(func_ids).zip(rows) {
+        let jit = selected_dispatch::JacobianEntry::finalize(&emitter.module, function, index)?;
         compiled_rows.push(CompiledJacobianRow {
             plan,
             jit,
@@ -1134,12 +1191,17 @@ fn compile_jacobian_whole(
             end += 1;
         }
         let end = end.max(start + 1);
-        let func_id = if end - start > 1 {
-            Some(emitter.compile_row_batch(&rows[start..end], RowKind::JacobianV)?)
-        } else {
-            None
-        };
-        groups.push((start..end, func_id));
+        let mut batches = Vec::new();
+        emitter.compile_independent_row_batches(
+            &rows[start..end],
+            RowKind::JacobianV,
+            &mut batches,
+        )?;
+        let mut first = start;
+        for (count, function) in batches {
+            groups.push((first..first + count, function));
+            first += count;
+        }
         start = end;
     }
     Ok(groups)
@@ -1241,6 +1303,12 @@ unsafe fn call_residual_jit(
                 .scratch
                 .invoke(|arena| unsafe { jit(y.as_ptr(), p.as_ptr(), t, out.as_mut_ptr(), arena) })
         }
+        ResidualJit::Selected { function, index } => {
+            // SAFETY: the checked selector evaluates only this program.
+            compiled.scratch.invoke(|arena| unsafe {
+                function(y.as_ptr(), p.as_ptr(), t, out.as_mut_ptr(), *index, arena)
+            })
+        }
         ResidualJit::Chunked(chunks) => {
             // Chunk functions exchange compiler registers through this tape.
             // Each register is written before its first read by validated SSA.
@@ -1278,16 +1346,8 @@ unsafe fn call_jacobian_jit(
     // SAFETY: the caller guarantees the function pointer came from
     // finalized_jacobian_fn, prevalidation ensures any loaded y/p/seed indices
     // are in bounds, and `out` has room for this program's outputs.
-    row.scratch.invoke(|arena| unsafe {
-        (row.jit)(
-            y.as_ptr(),
-            p.as_ptr(),
-            t,
-            v.as_ptr(),
-            out.as_mut_ptr(),
-            arena,
-        )
-    })
+    row.scratch
+        .invoke(|arena| unsafe { row.jit.call(y, p, t, v, out, arena) })
 }
 
 #[cfg(test)]
@@ -1790,52 +1850,7 @@ impl CraneliftEmitter {
 
             let params = fb.block_params(entry).to_vec();
             scratch::enter(&mut fb);
-            let y_ptr = params[0];
-            let p_ptr = params[1];
-            let t_value = params[2];
-            let (v_ptr, out_ptr) = if kind.has_seed() {
-                (Some(params[3]), params[4])
-            } else {
-                (None, params[3])
-            };
-
-            let mut regs: HashMap<u32, cranelift_codegen::ir::Value> = HashMap::new();
-            let mut loaded_y = HashMap::new();
-            let mut loaded_p = HashMap::new();
-            let flags = MemFlags::new();
-            let backing_regs_ptr = create_row_register_tape(&mut fb, pointer_type, row)?;
-            let mut row_lower = RowLowerCtx {
-                fb: &mut fb,
-                module: &mut self.module,
-                math: &mut self.math,
-                regs: &mut regs,
-                y_ptr,
-                p_ptr,
-                t_value,
-                v_ptr,
-                backing_regs_ptr,
-                flags,
-                loaded_y: backing_regs_ptr.is_none().then_some(&mut loaded_y),
-                loaded_p: backing_regs_ptr.is_none().then_some(&mut loaded_p),
-                fold_carried: None,
-                fold_indices: None,
-                fold_index_constants: None,
-                fold_captures: None,
-                fold_captures_ptr: None,
-                conditional_captures: None,
-                conditional_captures_ptr: None,
-                fold_functions: &self.fold_functions,
-                conditional_functions: &self.conditional_functions,
-                pure_call_functions: &self.pure_call_functions,
-                source_operation: std::ptr::null(),
-                pure_call_results: HashMap::new(),
-                nested_fold_results: HashMap::new(),
-                conditional_results: HashMap::new(),
-                fold_carried_versions: Vec::new(),
-                known_constants: HashMap::new(),
-            };
-
-            row_lower.lower_row_outputs(row, out_ptr)?;
+            self.lower_independent_row(&mut fb, row, kind, &params)?;
             status::succeed(&mut fb);
             fb.finalize();
         }
@@ -1891,6 +1906,39 @@ impl CraneliftEmitter {
         rows: &[Vec<LinearOp>],
         kind: RowKind,
     ) -> Result<FuncId, CompileError> {
+        let context = self.build_row_batch(rows, kind)?;
+        self.queue_row_batch(context, kind)
+    }
+
+    /// Compile consecutive independent programs in native-sized batches.
+    /// Oversized candidates are split before either half reaches codegen;
+    /// singleton slices use their ordinary individual entry.
+    fn compile_independent_row_batches(
+        &mut self,
+        rows: &[Vec<LinearOp>],
+        kind: RowKind,
+        batches: &mut Vec<(usize, Option<FuncId>)>,
+    ) -> Result<(), CompileError> {
+        if rows.len() == 1 {
+            batches.push((1, None));
+            return Ok(());
+        }
+        let context = self.build_row_batch(rows, kind)?;
+        if context.func.dfg.num_values() <= ROW_BATCH_VALUE_BUDGET {
+            batches.push((rows.len(), Some(self.queue_row_batch(context, kind)?)));
+            return Ok(());
+        }
+        drop(context);
+        let (left, right) = rows.split_at(rows.len() / 2);
+        self.compile_independent_row_batches(left, kind, batches)?;
+        self.compile_independent_row_batches(right, kind, batches)
+    }
+
+    fn build_row_batch(
+        &mut self,
+        rows: &[Vec<LinearOp>],
+        kind: RowKind,
+    ) -> Result<cranelift_codegen::Context, CompileError> {
         for row in rows {
             self.ensure_fold_programs(row, kind)?;
             self.ensure_conditional_programs(row, kind)?;
@@ -1905,17 +1953,7 @@ impl CraneliftEmitter {
             signature.params.push(AbiParam::new(pointer_type)); // v
         }
         signature.params.push(AbiParam::new(pointer_type));
-        let profile_id = NEXT_RESIDUAL_KERNEL_ID.fetch_add(1, Ordering::Relaxed);
         signature.params.push(AbiParam::new(pointer_type)); // caller-owned scratch
-        let name = if kind.has_seed() {
-            format!("rumoca_jacobian_batch_{profile_id}")
-        } else {
-            format!("rumoca_residual_batch_{profile_id}")
-        };
-        let func_id = self
-            .module
-            .declare_function(&name, Linkage::Local, &signature)
-            .map_err(to_backend_err)?;
         let mut context = self.module.make_context();
         context.func.signature = signature;
         let mut fb_ctx = FunctionBuilderContext::new();
@@ -1977,8 +2015,25 @@ impl CraneliftEmitter {
             status::succeed(&mut fb);
             fb.finalize();
         }
+        Ok(context)
+    }
+
+    fn queue_row_batch(
+        &mut self,
+        mut context: cranelift_codegen::Context,
+        kind: RowKind,
+    ) -> Result<FuncId, CompileError> {
+        let profile_id = NEXT_RESIDUAL_KERNEL_ID.fetch_add(1, Ordering::Relaxed);
+        let name = if kind.has_seed() {
+            format!("rumoca_jacobian_batch_{profile_id}")
+        } else {
+            format!("rumoca_residual_batch_{profile_id}")
+        };
+        let func_id = self
+            .module
+            .declare_function(&name, Linkage::Local, &context.func.signature)
+            .map_err(to_backend_err)?;
         self.module.queue_function(func_id, &mut context)?;
-        self.module.clear_context(&mut context);
         Ok(func_id)
     }
 

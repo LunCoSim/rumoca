@@ -62,6 +62,14 @@ per-operation retention allocations. Program identities and color order come
 from the checked application; the lookup table never chooses execution order.
 Retained native values remain local to emission and are never simulation state.
 
+Whole-set residual and directional Jacobian calls batch adjacent programs in
+source order. Typed tensor operations and function argument packing expand
+into many Cranelift values, so each independent batch checks its emitted size
+before code generation. Larger batches are divided at program boundaries, and
+a single program uses its individual native entry. Selectable residual and
+directional Jacobian programs share bounded dispatch functions whose arms
+execute one checked program with the caller's scratch arena.
+
 The native `pow` host call retains finite results in a bounded, thread-local
 4,096-entry table. Both f64 input bit patterns must match before reuse; a hash
 collision only replaces an entry. Signed zero and result bits are preserved.

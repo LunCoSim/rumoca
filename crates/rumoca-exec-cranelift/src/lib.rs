@@ -544,7 +544,7 @@ pub fn compile_expression_scalar_program_block(
 }
 
 /// Compile independent residual program entries for algebraic projection.
-/// Whole-block calls use the same entries, so program bodies are emitted once.
+/// Whole-block calls can batch adjacent program entries.
 /// A block with shared conditional owners retains its aggregate batch instead.
 pub fn compile_selectable_expression_scalar_program_block(
     rows: &ScalarProgramBlock,
@@ -637,8 +637,8 @@ mod tests {
     mod selected_faults;
     mod selected_jvp;
     mod selected_residual;
-    mod torn_tangent;
     mod tensor_cross_order;
+    mod torn_tangent;
 
     use super::*;
     use rumoca_ir_solve::{LinearOp, ScalarProgramBlock};
@@ -1222,7 +1222,9 @@ mod tests {
         let schedule = owners
             .exact_assignment_schedule(owners.algebraic().dynamic_causal_sequence)
             .expect("construction should freeze the exact order");
-        let shared = schedule.shared_segments(&source, &owners).expect("prove owner schedule");
+        let shared = schedule
+            .shared_segments(&source, &owners)
+            .expect("prove owner schedule");
         let compiled = compile_exact_assignment_schedule(&shared).expect("compile owner schedule");
         let mut y = [0.0, 0.0];
 

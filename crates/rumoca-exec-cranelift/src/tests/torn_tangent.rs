@@ -157,7 +157,7 @@ fn check_native_tangent_failure_recovery(
     );
     assert!(
         evaluator
-            .eval_through(point, &mut |program, seed, out| {
+            .eval_through::<EvalSolveError>(point, &mut |program, seed, out| {
                 call_native_tangent(compiled, point, program, seed, out)?;
                 if program == 0 {
                     out[coefficient] = f64::NAN;
@@ -184,86 +184,66 @@ fn check_native_tangent_failure_recovery(
 #[test]
 fn native_torn_workspace_recovers_after_errors_and_nonfinite_coefficients() {
     let (source, tearing) = source();
-    for plan in [
-        TornTangentPlan::derive(&tearing, &source).unwrap(),
-        TornTangentPlan::derive_directional(&tearing, &source).unwrap(),
-    ] {
-        let compiled = native(&plan, &source);
-        let coefficient = if plan.directional() {
-            0
-        } else {
-            plan.lanes() - 1
-        };
-        let stride = if plan.directional() { 1 } else { plan.lanes() };
-        let evaluator = TornTangentEvaluator::new(plan.clone(), &source).unwrap();
-        for width in [3, 3035, 5, 4096, 3] {
-            let mut y = vec![-3.0; width];
-            y[..3].copy_from_slice(&[width as f64 * 1.25, -0.0, 3.125]);
-            let point = TangentPoint {
-                y: &y,
-                p: &[],
-                t: 0.0,
-                context: Default::default(),
-            };
-            let expected = TornTangentEvaluator::new(plan.clone(), &source)
-                .unwrap()
-                .eval(point)
-                .unwrap()
-                .unwrap();
-            let actual = check_native_tangent_failure_recovery(
-                &evaluator,
-                &compiled,
-                point,
-                coefficient,
-                stride,
-            );
-            assert_eq!(bits(&actual), bits(&expected));
-        }
-    }
-}
-
-#[test]
-fn native_torn_workspace_allows_reentry_and_rejects_short_coordinates() {
-    let (source, tearing) = source();
-    for plan in [
-        TornTangentPlan::derive(&tearing, &source).unwrap(),
-        TornTangentPlan::derive_directional(&tearing, &source).unwrap(),
-    ] {
-        let compiled = native(&plan, &source);
-        let evaluator = TornTangentEvaluator::new(plan, &source).unwrap();
-        let y = [1.25, 2.5, 3.125];
+    let plan = TornTangentPlan::derive_directional(&tearing, &source).unwrap();
+    let compiled = native(&plan, &source);
+    let evaluator = TornTangentEvaluator::new(plan.clone(), &source).unwrap();
+    for width in [3, 3035, 5, 4096, 3] {
+        let mut y = vec![-3.0; width];
+        y[..3].copy_from_slice(&[width as f64 * 1.25, -0.0, 3.125]);
         let point = TangentPoint {
             y: &y,
             p: &[],
             t: 0.0,
             context: Default::default(),
         };
-        let expected = bits(&evaluator.eval(point).unwrap().unwrap());
-        let nested = Cell::new(false);
-        let actual = evaluator
-            .eval_through(point, &mut |program, seed, out| {
-                if !nested.replace(true) {
-                    assert_eq!(bits(&evaluator.eval(point).unwrap().unwrap()), expected);
-                }
-                call_native_tangent(&compiled, point, program, seed, out)
-            })
+        let expected = TornTangentEvaluator::new(plan.clone(), &source)
+            .unwrap()
+            .eval(point)
             .unwrap()
             .unwrap();
-        assert_eq!(bits(&actual), expected);
-        let invalid = TangentPoint { y: &[], ..point };
-        let error = evaluator.eval_through(invalid, &mut |_, _, _| {
-            panic!("invalid coordinates must fail before calling a program")
-        });
-        assert!(matches!(
-            error,
-            Err(EvalSolveError::MissingInput {
-                vector: "y",
-                len: 0,
-                ..
-            })
-        ));
-        assert_eq!(bits(&evaluator.eval(point).unwrap().unwrap()), expected);
+        let actual = check_native_tangent_failure_recovery(&evaluator, &compiled, point, 0, 1);
+        assert_eq!(bits(&actual), bits(&expected));
     }
+}
+
+#[test]
+fn native_torn_workspace_allows_reentry_and_rejects_short_coordinates() {
+    let (source, tearing) = source();
+    let plan = TornTangentPlan::derive_directional(&tearing, &source).unwrap();
+    let compiled = native(&plan, &source);
+    let evaluator = TornTangentEvaluator::new(plan, &source).unwrap();
+    let y = [1.25, 2.5, 3.125];
+    let point = TangentPoint {
+        y: &y,
+        p: &[],
+        t: 0.0,
+        context: Default::default(),
+    };
+    let expected = bits(&evaluator.eval(point).unwrap().unwrap());
+    let nested = Cell::new(false);
+    let actual = evaluator
+        .eval_through(point, &mut |program, seed, out| {
+            if !nested.replace(true) {
+                assert_eq!(bits(&evaluator.eval(point).unwrap().unwrap()), expected);
+            }
+            call_native_tangent(&compiled, point, program, seed, out)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(bits(&actual), expected);
+    let invalid = TangentPoint { y: &[], ..point };
+    let error = evaluator.eval_through::<EvalSolveError>(invalid, &mut |_, _, _| {
+        panic!("invalid coordinates must fail before calling a program")
+    });
+    assert!(matches!(
+        error,
+        Err(EvalSolveError::MissingInput {
+            vector: "y",
+            len: 0,
+            ..
+        })
+    ));
+    assert_eq!(bits(&evaluator.eval(point).unwrap().unwrap()), expected);
 }
 
 #[test]
@@ -272,9 +252,8 @@ fn native_torn_preparation_shares_clean_workspace_between_lane_shapes() {
     let mut preparation = TornTangentPreparation::new(&source);
     let lane_plan = TornTangentPlan::derive(&tearing, &source).unwrap();
     let direction_plan = TornTangentPlan::derive_directional(&tearing, &source).unwrap();
-    let native_lanes = native(&lane_plan, &source);
     let native_directions = native(&direction_plan, &source);
-    let lanes = preparation.prepare(lane_plan.clone()).unwrap();
+    let lanes = preparation.prepare(lane_plan).unwrap();
     let directions = preparation.prepare(direction_plan).unwrap();
     let mut y = vec![-3.0; 64];
     y[..3].copy_from_slice(&[1.25, 2.5, 3.125]);
@@ -285,33 +264,29 @@ fn native_torn_preparation_shares_clean_workspace_between_lane_shapes() {
         context: Default::default(),
     };
     let expected = bits(&lanes.eval(point).unwrap().unwrap());
-    for (evaluator, compiled, stride) in [
-        (&lanes, &native_lanes, lane_plan.lanes()),
-        (&directions, &native_directions, 1),
-        (&lanes, &native_lanes, lane_plan.lanes()),
-        (&directions, &native_directions, 1),
-    ] {
-        let actual = evaluator
+    for _ in 0..2 {
+        assert_eq!(bits(&lanes.eval(point).unwrap().unwrap()), expected);
+        let actual = directions
             .eval_through(point, &mut |program, seed, out| {
-                assert_eq!(seed.len(), point.y.len() * stride);
+                assert_eq!(seed.len(), point.y.len());
                 assert!(
-                    seed[3 * stride..]
+                    seed[3..]
                         .iter()
                         .all(|value| value.to_bits() == 0.0_f64.to_bits())
                 );
-                call_native_tangent(compiled, point, program, seed, out)
+                call_native_tangent(&native_directions, point, program, seed, out)
             })
             .unwrap()
             .unwrap();
         assert_eq!(bits(&actual), expected);
     }
     let nested = Cell::new(false);
-    let actual = lanes
+    let actual = directions
         .eval_through(point, &mut |program, seed, out| {
             if !nested.replace(true) {
-                assert_eq!(bits(&directions.eval(point).unwrap().unwrap()), expected);
+                assert_eq!(bits(&lanes.eval(point).unwrap().unwrap()), expected);
             }
-            call_native_tangent(&native_lanes, point, program, seed, out)
+            call_native_tangent(&native_directions, point, program, seed, out)
         })
         .unwrap()
         .unwrap();
@@ -376,7 +351,7 @@ fn native_torn_tangent_workspace_diagnostic() {
 }
 
 #[test]
-fn native_torn_tangent_batches_preserve_bits_and_reduce_invocations() {
+fn native_torn_tangent_directions_match_reference_lanes() {
     let (source, tearing) = source();
     let direction_plan = TornTangentPlan::derive_directional(&tearing, &source).unwrap();
     let lane_plan = TornTangentPlan::derive(&tearing, &source).unwrap();
@@ -384,7 +359,6 @@ fn native_torn_tangent_batches_preserve_bits_and_reduce_invocations() {
     let directions = TornTangentEvaluator::new(direction_plan.clone(), &source).unwrap();
     let lanes = TornTangentEvaluator::new(lane_plan.clone(), &source).unwrap();
     let native_directions = native(&direction_plan, &source);
-    let native_lanes = native(&lane_plan, &source);
     for y in [
         [1.25, 2.5, 3.125],
         [-3.2, -6.4, 20.48],
@@ -398,63 +372,17 @@ fn native_torn_tangent_batches_preserve_bits_and_reduce_invocations() {
         };
         let expected = directions.eval(point).unwrap().unwrap();
         assert_eq!(bits(&lanes.eval(point).unwrap().unwrap()), bits(&expected));
-        for (evaluator, native, expected_calls) in [
-            (&directions, &native_directions, 7),
-            (&lanes, &native_lanes, 3),
-        ] {
-            let calls = Cell::new(0);
-            let mut call = |program, seed: &[f64], out: &mut Vec<f64>| {
-                calls.set(calls.get() + 1);
-                native
-                    .call_program_outputs(
-                        program,
-                        rumoca_eval_solve::JacobianEvalInputs {
-                            y: &y,
-                            p: &[],
-                            t: 0.0,
-                            seed,
-                        },
-                        &[],
-                        out,
-                    )
-                    .map(|()| true)
-                    .map_err(|error| EvalSolveError::InvalidRow {
-                        message: error.to_string(),
-                        span: Some(fixture_span()),
-                    })
-            };
-            let actual = evaluator.eval_through(point, &mut call).unwrap().unwrap();
-            assert_eq!(bits(&actual), bits(&expected));
-            assert_eq!(calls.get(), expected_calls);
-        }
-    }
-}
-
-#[test]
-fn native_torn_tangent_execution_errors_do_not_become_reference_execution() {
-    let (source, tearing) = source();
-    for plan in [
-        TornTangentPlan::derive(&tearing, &source).unwrap(),
-        TornTangentPlan::derive_directional(&tearing, &source).unwrap(),
-    ] {
-        let native = native(&plan, &source);
-        let evaluator = TornTangentEvaluator::new(plan, &source).unwrap();
-        let y = [1.25, 2.5, 3.125];
-        let point = TangentPoint {
-            y: &y,
-            p: &[],
-            t: 0.0,
-            context: Default::default(),
-        };
-        let result = evaluator.eval_through(point, &mut |program, _, out| {
-            native
+        let calls = Cell::new(0);
+        let mut call = |program, seed: &[f64], out: &mut Vec<f64>| {
+            calls.set(calls.get() + 1);
+            native_directions
                 .call_program_outputs(
                     program,
                     rumoca_eval_solve::JacobianEvalInputs {
                         y: &y,
                         p: &[],
                         t: 0.0,
-                        seed: &[],
+                        seed,
                     },
                     &[],
                     out,
@@ -464,10 +392,47 @@ fn native_torn_tangent_execution_errors_do_not_become_reference_execution() {
                     message: error.to_string(),
                     span: Some(fixture_span()),
                 })
-        });
-        assert!(
-            result.is_err(),
-            "invalid native seed extent must remain a terminal error"
-        );
+        };
+        let actual = directions.eval_through(point, &mut call).unwrap().unwrap();
+        assert_eq!(bits(&actual), bits(&expected));
+        assert_eq!(calls.get(), 7);
     }
+}
+
+#[test]
+fn native_torn_tangent_execution_errors_do_not_become_reference_execution() {
+    let (source, tearing) = source();
+    let plan = TornTangentPlan::derive_directional(&tearing, &source).unwrap();
+    let native = native(&plan, &source);
+    let evaluator = TornTangentEvaluator::new(plan, &source).unwrap();
+    let y = [1.25, 2.5, 3.125];
+    let point = TangentPoint {
+        y: &y,
+        p: &[],
+        t: 0.0,
+        context: Default::default(),
+    };
+    let result = evaluator.eval_through(point, &mut |program, _, out| {
+        native
+            .call_program_outputs(
+                program,
+                rumoca_eval_solve::JacobianEvalInputs {
+                    y: &y,
+                    p: &[],
+                    t: 0.0,
+                    seed: &[],
+                },
+                &[],
+                out,
+            )
+            .map(|()| true)
+            .map_err(|error| EvalSolveError::InvalidRow {
+                message: error.to_string(),
+                span: Some(fixture_span()),
+            })
+    });
+    assert!(
+        result.is_err(),
+        "invalid native seed extent must remain a terminal error"
+    );
 }
