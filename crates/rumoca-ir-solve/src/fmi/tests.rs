@@ -45,6 +45,7 @@ fn variable_metadata_is_available_only_through_borrowed_views() {
         start_allowed: true,
         declaration_start: vec![1.0, 2.0].into(),
         effective_input_default: None,
+        given_state_start: None,
         minimum: Some(vec![0.0, 0.0].into()),
         maximum: Some(vec![3.0, 4.0].into()),
         nominal: Some(vec![1.0, 1.0].into()),

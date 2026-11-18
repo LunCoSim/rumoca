@@ -195,17 +195,14 @@ fn sample_tick_pulse_buffers_publish_their_exact_producer() {
 
 #[test]
 fn clocked_previous_history_is_refused() {
-    assert_refused(
-        "clocked previous() history needs clock event handling",
-        |model| {
-            static_partition(model);
-            model.problem.solve_layout.pre_param_bindings = vec![PreParamBinding {
-                dest_p_index: 0,
-                source: PreParamSource::P { index: 1 },
-                clock_schedule: Some(PeriodicEventSchedule::from_seconds(0.1, 0.0).unwrap()),
-            }];
-        },
-    );
+    assert_refused("cannot execute clocked previous() history", |model| {
+        static_partition(model);
+        model.problem.solve_layout.pre_param_bindings = vec![PreParamBinding {
+            dest_p_index: 0,
+            source: PreParamSource::P { index: 1 },
+            clock_schedule: Some(PeriodicEventSchedule::from_seconds(0.1, 0.0).unwrap()),
+        }];
+    });
 }
 
 /// A pre() value the continuous kernel reads follows events, which the

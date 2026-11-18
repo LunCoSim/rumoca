@@ -478,6 +478,7 @@ impl FmiComponent {
             .validate()
             .map_err(|error| FmiComponentError::InvalidSolve(error.to_string()))?;
         let mut metadata = checked_metadata(&model.problem, inputs)?;
+        initial_state_constraints::derive_given_state_starts(&model, &mut metadata)?;
         metadata.publication_defaults_complete =
             input_defaults::check_model_defaults(&model, &metadata)?;
         let event_indicators = FmiEventIndicatorInventory::derive(&model)?;
@@ -907,6 +908,7 @@ fn checked_variable(
         start_allowed,
         declaration_start,
         effective_input_default,
+        given_state_start: None,
         minimum: input.minimum,
         maximum: input.maximum,
         nominal: input.nominal,

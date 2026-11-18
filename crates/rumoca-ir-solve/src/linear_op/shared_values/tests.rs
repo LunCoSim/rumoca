@@ -2,7 +2,7 @@ use super::registers::RegisterSet;
 use super::*;
 
 fn wide_matrix_program() -> Vec<LinearOp> {
-    vec![
+    let mut ops = vec![
         LinearOp::TensorLoad {
             dst_start: 0,
             input: TensorInputKind::Y,
@@ -20,12 +20,9 @@ fn wide_matrix_program() -> Vec<LinearOp> {
             columns: 16,
             lanes: 1,
         },
-        LinearOp::StoreOutputRange {
-            start: 512,
-            count: 256,
-            stride: 1,
-        },
-    ]
+    ];
+    ops.extend((512..768).map(|src| LinearOp::StoreOutput { src }));
+    ops
 }
 
 #[test]
@@ -592,17 +589,15 @@ fn a_sharing_that_fails_its_proof_is_counted_and_admits_nothing() {
     let wrong = SharedValueSegments::derive(&[AssignmentProgram {
         ops: &other,
         targets: &targets,
-    }])
-    .unwrap();
+    }]);
     let before = shared_value_proof_failures();
-    assert!(admit_proven(Ok(wrong), &program, &targets).is_none());
+    assert!(admit_proven(wrong, &program, &targets).is_none());
     assert!(shared_value_proof_failures() > before);
     let right = SharedValueSegments::derive(&[AssignmentProgram {
         ops: &program,
         targets: &targets,
-    }])
-    .unwrap();
-    let admitted = admit_proven(Ok(right), &program, &targets).expect("a proven sharing");
+    }]);
+    let admitted = admit_proven(right, &program, &targets).expect("a proven sharing");
     assert_eq!(count(&admitted.ops, "StoreOutput"), 1);
 }
 
@@ -735,10 +730,10 @@ fn a_wide_operations_outputs_are_one_private_block_of_terms() {
     let mut terms = Terms::default();
     let slot = terms.slot(7);
     assert_eq!(terms.slot(7), slot, "a slot is one term");
-    let wide = terms.key("wide", vec![(0, slot)], 1_000);
-    let again = terms.key("wide", vec![(0, slot)], 1_000);
+    let wide = terms.key(&ShapeKey::Slot, vec![(0, slot)], 1_000);
+    let again = terms.key(&ShapeKey::Slot, vec![(0, slot)], 1_000);
     assert_eq!(wide, again, "one operation over one operand is one value");
-    let other = terms.key("wide", vec![(0, slot + 1)], 1_000);
+    let other = terms.key(&ShapeKey::Slot, vec![(0, slot + 1)], 1_000);
     let wide_terms = (0..1_000).map(|lane| Terms::value(&wide, lane).unwrap());
     let other_terms = (0..1_000).map(|lane| Terms::value(&other, lane).unwrap());
     let mut all = wide_terms
@@ -781,10 +776,10 @@ fn register_state_is_dense_and_counts_the_registers_it_holds() {
 fn a_value_term_past_the_key_width_is_refused() {
     let mut terms = Terms::default();
     let slot = terms.slot(0);
-    let key = terms.key("pair", vec![(0, slot)], 2);
+    let key = terms.key(&ShapeKey::Slot, vec![(0, slot)], 2);
     assert!(Terms::value(&key, 1).is_some());
     assert_eq!(Terms::value(&key, 2), None);
-    let wider = terms.key("pair", vec![(0, slot)], 3);
+    let wider = terms.key(&ShapeKey::Slot, vec![(0, slot)], 3);
     assert_eq!(
         wider, key,
         "the operation keeps the width it was issued with"

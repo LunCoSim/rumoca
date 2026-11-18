@@ -58,6 +58,7 @@ pub(super) fn derived_local(value_reference_fmi3: u32) -> FmiVariable {
             count: 1,
         },
         effective_input_default: None,
+        given_state_start: None,
         minimum: None,
         maximum: None,
         nominal: None,

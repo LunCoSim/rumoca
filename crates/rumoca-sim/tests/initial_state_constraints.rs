@@ -68,12 +68,23 @@ fn accepted_free_state_is_owned_without_mutating_cached_program_or_losing_residu
         initialize_fmi_component(&constrained, &options, &names).unwrap(),
         [1.0, 1.0]
     );
-    let x = constrained
-        .variables()
-        .iter()
-        .find(|v| v.name() == "x")
-        .unwrap();
-    assert_eq!(x.start(), Some([1.0].as_slice()));
+    let root = constrained.runtime_view().retain_assertion_root();
+    let wire = rumoca_sim::retained_fmi_component_wire(&root).unwrap();
+    let bytes = serde_json::to_vec(&wire).unwrap();
+    let mut decoder = serde_json::Deserializer::from_slice(&bytes);
+    let replayed = rumoca_sim::deserialize_fmi_component(&mut decoder).unwrap();
+    for component in [&constrained, &replayed] {
+        let x = component
+            .variables()
+            .iter()
+            .find(|v| v.name() == "x")
+            .unwrap();
+        assert_eq!(x.start().map(|values| values.as_slice()), Some(&[1.0][..]));
+        assert_eq!(
+            x.declaration_start().real().map(|values| values.as_slice()),
+            Some(&[0.0][..]),
+        );
+    }
 }
 
 #[test]

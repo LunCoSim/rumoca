@@ -214,11 +214,14 @@ fn fixture_splits_are_exact_and_evaluate_each_invariant_part_once_per_call() {
     let (native, counts) = assert_trajectory_exact("TangentChain", &chain);
     // The chain block's rows are one-output programs with no shared residual
     // output selection, so native residual passes evaluate them through the
-    // block's fused residual entry, and the block keeps no split it would not
-    // read; residual evaluations outside the refresh projection still
-    // evaluate its rows in one batch.
+    // block's fused residual entry. Debug builds also evaluate the rows in a
+    // batch to check the fused result bit for bit.
     assert_eq!(native.calls, 0, "{native:?}");
-    assert!(native.batched_rows > 0, "{native:?}");
+    assert_eq!(
+        native.batched_rows > 0,
+        cfg!(debug_assertions),
+        "{native:?}"
+    );
     assert!(counts.calls > 0, "the chain block splits: {counts:?}");
     assert_eq!(counts.fallbacks, 0);
     // The chain's one split block: exactly one invariant evaluation per split

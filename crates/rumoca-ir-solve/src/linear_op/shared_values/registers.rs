@@ -187,7 +187,7 @@ fn visit_segment_registers(op: &mut LinearOp, visit: &mut dyn FnMut(&mut Reg)) {
 }
 
 /// Whether the value key of `op` records the offsets between the registers
-/// it reads ([`super::symbolic::value_shape`]): true for every operation but a
+/// it reads ([`super::shape::value_shape`]): true for every operation but a
 /// [`renamable`] one whose sources are all scalar fields, whose key names its
 /// operands by field alone.
 pub(super) fn records_operand_offsets(op: &LinearOp) -> bool {

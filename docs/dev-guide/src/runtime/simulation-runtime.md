@@ -70,6 +70,11 @@ a single program uses its individual native entry. Selectable residual and
 directional Jacobian programs share bounded dispatch functions whose arms
 execute one checked program with the caller's scratch arena.
 
+A runtime index into a tensor stored on the register tape checks every supplied
+coordinate and uses the resulting strided offset for one load. Indexed reads
+from the tape emit a constant number of instructions per axis, independent of
+the number of cells.
+
 The native `pow` host call retains finite results in a bounded, thread-local
 4,096-entry table. Both f64 input bit patterns must match before reuse; a hash
 collision only replaces an entry. Signed zero and result bits are preserved.

@@ -144,6 +144,74 @@ fn cached_native_code_matches_fresh_modules_and_changed_inputs() {
 }
 
 #[test]
+fn wide_runtime_tensor_projection_emits_one_checked_tape_read() {
+    fn compiled_bytes(width: usize) -> usize {
+        use rumoca_ir_solve::{TensorIndex, TensorInputKind};
+        let dst = 2 + (width * 2) as u32;
+        let block = ScalarProgramBlock::with_program_spans(
+            vec![vec![
+                LinearOp::LoadP { dst: 0, index: 0 },
+                LinearOp::LoadP { dst: 1, index: 1 },
+                LinearOp::TensorLoad {
+                    dst_start: 2,
+                    input: TensorInputKind::Y,
+                    input_start: 0,
+                    count: width,
+                    seed_start: Some(0),
+                    lanes: 2,
+                },
+                LinearOp::LoadIndexedRegister {
+                    dst,
+                    base: 3,
+                    stride: 2,
+                    dimensions: Box::new([2, (width / 2) as u32]),
+                    indices: Box::new([TensorIndex::Runtime(0), TensorIndex::Runtime(1)]),
+                },
+                LinearOp::StoreOutput { src: dst },
+            ]],
+            vec![Span::from_offsets(
+                SourceId::from_source_name("index.mo"),
+                0,
+                1,
+            )],
+        )
+        .unwrap();
+        let store = Rc::new(RefCell::new(MemoryStore::default()));
+        let (compiled, _) = with_native_code_cache(store.clone(), || {
+            crate::compile_jacobian_scalar_program_block(&block).unwrap()
+        });
+        let y = vec![1.25; width];
+        let mut seed = vec![2.5; width];
+        seed[0] = -0.0;
+        seed[width - 1] = -7.25;
+        let mut output: [f64; 1] = [0.0];
+        for (indices, expected) in [([1.0, 1.0], -0.0_f64), ([2.0, (width / 2) as f64], -7.25)] {
+            compiled
+                .call(&y, &indices, 0.0, &seed, &mut output)
+                .unwrap();
+            assert_eq!(output[0].to_bits(), expected.to_bits());
+        }
+        assert!(matches!(
+            compiled.call(&y, &[3.0, 1.0], 0.0, &seed, &mut output),
+            Err(crate::CompileError::SourceOperation {
+                kind: crate::NativeSourceFault::TensorIndex,
+                ..
+            })
+        ));
+        let bytes = store.borrow().0.values().map(Vec::len).sum();
+        assert!(bytes > 0);
+        bytes
+    }
+
+    let small = compiled_bytes(256);
+    let large = compiled_bytes(4096);
+    assert!(
+        large <= small + 128,
+        "tape reads emitted {small} and {large} cache bytes"
+    );
+}
+
+#[test]
 fn cache_scope_restores_parent_on_return_unwind_and_new_threads() {
     let outer = Rc::new(RefCell::new(MemoryStore::default()));
     let inner = Rc::new(RefCell::new(MemoryStore::default()));

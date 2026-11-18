@@ -6111,6 +6111,28 @@ impl<'a, 'b> RowLowerCtx<'a, 'b> {
             .ok_or_else(|| {
                 CompileError::Backend("runtime tensor projection extent overflow".to_string())
             })?;
+        let flat = self.checked_tensor_projection_offset(dimensions, indices)?;
+        if let Some(tape) = self.backing_regs_ptr {
+            // The tape's footprint already includes the complete strided range.
+            // Read only the selected cell after checking all coordinates.
+            let stride_bytes = if count > 1 {
+                i64::from(register_byte_offset(checked_strided_register(
+                    0,
+                    1,
+                    stride,
+                    "runtime tensor projection stride",
+                )?)?)
+            } else {
+                0
+            };
+            let byte_offset = self.fb.ins().imul_imm(flat, stride_bytes);
+            let address = self.fb.ins().iadd(tape, byte_offset);
+            let value =
+                self.fb
+                    .ins()
+                    .load(types::F64, self.flags, address, register_byte_offset(base)?);
+            return self.insert(dst, value);
+        }
         let byte_count = count
             .checked_mul(std::mem::size_of::<f64>())
             .and_then(|bytes| u32::try_from(bytes).ok())
@@ -6130,7 +6152,6 @@ impl<'a, 'b> RowLowerCtx<'a, 'b> {
             scratch::stack_store(self.fb, value, slot, byte_offset);
         }
 
-        let flat = self.checked_tensor_projection_offset(dimensions, indices)?;
         let byte_offset = self
             .fb
             .ins()

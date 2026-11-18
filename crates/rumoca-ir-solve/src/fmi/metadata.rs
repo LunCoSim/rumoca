@@ -147,6 +147,7 @@ pub struct FmiVariable {
     pub(super) start_allowed: bool,
     pub(super) declaration_start: SolveDeclarationStart,
     pub(super) effective_input_default: Option<super::FmiInputInstantiationDefault>,
+    pub(super) given_state_start: Option<Box<SolveDeclarationStart>>,
     pub(super) minimum: Option<SolveInitialValues>,
     pub(super) maximum: Option<SolveInitialValues>,
     pub(super) nominal: Option<SolveInitialValues>,
@@ -265,6 +266,9 @@ impl FmiVariable {
     }
     /// Original instantiation authority; it does not change source authorship.
     pub fn instantiation_start(&self) -> &SolveDeclarationStart {
+        if let Some(start) = self.given_state_start.as_deref() {
+            return start;
+        }
         self.effective_input_default
             .as_ref()
             .map_or(&self.declaration_start, |default| default.values())

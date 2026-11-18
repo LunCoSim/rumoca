@@ -65,11 +65,7 @@ fn a_discrete_row_writing_solver_storage_is_refused() {
             },
         ],
     );
-    let refused = validate(&model).map(|_| ()).unwrap_err().message();
-    assert!(
-        refused.starts_with("only parameter-determined discrete equations are supported"),
-        "{refused}"
-    );
+    assert_discrete_refusal(&model);
 }
 
 #[test]
@@ -86,7 +82,17 @@ fn equations_and_memories_admit_in_their_own_orders() {
     assert_eq!(order.memories, vec![0]);
 }
 
-const EVENT_ITERATION: &str = "only parameter-determined discrete equations are supported";
+fn assert_discrete_refusal(model: &SolveModel) {
+    let refusal = validate(model).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(
+            refusal,
+            StaticRefusal::EventIteration(message)
+                if message.contains("parameter-determined discrete equations")
+        ),
+        "{refusal:?}"
+    );
+}
 
 fn assert_event_iteration(mutate: impl FnOnce(&mut crate::DiscreteSolveSystem)) {
     let mut model = partition(
@@ -97,8 +103,7 @@ fn assert_event_iteration(mutate: impl FnOnce(&mut crate::DiscreteSolveSystem)) 
         [p(0), p(1)],
     );
     mutate(&mut model.problem.discrete);
-    let refused = validate(&model).map(|_| ()).unwrap_err().message();
-    assert!(refused.starts_with(EVENT_ITERATION), "{refused}");
+    assert_discrete_refusal(&model);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Exact register-independent operation identity for shared-value proofs.
 
 use super::super::*;
-use super::registers::{Role, read_registers, renamable, visit_registers};
+use super::registers::{Role, read_registers, records_operand_offsets, renamable, visit_registers};
 
 /// Shapes of compiler operations and the builder's solver-slot reads occupy
 /// distinct domains. Operation identity uses the complete typed IR encoding,
@@ -10,6 +10,7 @@ use super::registers::{Role, read_registers, renamable, visit_registers};
 pub(super) enum ShapeKey {
     Slot,
     Slots,
+    Conditional,
     Operation(Box<[u8]>),
 }
 
@@ -51,15 +52,14 @@ pub(super) fn value_shape(op: &LinearOp) -> Option<ValueShape> {
             ranged: true,
         });
     }
-    let (mut scalar, mut ranged) = (Vec::new(), false);
-    let mut normalized = op.clone();
-    visit_registers(&mut normalized, &mut |role, register| match role {
-        Role::Scalar => scalar.push(*register),
-        Role::RangeStart => ranged = true,
-        Role::Destination => {}
-    });
+    let ranged = records_operand_offsets(op);
+    let mut scalar = Vec::new();
     let lowest = reads.first().copied().unwrap_or(0);
+    let mut normalized = op.clone();
     visit_registers(&mut normalized, &mut |role, register| {
+        if role == Role::Scalar {
+            scalar.push(*register);
+        }
         *register = match role {
             Role::Destination => 0,
             Role::Scalar if !ranged => 0,

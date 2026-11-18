@@ -3,8 +3,64 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{FmiComponent, FmiComponentError, FmiStorageColumn, FmiVariable};
-use crate::{InitializationSolveSystem, ScalarSlot, SolveEventClass, SolveVariableStorageRole};
+use super::{
+    FmiComponent, FmiComponentError, FmiInitial, FmiMetadata, FmiStorageColumn, FmiVariable,
+};
+use crate::{
+    InitializationSolveSystem, ScalarSlot, SolveDeclarationStart, SolveEventClass, SolveModel,
+    SolveVariableStorageRole, SolveVariableValueKind,
+};
+
+/// FMI exact starts follow the given coordinates in the executable component.
+/// Retain the source declarations separately so the canonical wire can replay
+/// the same derivation from checked initialization data.
+pub(super) fn derive_given_state_starts(
+    model: &SolveModel,
+    metadata: &mut FmiMetadata,
+) -> Result<(), FmiComponentError> {
+    let given: BTreeSet<_> = model
+        .problem
+        .initialization
+        .given_state_indices()
+        .iter()
+        .copied()
+        .collect();
+    if given.is_empty() {
+        return Ok(());
+    }
+    for &index in &metadata.state_variable_indices {
+        let variable = &mut metadata.variables[index];
+        if variable.initial() != Some(FmiInitial::Exact)
+            || variable.value_kind() != SolveVariableValueKind::Real
+        {
+            continue;
+        }
+        let storage = variable.storage().ok_or_else(|| {
+            FmiComponentError::InvalidSolve("given state has no FMI storage".into())
+        })?;
+        let range = storage.base()..storage.base() + storage.scalar_count();
+        if given.range(range.clone()).next().is_none() {
+            continue;
+        }
+        if let Some(declared) = variable.declaration_start.real()
+            && range.clone().enumerate().all(|(scalar, slot)| {
+                declared.value(scalar).map(f64::to_bits)
+                    == model.initial_y.value(slot).map(f64::to_bits)
+            })
+        {
+            continue;
+        }
+        let start = range
+            .map(|slot| model.initial_y.value(slot))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                FmiComponentError::InvalidSolve("given state has no prepared value".into())
+            })?;
+        variable.given_state_start = Some(Box::new(SolveDeclarationStart::Real(start.into())));
+        variable.start_allowed = true;
+    }
+    Ok(())
+}
 
 /// A finite accepted value for one exact checked state scalar identity.
 /// This is an initialization constraint, not an initialization start guess.

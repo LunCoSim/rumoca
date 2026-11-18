@@ -6,6 +6,7 @@ fn source_span(source: &'static str, start: usize, end: usize) -> Span {
 
 #[test]
 fn sparse_output_lookup_preserves_first_program_and_source_on_replay() {
+    let highest = usize::MAX - 1;
     let first = source_span("SparseOutputs.mo", 1, 10);
     let second = source_span("SparseOutputs.mo", 11, 20);
     let program = vec![
@@ -20,7 +21,7 @@ fn sparse_output_lookup_preserves_first_program_and_source_on_replay() {
     let block = ScalarProgramBlock::with_output_indices(
         vec![program.clone(), program],
         vec![first, second],
-        vec![usize::MAX, 2, usize::MAX, 17],
+        vec![highest, 2, highest, 17],
     )
     .unwrap();
     let wire = serde_json::to_value(&block).unwrap();
@@ -30,11 +31,11 @@ fn sparse_output_lookup_preserves_first_program_and_source_on_replay() {
     assert!(block.shares_program_owner(&cloned));
     for owner in [&block, &cloned, &replay] {
         assert_eq!(owner.stored_output_count(), 4);
-        assert_eq!(owner.program_index_for_output(usize::MAX), Some(0));
+        assert_eq!(owner.program_index_for_output(highest), Some(0));
         assert_eq!(owner.program_index_for_output(2), Some(0));
         assert_eq!(owner.program_index_for_output(17), Some(1));
         assert_eq!(owner.program_index_for_output(0), None);
-        assert_eq!(owner.span_for_output(usize::MAX), Some(first));
+        assert_eq!(owner.span_for_output(highest), Some(first));
         assert_eq!(owner.span_for_output(17), Some(second));
     }
     let empty = ScalarProgramBlock::default();
