@@ -42,6 +42,11 @@ If two solvers need the same code, it moves into the shared layer. Solver
 backends implement the integration method and consume resolved input
 values — they must not know about keyboards, gamepads, or transports.
 
+For open time-only sessions with monitored event indicators, the shared host
+bounds each deferred interval to one event-scan interval. It uses the same
+root checks as state-carrying sessions and keeps the internal interval
+independent of how often the caller reads a result.
+
 ## Native projection preparation
 
 Every native module uses `rumoca-exec-cranelift`'s shared `host_jit_builder`.

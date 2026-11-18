@@ -144,13 +144,13 @@ fn repeated_input_transaction_diagnostic() {
                 .problem
                 .solve_layout
                 .input_scalar_names
-                .push(format!("input_{index}"));
-            model.parameters.push(1.0);
+                .push_scalar(format!("input_{index}"));
         }
+        model.parameters = solve::SolveInitialValues::repeat(1.0, width).unwrap();
         let model = refresh_owned(model);
         let mut retained = retained_branch_component(&model);
         let mut session = plugin_session(&mut retained, FaultyPlugin::new(PluginFault::Healthy));
-        let names = session.input_names();
+        let names = session.input_names().to_vec();
         assert_eq!(names.len(), width);
         let inputs: Vec<_> = names.iter().map(|name| (name.as_str(), 1.0)).collect();
         session.set_inputs(&inputs).unwrap();

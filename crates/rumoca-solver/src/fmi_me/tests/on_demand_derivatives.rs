@@ -3,8 +3,8 @@
 use super::{fixture_instance_config, harmonic_oscillator, refresh_owned};
 use crate::fmi_me::{MeExecutionBackend, MeModelSource, MeTime, SolveMeKernel};
 use crate::runtime::solve_runtime::{
-    CompiledSolveAssignmentSchedule, CompiledSolveEventTransaction, CompiledSolveExpression,
-    CompiledSolveJacobianExpression, SolveExecutionBackend,
+    CompiledSolveEventTransaction, CompiledSolveExpression, CompiledSolveJacobianExpression,
+    SolveExecutionBackend,
 };
 use rumoca_eval_solve::{PreparedScalarProgramBlock, RowEvalContext};
 use rumoca_ir_solve as solve;
@@ -52,13 +52,6 @@ impl SolveExecutionBackend for CountingBackend {
         block: &solve::ScalarProgramBlock,
     ) -> Result<Rc<dyn CompiledSolveJacobianExpression>, crate::CompileRefusal> {
         crate::runtime::solve_runtime::test_kernels::jacobian(block).map_err(Into::into)
-    }
-
-    fn compile_assignment_schedule(
-        &self,
-        _: &solve::SharedAssignmentSchedule,
-    ) -> Result<Rc<dyn CompiledSolveAssignmentSchedule>, String> {
-        Err("the fixture has no algebraic assignments".into())
     }
 
     fn compile_event_transaction(
