@@ -19,7 +19,6 @@ mod query;
 mod record_fields;
 use record_fields::FieldPath;
 mod scalar_selection;
-mod static_selection;
 #[cfg(test)]
 mod tests;
 mod visited;

@@ -26,6 +26,7 @@ impl<'dae> Projection<'_, 'dae> {
         let node = self.node(expression);
         self.expect_scalar_index(node, scalar_index)?;
         let span = node.provenance().span();
+        let points = &self.domain_contexts.points;
         match node.operation() {
             dae::ExpressionOperation::Literal(
                 dae::DaeLiteral::Integer(value) | dae::DaeLiteral::Enumeration(value),
@@ -45,19 +46,8 @@ impl<'dae> Projection<'_, 'dae> {
                     .ok_or(ProjectionError::IntegerOverflow { span })
             }
             dae::ExpressionOperation::Coordinate(dae::CoordinateView::Binder(binder)) => {
-                let Some((_, point)) = self
-                    .domain_contexts
-                    .points
-                    .iter()
-                    .rev()
-                    .find(|(domain, _)| *domain == binder.domain())
-                else {
-                    return Err(ProjectionError::DynamicSubscript { span });
-                };
-                point
-                    .get(binder.ordinal() as usize)
-                    .copied()
-                    .ok_or(ProjectionError::DynamicSubscript { span })
+                crate::domain_point_integer(binder.domain(), binder.ordinal() as usize, points)
+                    .map_err(|_| ProjectionError::DynamicSubscript { span })
             }
             dae::ExpressionOperation::Coordinate(dae::CoordinateView::FunctionParameter(
                 parameter,
@@ -87,8 +77,15 @@ impl<'dae> Projection<'_, 'dae> {
                 let rhs = self.integer(rhs, scalar_index)?;
                 integer_binary(operator, lhs, rhs, span)
             }
-            dae::ExpressionOperation::Conditional(operands) => {
-                let selected = self.static_selected_branch(operands)?;
+            dae::ExpressionOperation::Conditional(_) if node.value_type().is_scalar() => {
+                crate::FunctionCallContext::integer_at_domain_point(self.view, expression, points)
+                    .ok_or(ProjectionError::DynamicSubscript { span })
+            }
+            dae::ExpressionOperation::Conditional(_) => {
+                let selected = crate::FunctionCallContext::branch_at_domain_point(
+                    self.view, expression, points,
+                )
+                .ok_or(ProjectionError::DynamicSubscript { span })?;
                 self.integer(selected, scalar_index)
             }
             dae::ExpressionOperation::Call {

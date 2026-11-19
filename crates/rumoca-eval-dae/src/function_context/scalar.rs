@@ -48,23 +48,47 @@ impl<'dae> FunctionCallContext<'dae> {
         expression: dae::ExprId<'dae>,
         domain_points: &[(dae::DomainId<'dae>, Vec<i64>)],
     ) -> Option<i64> {
-        if view.expression(expression)?.function_scope().is_some() {
-            return None;
-        }
-        match (ScalarSelection {
-            view,
-            active: BTreeSet::new(),
-            domain_points: Some(domain_points),
-        })
-        .resolve(expression, &Self::default(), &[])?
-        {
+        match ScalarSelection::at_domain_point(view, expression, domain_points)?.resolve(
+            expression,
+            &Self::default(),
+            &[],
+        )? {
             dae::DaeLiteral::Integer(value) | dae::DaeLiteral::Enumeration(value) => Some(value),
             _ => None,
         }
     }
+
+    pub(crate) fn branch_at_domain_point(
+        view: dae::DaeView<'dae>,
+        expression: dae::ExprId<'dae>,
+        domain_points: &[(dae::DomainId<'dae>, Vec<i64>)],
+    ) -> Option<dae::ExprId<'dae>> {
+        let dae::ExpressionOperation::Conditional(operands) =
+            view.expression(expression)?.operation()
+        else {
+            return None;
+        };
+        ScalarSelection::at_domain_point(view, expression, domain_points)?
+            .branch(operands, &Self::default())
+    }
 }
 
-impl<'dae> ScalarSelection<'_, 'dae> {
+impl<'points, 'dae> ScalarSelection<'points, 'dae> {
+    fn at_domain_point(
+        view: dae::DaeView<'dae>,
+        expression: dae::ExprId<'dae>,
+        domain_points: &'points [(dae::DomainId<'dae>, Vec<i64>)],
+    ) -> Option<Self> {
+        if view.expression(expression)?.function_scope().is_some() {
+            return None;
+        }
+        Some(Self {
+            view,
+            active: BTreeSet::new(),
+            domain_points: Some(domain_points),
+        })
+    }
+
     fn branch(
         &mut self,
         operands: dae::ExpressionOperands<'dae>,
@@ -130,15 +154,13 @@ impl<'dae> ScalarSelection<'_, 'dae> {
             dae::ExpressionOperation::Coordinate(dae::CoordinateView::Binder(binder))
                 if indices.is_empty() =>
             {
-                let (_, point) = self
-                    .domain_points?
-                    .iter()
-                    .rev()
-                    .find(|(domain, _)| *domain == binder.domain())?;
-                point
-                    .get(binder.ordinal() as usize)
-                    .copied()
-                    .map(dae::DaeLiteral::Integer)
+                crate::domain_point_integer(
+                    binder.domain(),
+                    binder.ordinal() as usize,
+                    self.domain_points?,
+                )
+                .ok()
+                .map(dae::DaeLiteral::Integer)
             }
             dae::ExpressionOperation::Coordinate(dae::CoordinateView::FunctionParameter(
                 parameter,

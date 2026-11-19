@@ -94,6 +94,26 @@ end RuntimeSelection;
 }
 
 #[test]
+fn a_tunable_parameter_default_does_not_prove_a_fixed_incidence_cell() {
+    let dae = compile(
+        r#"
+model TunableSelection
+  parameter Boolean useNew = false annotation(Evaluate=false);
+  Real q[2,2];
+equation
+  for i in 1:2 loop
+    q[i,1] = 0;
+    q[i,2] = i + sum(q[j, if useNew then 2 else 1] for j in 1:2);
+  end for;
+end TunableSelection;
+"#,
+        "TunableSelection",
+    );
+    let report = structural_report_for_dae(&dae, &SimOptions::default()).unwrap();
+    assert!(report.blocks.iter().any(BlockReport::is_coupled));
+}
+
+#[test]
 fn index_three_inspection_agrees_with_simulation_preparation() {
     let dae = compile(PENDULUM, "Pend");
     let options = SimOptions {
