@@ -78,7 +78,15 @@ execute one checked program with the caller's scratch arena.
 A runtime index into a tensor stored on the register tape checks every supplied
 coordinate and uses the resulting strided offset for one load. Indexed reads
 from the tape emit a constant number of instructions per axis, independent of
-the number of cells.
+the number of cells. Forward differentiation retains strided primal and tangent
+register ranges for indexed reads, including the two lanes of an interleaved
+tensor. A non-strided range is packed before the same checked read.
+
+Scalar Solve lowering evaluates an integer subscript at its current domain
+point when the selector and all evaluated call arguments are exact. The same
+proof handles one-result functions with a single assignment. A selected
+in-bounds index uses the scalar source directly. A tunable or unbound value,
+an effectful call, or an unproved bound retains checked runtime indexing.
 
 The native `pow` host call retains finite results in a bounded, thread-local
 4,096-entry table. Both f64 input bit patterns must match before reuse; a hash
