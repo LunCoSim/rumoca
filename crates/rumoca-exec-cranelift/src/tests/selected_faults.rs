@@ -72,7 +72,7 @@ fn bound_numeric_and_directional_index_faults_keep_original_program_spans_and_re
     assert_eq!(output, [7.0]);
 }
 
-fn indexed_owner() -> solve::SolvePureCallTable {
+fn indexed_owner(inner: rumoca_core::Span) -> solve::SolvePureCallTable {
     let arithmetic = solve::SolveArithmeticProfile::construct(
         solve::SolveRealFormat::Binary64,
         solve::SolveIntegerDomain::FULL,
@@ -81,7 +81,6 @@ fn indexed_owner() -> solve::SolvePureCallTable {
     let tensor =
         solve::SolveValueType::tensor(solve::SolveScalarType::real(arithmetic), vec![2]).unwrap();
     let integer = solve::SolveValueType::scalar(solve::SolveScalarType::integer(arithmetic));
-    let inner = rumoca_core::Span::from_offsets(fixture_span().source, 23, 29);
     solve::SolvePureCallTable::construct(arithmetic, |table| {
         table.add_owner(
             solve::SolvePureCallIdentity::issued(NonZeroU64::new(1).unwrap()),
@@ -102,9 +101,20 @@ fn indexed_owner() -> solve::SolvePureCallTable {
 
 #[test]
 fn bound_program_fallback_never_replaces_an_exact_callee_operation_span() {
-    let table = indexed_owner();
-    let calls = compile_pure_call_table(&table).unwrap();
-    let inner = table.owners()[0].provenance();
+    use crate::native_code_cache::{tests::MemoryStore, with_native_code_cache};
+    use std::{cell::RefCell, rc::Rc};
+
+    let inner = rumoca_core::Span::from_offsets(fixture_span().source, 23, 29);
+    let first = indexed_owner(fixture_span());
+    let table = indexed_owner(inner);
+    let store = Rc::new(RefCell::new(MemoryStore::default()));
+    let (_first_calls, cold) =
+        with_native_code_cache(store.clone(), || compile_pure_call_table(&first).unwrap());
+    let (calls, warm) = with_native_code_cache(store, || compile_pure_call_table(&table).unwrap());
+    assert!(cold.compilations > 0);
+    assert_eq!(warm.attempts, cold.attempts);
+    assert_eq!(warm.hits, warm.attempts);
+    assert_eq!(warm.compilations, 0);
     assert_ne!(inner, fixture_span());
     let source = ScalarProgramBlock::with_program_spans(
         vec![vec![

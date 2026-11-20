@@ -50,13 +50,11 @@ impl InputResults {
         input: Value,
         output: Value,
     ) -> Result<Value, CompileError> {
-        let address = module.declare_data_in_func(self.cells, builder.func);
-        let cranelift_codegen::ir::GlobalValueData::Symbol { colocated, .. } =
-            &mut builder.func.global_values[address]
-        else {
-            return Err(CompileError::Backend("pure result storage requires a symbolic address".into()));
-        };
-        *colocated = false;
+        let address = crate::emit::owned_jit_module::declare_far_data_in_func(
+            module,
+            self.cells,
+            builder.func,
+        )?;
         let cache = builder.ins().global_value(config.pointer_type(), address);
         let cached_input = cell_pointer(builder, cache, 1, "pure result inputs")?;
         let ready = builder.ins().load(types::I64, MemFlags::new(), cache, 0);

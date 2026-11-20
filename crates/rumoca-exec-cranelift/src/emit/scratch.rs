@@ -11,15 +11,37 @@ use cranelift_codegen::ir::{
 };
 use cranelift_frontend::FunctionBuilder;
 use std::cell::{RefCell, RefMut};
+use std::mem::offset_of;
 
 pub(super) const FAILURE: u8 = 9;
 
+// Generated code reads callback addresses from the caller's live arena. This
+// keeps host addresses out of cached Cranelift stencils.
+#[repr(C)]
 #[derive(Default)]
 pub(crate) struct NativeScratch {
+    callbacks: ScratchCallbacks,
     root: Frame,
     frames: Vec<Frame>,
     depth: usize,
     invalid: bool,
+}
+
+#[repr(C)]
+struct ScratchCallbacks {
+    enter: unsafe extern "C" fn(*mut NativeScratch) -> u8,
+    leave: unsafe extern "C" fn(*mut NativeScratch),
+    allocate: unsafe extern "C" fn(*mut NativeScratch, u64, u64) -> *mut u64,
+}
+
+impl Default for ScratchCallbacks {
+    fn default() -> Self {
+        Self {
+            enter: enter_native,
+            leave: leave_native,
+            allocate: allocate_native,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -166,7 +188,7 @@ pub(super) fn parameter(builder: &FunctionBuilder<'_>) -> Value {
 
 fn host_call(
     builder: &mut FunctionBuilder<'_>,
-    address: usize,
+    callback_offset: i32,
     arguments: &[Value],
     result: Option<Type>,
 ) -> Option<Value> {
@@ -186,7 +208,9 @@ fn host_call(
         .first()
         .expect("native host call receives its arena");
     let pointer_type = builder.func.dfg.value_type(arena);
-    let address = builder.ins().iconst(pointer_type, address as i64);
+    let address = builder
+        .ins()
+        .load(pointer_type, MemFlags::trusted(), arena, callback_offset);
     let call = builder.ins().call_indirect(signature, address, arguments);
     result.map(|_| builder.inst_results(call)[0])
 }
@@ -201,7 +225,7 @@ pub(super) fn enter(builder: &mut FunctionBuilder<'_>) {
         .expect("native entry has its scratch parameter");
     let result = host_call(
         builder,
-        enter_native as *const () as usize,
+        offset_of!(NativeScratch, callbacks.enter) as i32,
         &[arena],
         Some(types::I8),
     )
@@ -219,7 +243,12 @@ pub(super) fn enter(builder: &mut FunctionBuilder<'_>) {
 
 pub(super) fn leave(builder: &mut FunctionBuilder<'_>) {
     let arena = parameter(builder);
-    let _ = host_call(builder, leave_native as *const () as usize, &[arena], None);
+    let _ = host_call(
+        builder,
+        offset_of!(NativeScratch, callbacks.leave) as i32,
+        &[arena],
+        None,
+    );
 }
 
 pub(super) fn create_slot(
@@ -244,7 +273,7 @@ pub(super) fn create_slot(
         .iconst(types::I64, i64::from(bytes.max(8) / 8));
     let pointer = host_call(
         builder,
-        allocate_native as *const () as usize,
+        offset_of!(NativeScratch, callbacks.allocate) as i32,
         &[arena, site, cells],
         Some(pointer_type),
     )

@@ -3303,10 +3303,11 @@ impl<'a, 'b> RowLowerCtx<'a, 'b> {
         let output_ptr = scratch::stack_addr(self.fb, pointer_type, output_slot, 0);
         self.pack_typed_call_inputs(input_starts, inputs, input_slot)?;
         if matches!(published, PublishedOutputs::Predicates(_)) {
-            let marker = self
-                .fb
-                .ins()
-                .iconst(types::I64, self.source_operation as usize as i64);
+            let marker = observation_carrier::emit_source_marker(
+                self.module,
+                self.fb,
+                self.source_operation,
+            )?;
             observation_carrier::emit(
                 self.module,
                 self.fb,

@@ -468,6 +468,24 @@ pub(super) unsafe extern "C" fn observe(
     })
 }
 
+/// Root scalar operations and nested regions use the observation ordinal
+/// channel to carry their source identity.
+pub(super) fn emit_source_marker<T>(
+    module: &mut cranelift_jit::JITModule,
+    builder: &mut cranelift_frontend::FunctionBuilder<'_>,
+    source: *const T,
+) -> Result<cranelift_codegen::ir::Value, CompileError> {
+    use cranelift_codegen::ir::{InstBuilder, types};
+    use cranelift_module::Module;
+
+    let address = super::owned_jit_module::emit_source_address(module, builder, source)?;
+    if module.target_config().pointer_type() == types::I64 {
+        Ok(address)
+    } else {
+        Ok(builder.ins().uextend(types::I64, address))
+    }
+}
+
 pub(super) fn emit(
     module: &mut cranelift_jit::JITModule,
     builder: &mut cranelift_frontend::FunctionBuilder<'_>,
@@ -504,8 +522,8 @@ pub(super) fn emit(
     let function = super::owned_jit_module::declare_far_call_in_func(module, id, builder.func);
     let kind = builder.ins().iconst(types::I32, i64::from(kind));
     let owner = builder.ins().iconst(types::I32, i64::from(owner));
-    let address = operation.map_or(0, |operation| operation as *const _ as usize);
-    let operation = builder.ins().iconst(pointer, address as i64);
+    let source = operation.map_or(std::ptr::null(), std::ptr::from_ref);
+    let operation = super::owned_jit_module::emit_source_address(module, builder, source)?;
     let width = builder.ins().iconst(
         pointer,
         i64::try_from(width).map_err(|_| error("native observation width exceeds i64"))?,

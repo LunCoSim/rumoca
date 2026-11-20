@@ -680,16 +680,19 @@ impl ProgramLowerer<'_, '_> {
         (input, output): (Value, Value),
         (input_placement, output_placement): (Option<Vec<PlacedSlot>>, Option<Vec<PlacedSlot>>),
     ) -> Result<(), CompileError> {
-        let region_address = self
-            .builder
-            .ins()
-            .iconst(types::I64, region as *const _ as usize as i64);
-        self.carrier_event(
-            super::super::observation_carrier::REGION_ENTER,
-            input,
-            0,
-            Some(region_address),
-        )?;
+        if self.observation.is_some() {
+            let marker = super::super::observation_carrier::emit_source_marker(
+                self.module,
+                self.builder,
+                region,
+            )?;
+            self.carrier_event(
+                super::super::observation_carrier::REGION_ENTER,
+                input,
+                0,
+                Some(marker),
+            )?;
+        }
         let tape = create_tape(self.builder, self.pointer_type, layout.tape_cells)?;
         let mut nested = ProgramLowerer {
             builder: self.builder,

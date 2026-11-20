@@ -4,7 +4,9 @@
 //! compilation and rebinds every artifact's relocations in its new JIT module.
 //! Cache keys are issued by Cranelift from its function stencil, compiler
 //! version, target ISA and flags. No executable arena or simulation state is
-//! retained by this scope. Stores must contain only trusted compiler artifacts.
+//! retained by this scope. Emission keeps process addresses in module data
+//! and the invocation ABI so unrelated allocations can reuse a stencil.
+//! Stores must contain only trusted compiler artifacts.
 
 use std::{
     cell::{Cell, RefCell},

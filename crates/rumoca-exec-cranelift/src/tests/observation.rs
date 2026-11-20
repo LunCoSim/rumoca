@@ -395,8 +395,7 @@ fn seventeen_on_failure<'program>(
     Ok(message[0])
 }
 
-#[test]
-fn checked_native_messages_keep_the_source_binding_across_repeated_invocations() {
+fn observed_source() -> rumoca_ir_solve::SolveExecutionSource {
     let table = observed_table();
     let site = table.owners()[0].call_site();
     let block = ScalarProgramBlock::with_program_spans(
@@ -405,14 +404,19 @@ fn checked_native_messages_keep_the_source_binding_across_repeated_invocations()
     )
     .unwrap();
     let mut model = rumoca_ir_solve::SolveModel {
-        pure_calls: table.clone(),
+        pure_calls: table,
         ..Default::default()
     };
     model.problem.events.action_conditions = block;
     model.problem.events.actions = vec![action(&site)];
-    let source = rumoca_ir_solve::SolveExecutionSource::new(model);
-    let calls = compile_pure_call_table(&table).unwrap();
-    let compiled = crate::compile_event_observation(
+    rumoca_ir_solve::SolveExecutionSource::new(model)
+}
+
+fn compile_bound_observation(
+    source: &rumoca_ir_solve::SolveExecutionSource,
+) -> crate::CompiledEventObservation {
+    let calls = compile_pure_call_table(&source.model().pure_calls).unwrap();
+    crate::compile_event_observation(
         source
             .event_program(
                 rumoca_ir_solve::RetainedAssertionSource::ActionConditions,
@@ -421,7 +425,25 @@ fn checked_native_messages_keep_the_source_binding_across_repeated_invocations()
             .unwrap(),
         &calls,
     )
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+fn cached_native_messages_keep_the_new_module_source_binding() {
+    use crate::native_code_cache::{tests::MemoryStore, with_native_code_cache};
+    use std::{cell::RefCell, rc::Rc};
+
+    let first = observed_source();
+    let source = observed_source();
+    let store = Rc::new(RefCell::new(MemoryStore::default()));
+    let (_first_compiled, cold) =
+        with_native_code_cache(store.clone(), || compile_bound_observation(&first));
+    let (compiled, warm) = with_native_code_cache(store, || compile_bound_observation(&source));
+    assert!(cold.compilations > 0);
+    assert_eq!(warm.attempts, cold.attempts);
+    assert_eq!(warm.hits, warm.attempts);
+    assert_eq!(warm.compilations, 0);
+
     let foreign_calls = compile_pure_call_table(&observed_table()).unwrap();
     let foreign_binding = source
         .event_program(
@@ -453,7 +475,6 @@ fn checked_native_messages_keep_the_source_binding_across_repeated_invocations()
         "failed input guards cannot expose an earlier invocation"
     );
     drop(source);
-    drop(calls);
     let mut retained = [f64::NAN];
     compiled.call(&[], &[0.0], 0.0, &[], &mut retained).unwrap();
     assert_eq!(

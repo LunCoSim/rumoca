@@ -1,5 +1,5 @@
 //! Private source-fault details published only with the matching native failure status.
-use super::scratch;
+use super::{owned_jit_module::emit_source_address, scratch};
 use crate::{CompileError, NativeSourceFault};
 use rumoca_ir_solve::SolveSpannedOperation;
 use std::cell::RefCell;
@@ -116,7 +116,7 @@ pub(super) fn checked_index(
     builder.switch_to_block(failed);
     builder.seal_block(failed);
     let extent = builder.ins().iconst(types::I32, i64::from(extent));
-    let source = builder.ins().iconst(pointer, operation as usize as i64);
+    let source = emit_source_address(module, builder, operation)?;
     builder.ins().call(local, &[value, extent, source]);
     let status = builder.ins().iconst(types::I8, 1);
     scratch::leave(builder);
@@ -140,7 +140,7 @@ pub(super) fn emit_span(
         .declare_function("rumoca_fault_span", Linkage::Import, &signature)
         .map_err(super::to_backend_err)?;
     let local = super::owned_jit_module::declare_far_call_in_func(module, function, builder.func);
-    let source = builder.ins().iconst(pointer, operation as usize as i64);
+    let source = emit_source_address(module, builder, operation)?;
     builder.ins().call(local, &[source]);
     Ok(())
 }

@@ -1,8 +1,9 @@
 use std::ops::{Deref, DerefMut};
 
-use cranelift_codegen::ir;
+use cranelift_codegen::ir::{self, InstBuilder};
+use cranelift_frontend::FunctionBuilder;
 use cranelift_jit::JITModule;
-use cranelift_module::{FuncId, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Module};
 
 use super::register_allocation::QueuedFunctions;
 use super::{CompileError, define_queued_functions};
@@ -75,6 +76,49 @@ pub(super) fn declare_far_call_in_func(
     let callee = module.declare_func_in_func(func_id, func);
     func.dfg.ext_funcs[callee].colocated = false;
     callee
+}
+
+/// Keep JIT data relocations valid even when code and data occupy separate arenas.
+pub(super) fn declare_far_data_in_func(
+    module: &JITModule,
+    data: DataId,
+    func: &mut ir::Function,
+) -> Result<ir::GlobalValue, CompileError> {
+    let address = module.declare_data_in_func(data, func);
+    let ir::GlobalValueData::Symbol { colocated, .. } = &mut func.global_values[address] else {
+        return Err(CompileError::Backend(
+            "JIT data requires a symbolic address".into(),
+        ));
+    };
+    *colocated = false;
+    Ok(address)
+}
+
+/// Bind a live source identity in module data so the cached code can be linked
+/// to the source allocation supplied by each compilation.
+pub(super) fn emit_source_address<T>(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    source: *const T,
+) -> Result<ir::Value, CompileError> {
+    let pointer = module.target_config().pointer_type();
+    if source.is_null() {
+        return Ok(builder.ins().iconst(pointer, 0));
+    }
+    let cell = module
+        .declare_anonymous_data(false, false)
+        .map_err(super::to_backend_err)?;
+    let mut data = DataDescription::new();
+    data.define(Box::new((source as usize).to_ne_bytes()));
+    data.set_align(u64::from(pointer.bytes()));
+    module
+        .define_data(cell, &data)
+        .map_err(super::to_backend_err)?;
+    let global = declare_far_data_in_func(module, cell, builder.func)?;
+    let address = builder.ins().global_value(pointer, global);
+    Ok(builder
+        .ins()
+        .load(pointer, ir::MemFlags::trusted(), address, 0))
 }
 
 impl Deref for OwnedJitModule {
