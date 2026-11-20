@@ -1,4 +1,5 @@
 mod range_wire;
+mod reverse;
 #[cfg(test)]
 mod tests;
 
@@ -48,7 +49,10 @@ pub(crate) struct ScalarOutputPlacements {
 enum PlacementKind {
     #[default]
     Dense,
-    ProgramRanges(Box<[ScalarProgramOutputPlacement]>),
+    ProgramRanges {
+        entries: Box<[ScalarProgramOutputPlacement]>,
+        reverse: reverse::OutputOrdinalIndex,
+    },
     Explicit {
         indices: Vec<usize>,
         ordinals: Box<[usize]>,
@@ -117,16 +121,6 @@ impl ScalarProgramOutputPlacement {
                 return segment.index_at(ordinal);
             }
             ordinal -= count;
-        }
-        None
-    }
-    fn position(&self, output: usize) -> Option<usize> {
-        let mut ordinal = 0usize;
-        for segment in self.segments() {
-            if let Some(position) = segment.position(output) {
-                return ordinal.checked_add(position);
-            }
-            ordinal = ordinal.checked_add(segment.checked_count()?)?;
         }
         None
     }
@@ -205,12 +199,6 @@ impl ScalarOutputSegmentRef<'_> {
             Self::Explicit(indices) => indices.get(ordinal).copied(),
         }
     }
-    fn position(self, output: usize) -> Option<usize> {
-        match self {
-            Self::Range(range) => range.contains(&output).then(|| output - range.start),
-            Self::Explicit(indices) => indices.iter().position(|&index| index == output),
-        }
-    }
     fn maximum(self) -> Option<usize> {
         match self {
             Self::Range(range) => (!range.is_empty()).then(|| range.end - 1),
@@ -258,7 +246,7 @@ impl ScalarOutputPlacements {
         let (dense, programs, explicit): (Range<usize>, &[ScalarProgramOutputPlacement], &[usize]) =
             match &self.kind {
                 PlacementKind::Dense => (0..self.count, &[][..], &[][..]),
-                PlacementKind::ProgramRanges(entries) => (0..0, entries.as_ref(), &[][..]),
+                PlacementKind::ProgramRanges { entries, .. } => (0..0, entries.as_ref(), &[][..]),
                 PlacementKind::Explicit { indices, .. } => (0..0, &[][..], indices.as_slice()),
             };
         dense
@@ -376,7 +364,10 @@ impl ScalarOutputPlacements {
         let kind = if dense {
             PlacementKind::Dense
         } else {
-            PlacementKind::ProgramRanges(entries.into_boxed_slice())
+            PlacementKind::ProgramRanges {
+                reverse: reverse::OutputOrdinalIndex::new(&entries),
+                entries: entries.into_boxed_slice(),
+            }
         };
         Ok(Self {
             kind,
@@ -388,7 +379,7 @@ impl ScalarOutputPlacements {
     pub(crate) fn view(&self) -> ScalarOutputPlacementView<'_> {
         match &self.kind {
             PlacementKind::Dense => ScalarOutputPlacementView::Dense { count: self.count },
-            PlacementKind::ProgramRanges(entries) => {
+            PlacementKind::ProgramRanges { entries, .. } => {
                 ScalarOutputPlacementView::ProgramRanges(entries)
             }
             PlacementKind::Explicit { indices, .. } => ScalarOutputPlacementView::Explicit(indices),
@@ -412,7 +403,7 @@ impl ScalarOutputPlacements {
         match &self.kind {
             PlacementKind::Dense => Some(ordinal),
             PlacementKind::Explicit { indices, .. } => indices.get(ordinal).copied(),
-            PlacementKind::ProgramRanges(entries) => {
+            PlacementKind::ProgramRanges { entries, .. } => {
                 let program = program_ends.partition_point(|&end| end <= ordinal);
                 let start = program.checked_sub(1).map_or(0, |p| program_ends[p]);
                 entries.get(program)?.index_at(ordinal - start)
@@ -435,7 +426,7 @@ impl ScalarOutputPlacements {
             PlacementKind::Explicit { indices, .. } => {
                 crate::ScalarProgramOutputSpan::checked(indices.get(ordinal..end)?)
             }
-            PlacementKind::ProgramRanges(entries) => {
+            PlacementKind::ProgramRanges { entries, .. } => {
                 let program = program_ends.partition_point(|&end| end <= ordinal);
                 if end > *program_ends.get(program)? {
                     return None;
@@ -447,11 +438,7 @@ impl ScalarOutputPlacements {
         }
     }
 
-    pub(crate) fn ordinal_for_output(
-        &self,
-        output: usize,
-        program_ends: &[usize],
-    ) -> Option<usize> {
+    pub(crate) fn ordinal_for_output(&self, output: usize) -> Option<usize> {
         match &self.kind {
             PlacementKind::Dense => (output < self.count).then_some(output),
             PlacementKind::Explicit { indices, ordinals } => {
@@ -459,13 +446,7 @@ impl ScalarOutputPlacements {
                 let ordinal = *ordinals.get(position)?;
                 (indices[ordinal] == output).then_some(ordinal)
             }
-            PlacementKind::ProgramRanges(entries) => {
-                entries.iter().enumerate().find_map(|(program, entry)| {
-                    let position = entry.position(output)?;
-                    let start = program.checked_sub(1).map_or(0, |p| program_ends[p]);
-                    Some(start + position)
-                })
-            }
+            PlacementKind::ProgramRanges { reverse, .. } => reverse.ordinal(output),
         }
     }
 }

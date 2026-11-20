@@ -77,6 +77,13 @@ Modelica -> checked IR pipeline -> checked Solve/GALEC kernel
 
 ### Internal Solver Boundary
 
+A named initialization observation uses the common Model Exchange
+initialization driver and returns finite values in request order. Its
+execution preparation may include only the expression programs required by
+the requested visible points. Checked direct storage observations use the
+same projection as full observation. Initialization equations, actions,
+discrete iteration, and termination retain their common owners.
+
 `SolveProblem` is compiler IR, projected once into an FMI 3 ME component kernel.
 All numerical integrators use only FMI 3 ME lifecycle, state, derivative,
 event-indicator, time, continuous-state, and discrete-state operations. They

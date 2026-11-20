@@ -1,28 +1,13 @@
 use super::*;
 
 impl VisibleProjection {
-    pub(super) fn member_at<'a>(
-        &'a self,
-        problem: &SolveProblem,
-        mut point: usize,
-    ) -> Option<(&'a VisibleProjectionInput, usize)> {
-        for member in &self.members {
-            let extent = match member {
-                VisibleProjectionInput::Declaration(source) => {
-                    problem
-                        .solve_layout
-                        .variable_storage_runs
-                        .get(source.declaration)?
-                        .scalar_count
-                }
-                VisibleProjectionInput::Expression { names, .. } => names.len(),
-            };
-            if point < extent {
-                return Some((member, point));
-            }
-            point -= extent;
-        }
-        None
+    pub(super) fn member_at(&self, point: usize) -> Option<(&VisibleProjectionInput, usize)> {
+        let index = self.member_ends.partition_point(|&end| end <= point);
+        let member = self.members.get(index)?;
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |previous| self.member_ends[previous]);
+        Some((member, point - start))
     }
 
     pub(super) fn index(&self, problem: &SolveProblem, name: &str) -> Option<usize> {
@@ -53,7 +38,7 @@ impl VisibleProjection {
     }
 
     pub(super) fn name(&self, problem: &SolveProblem, point: usize) -> Option<String> {
-        match self.member_at(problem, point)? {
+        match self.member_at(point)? {
             (VisibleProjectionInput::Declaration(source), ordinal) => problem
                 .layout
                 .scalar_declaration_name(&source.binding, ordinal),
@@ -64,9 +49,7 @@ impl VisibleProjection {
     }
 
     pub(super) fn slot(&self, problem: &SolveProblem, point: usize) -> Option<ScalarSlot> {
-        let (VisibleProjectionInput::Declaration(source), ordinal) =
-            self.member_at(problem, point)?
-        else {
+        let (VisibleProjectionInput::Declaration(source), ordinal) = self.member_at(point)? else {
             return None;
         };
         storage_point(
@@ -84,7 +67,7 @@ impl VisibleProjection {
         problem: &SolveProblem,
         point: usize,
     ) -> Option<SolveVariableMeta> {
-        match self.member_at(problem, point)? {
+        match self.member_at(point)? {
             (VisibleProjectionInput::Expression { metadata, .. }, ordinal) => {
                 metadata.as_ref()?.get(ordinal).cloned()
             }
@@ -95,7 +78,9 @@ impl VisibleProjection {
                     .get(source.declaration)?;
                 let attrs = &source.attributes;
                 Some(SolveVariableMeta {
-                    name: self.name(problem, point)?,
+                    name: problem
+                        .layout
+                        .scalar_declaration_name(&source.binding, ordinal)?,
                     source_span: attrs.source_span,
                     role: role_name(declaration.role()).into(),
                     is_state: declaration.role() == crate::SolveVariableStorageRole::State,

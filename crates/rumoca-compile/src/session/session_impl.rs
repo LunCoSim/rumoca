@@ -1229,60 +1229,46 @@ impl Session {
         &mut self,
         model_name: &str,
     ) -> std::result::Result<Box<DaeCompilationResult>, Box<StrictCompileFailure>> {
-        let target = self.resolve_strict_compilation_target(model_name).map_err(|failure| {
-            Box::new(strict_pre_phase_failure(
-                model_name,
-                failure.failures,
-                *failure.source_map,
-            ))
-        })?;
+        self.prepare_strict_dae_compilation(model_name)?.compile()
+    }
+
+    /// Resolve the current target through the same strict pipeline used by
+    /// DAE lowering. A caller can use this checked input for artifact lookup.
+    pub fn prepare_strict_dae_compilation(
+        &mut self,
+        model_name: &str,
+    ) -> std::result::Result<StrictDaePreparation, Box<StrictCompileFailure>> {
+        let target = self
+            .resolve_strict_compilation_target(model_name)
+            .map_err(|failure| {
+                Box::new(strict_pre_phase_failure(
+                    model_name,
+                    failure.failures,
+                    *failure.source_map,
+                ))
+            })?;
         let tree = target.resolved.inner();
-        let mut failures = Vec::new();
-
-        let requested_result = compile_model_dae_internal_with_options(
-            tree,
-            model_name,
-            self.instantiation_options.clone(),
-        );
-        let requested = dae_phase_result_requested_message(model_name, &requested_result);
-        failures.extend(dae_phase_result_to_failures(
-            tree,
-            model_name,
-            &requested_result,
-        ));
-        if !failures.is_empty() {
-            let summary =
-                format_strict_failure_summary(model_name, requested, &failures, STRICT_MAX_RELATED);
-            return Err(Box::new(StrictCompileFailure::from_dae_phase_result(
-                summary,
-                &requested_result,
-                failures,
-                tree.source_map.clone(),
-            )));
-        }
-
-        match requested_result {
-            DaePhaseResult::Success(mut result) => {
-                let files = collect_target_source_files(tree, &target.closure.reachable_classes);
-                result.source_closure = Some(super::CompiledSourceClosure {
-                    target: model_name.to_owned(),
-                    files: files.into_iter().map(|uri| super::CompiledSourceContribution {
-                        source_set_keys: self.source_root_backing_keys_for_uri(&uri).into_iter().collect(),
-                        uri,
-                    }).collect(),
-                });
-                Ok(result)
+        let files = collect_target_source_files(tree, &target.closure.reachable_classes)
+            .into_iter()
+            .map(|uri| CompiledSourceContribution {
+                source_set_keys: self
+                    .source_root_backing_keys_for_uri(&uri)
+                    .into_iter()
+                    .collect(),
+                uri,
+            })
+            .collect();
+        let dependency_fingerprint =
+            self.model_dependency_fingerprint(tree, target.query_mode, model_name);
+        Ok(StrictDaePreparation {
+            resolved: target.resolved,
+            options: self.instantiation_options.clone(),
+            source_closure: CompiledSourceClosure {
+                target: model_name.to_owned(),
+                dependency_fingerprint,
+                files,
             },
-            DaePhaseResult::NeedsInner { .. } | DaePhaseResult::Failed { .. } => {
-                Err(Box::new(StrictCompileFailure::from_dae_phase_result(
-                    "strict DAE compile returned non-success requested result without collected diagnostics"
-                        .to_string(),
-                    &requested_result,
-                    Vec::new(),
-                    tree.source_map.clone(),
-                )))
-            }
-        }
+        })
     }
 
     fn compile_model_strict_reachable_attempt(
@@ -1440,5 +1426,54 @@ impl Session {
             results.push((name, result));
         }
         results
+    }
+}
+
+impl StrictDaePreparation {
+    pub fn source_closure(&self) -> &CompiledSourceClosure {
+        &self.source_closure
+    }
+
+    pub fn compile(
+        self,
+    ) -> std::result::Result<Box<DaeCompilationResult>, Box<StrictCompileFailure>> {
+        let tree = self.resolved.inner();
+        let model_name = self.source_closure.target.as_str();
+        let mut failures = Vec::new();
+
+        let requested_result =
+            compile_model_dae_internal_with_options(tree, model_name, self.options);
+        let requested = dae_phase_result_requested_message(model_name, &requested_result);
+        failures.extend(dae_phase_result_to_failures(
+            tree,
+            model_name,
+            &requested_result,
+        ));
+        if !failures.is_empty() {
+            let summary =
+                format_strict_failure_summary(model_name, requested, &failures, STRICT_MAX_RELATED);
+            return Err(Box::new(StrictCompileFailure::from_dae_phase_result(
+                summary,
+                &requested_result,
+                failures,
+                tree.source_map.clone(),
+            )));
+        }
+
+        match requested_result {
+            DaePhaseResult::Success(mut result) => {
+                result.source_closure = Some(self.source_closure);
+                Ok(result)
+            },
+            DaePhaseResult::NeedsInner { .. } | DaePhaseResult::Failed { .. } => {
+                Err(Box::new(StrictCompileFailure::from_dae_phase_result(
+                    "strict DAE compile returned non-success requested result without collected diagnostics"
+                        .to_string(),
+                    &requested_result,
+                    Vec::new(),
+                    tree.source_map.clone(),
+                )))
+            }
+        }
     }
 }

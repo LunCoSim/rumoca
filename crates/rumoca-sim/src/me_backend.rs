@@ -142,21 +142,45 @@ pub(crate) fn initialized_host(
 ) -> Result<MeComponentHost<'static>, SimError> {
     let execution_backend =
         rumoca_solver::fmi_me::admit_execution_backend(opts.execution_policy, execution_backend)?;
-    let root_location = source.root_location();
+    let options = initialized_options(&source, opts)?;
     let retained = MeRetainedComponent::instantiate(
         source,
         &MeInstanceConfig::open_ended(instance_name, opts.rtol, opts.t_start)?,
         execution_backend,
     )?;
-    let options = live_session_options(
-        &root_location,
+    retained.into_lease(options).map_err(Into::into)
+}
+
+pub(crate) fn observe_initialization(
+    source: MeModelSource<'_>,
+    opts: &SimOptions,
+    execution_backend: Option<MeExecutionBackend>,
+    names: &[String],
+) -> Result<Vec<f64>, SimError> {
+    let execution_backend =
+        rumoca_solver::fmi_me::admit_execution_backend(opts.execution_policy, execution_backend)?;
+    let options = initialized_options(&source, opts)?;
+    Ok(MeRetainedComponent::initialize_and_observe(
+        source,
+        &MeInstanceConfig::open_ended("initialization", opts.rtol, opts.t_start)?,
+        execution_backend,
+        options,
+        names,
+    )?)
+}
+
+fn initialized_options(
+    source: &MeModelSource<'_>,
+    opts: &SimOptions,
+) -> Result<rumoca_solver::fmi_me::session::MeSessionOptions, SimError> {
+    Ok(live_session_options(
+        &source.root_location(),
         opts.t_start,
         opts.rtol,
         opts.atol,
         live_scan_scale(opts),
         opts.max_wall_seconds,
-    )?;
-    retained.into_lease(options).map_err(Into::into)
+    )?)
 }
 
 #[cfg(feature = "solver-rk45")]

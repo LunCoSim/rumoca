@@ -550,10 +550,7 @@ impl ScalarProgramBlock {
     /// The program that produces dense output slot `output` and the position
     /// of that output among the program's own stored outputs.
     pub fn output_position(&self, output: usize) -> Option<(usize, usize)> {
-        let ordinal = self
-            .data
-            .output_placements
-            .ordinal_for_output(output, &self.data.program_output_ends)?;
+        let ordinal = self.data.output_placements.ordinal_for_output(output)?;
         let program = self
             .data
             .program_output_ends

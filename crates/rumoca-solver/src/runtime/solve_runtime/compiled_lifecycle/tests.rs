@@ -228,3 +228,50 @@ fn family_binding_error_preserves_original_span_and_is_fatal_cold() {
     assert_eq!(backend.individuals.get(), 0);
     assert!(backend.executed.borrow().is_empty());
 }
+
+#[test]
+fn initial_observation_prepares_only_requested_expression_owners() {
+    let (_, mut backend) = fixture(FamilyMode::Bind);
+    let spans = ["direct.mo", "requested.mo", "other.mo"].map(|name| {
+        rumoca_core::Span::from_offsets(rumoca_core::SourceId::from_source_name(name), 1, 2)
+    });
+    let literal = |value| {
+        vec![
+            solve::LinearOp::Const { dst: 0, value },
+            solve::LinearOp::StoreOutput { src: 0 },
+        ]
+    };
+    let source = solve::ScalarProgramBlock::with_program_spans(
+        vec![
+            vec![
+                solve::LinearOp::LoadY { dst: 0, index: 0 },
+                solve::LinearOp::StoreOutput { src: 0 },
+            ],
+            literal(3.0),
+            literal(7.0),
+        ],
+        spans.to_vec(),
+    )
+    .unwrap();
+    let plan = visible_value_plan(&source, 3).unwrap();
+    backend.refused = Some(spans[2]);
+    let requested = [0, 1].into_iter().collect();
+    let compiled = CompiledPrograms::visible(&source, Some(&plan), Some(&requested), &backend)
+        .expect("direct and unrequested observations have no native expression owner");
+    assert_eq!(backend.individuals.get(), 1);
+    let point = RowEvalPoint {
+        y: &[2.0],
+        p: &[],
+        t: 0.0,
+    };
+    let mut out = Vec::new();
+    compiled.call(1, point, &[], &mut out).unwrap();
+    assert_eq!(out, [3.0]);
+    assert!(compiled.call(2, point, &[], &mut out).is_err());
+    let error = CompiledPrograms::visible(&source, Some(&plan), None, &backend)
+        .err()
+        .expect("the full runtime requires every expression owner");
+    assert!(
+        matches!(error, EvalSolveError::CompiledExecution { span: Some(span), .. } if span == spans[2])
+    );
+}

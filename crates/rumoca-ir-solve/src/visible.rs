@@ -51,7 +51,7 @@ pub enum VisibleProjectionInput {
 pub struct VisibleProjection {
     members: Vec<VisibleProjectionInput>,
     #[serde(skip)]
-    scalar_count: usize,
+    member_ends: Vec<usize>,
 }
 
 /// A demanded observation view issued from one model's two correlated owners.
@@ -119,10 +119,11 @@ impl VisibleProjection {
         problem: &SolveProblem,
         members: Vec<VisibleProjectionInput>,
     ) -> Result<Self, VisibleProjectionError> {
-        let count = Self::check_inputs(problem, &members)?;
+        let mut member_ends = Vec::with_capacity(members.len());
+        Self::visit_checked_extents(problem, &members, |end| member_ends.push(end))?;
         let owner = Self {
             members,
-            scalar_count: count,
+            member_ends,
         };
         owner.validate_source_facts(problem)?;
         Ok(owner)
@@ -132,6 +133,14 @@ impl VisibleProjection {
         problem: &SolveProblem,
         members: &[VisibleProjectionInput],
     ) -> Result<usize, VisibleProjectionError> {
+        Self::visit_checked_extents(problem, members, |_| {})
+    }
+
+    fn visit_checked_extents(
+        problem: &SolveProblem,
+        members: &[VisibleProjectionInput],
+        mut visit_end: impl FnMut(usize),
+    ) -> Result<usize, VisibleProjectionError> {
         let mut count = 0usize;
         let mut previous = None;
         for member in members {
@@ -139,12 +148,18 @@ impl VisibleProjection {
             count = count
                 .checked_add(extent)
                 .ok_or_else(|| error("visible extent overflow", None))?;
+            visit_end(count);
         }
         Ok(count)
     }
 
     pub fn validate_against(&self, problem: &SolveProblem) -> Result<(), VisibleProjectionError> {
-        if Self::check_inputs(problem, &self.members)? != self.scalar_count {
+        let mut ends = self.member_ends.iter().copied();
+        let mut exact = true;
+        Self::visit_checked_extents(problem, &self.members, |end| {
+            exact &= ends.next() == Some(end);
+        })?;
+        if !exact || ends.next().is_some() {
             return Err(error("visible owner has foreign logical extent", None));
         }
         self.validate_source_facts(problem)
@@ -154,7 +169,7 @@ impl VisibleProjection {
         &self.members
     }
     pub fn scalar_count(&self) -> usize {
-        self.scalar_count
+        self.member_ends.last().copied().unwrap_or(0)
     }
 }
 

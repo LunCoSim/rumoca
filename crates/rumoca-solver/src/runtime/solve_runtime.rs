@@ -123,8 +123,8 @@ pub use initial_event::{
 };
 use plans::{
     RootConditionPlan, RootConditionPlanEntry, VisibleValuePlan, VisibleValuePlanEntry,
-    direct_time_root_search_default, direct_time_root_value,
-    direct_visible_value, root_condition_plan, total_root_condition_count, visible_value_plan,
+    direct_time_root_search_default, direct_time_root_value, direct_visible_value,
+    root_condition_plan, total_root_condition_count, visible_value_plan,
 };
 use refresh_execution::static_refresh_parameter_indices;
 use refresh_projection::*;
@@ -489,14 +489,27 @@ impl SolveRuntime {
         model: &solve::SolveModel,
         execution_backend: Option<Rc<dyn SolveExecutionBackend>>,
     ) -> Result<Self, EvalSolveError> {
-        Self::construct(SolveRuntimeModel::copied(model), execution_backend, None)
+        Self::construct(
+            SolveRuntimeModel::copied(model),
+            execution_backend,
+            None,
+            None,
+        )
     }
 
     pub(crate) fn new_with_model_owner(
         model: SolveRuntimeModel,
         execution_backend: Option<Rc<dyn SolveExecutionBackend>>,
     ) -> Result<Self, EvalSolveError> {
-        Self::construct(model, execution_backend, None)
+        Self::construct(model, execution_backend, None, None)
+    }
+
+    pub(crate) fn new_initial_observer(
+        model: SolveRuntimeModel,
+        execution_backend: Option<Rc<dyn SolveExecutionBackend>>,
+        names: &[String],
+    ) -> Result<Self, EvalSolveError> {
+        Self::construct(model, execution_backend, None, Some(names))
     }
 
     /// The runtime of an alternate reduced chart over `model`, sharing this
@@ -507,6 +520,7 @@ impl SolveRuntime {
             SolveRuntimeModel::copied(model),
             self.scalar_evaluation()?.scalar.execution_backend.clone(),
             Some(self),
+            None,
         )
     }
 

@@ -627,6 +627,22 @@ impl SolveMeKernel {
         Self::finish_instantiation(runtime, facts, config)
     }
 
+    pub(crate) fn instantiate_initial_observer(
+        source: MeModelSource<'_>,
+        config: &MeInstanceConfig,
+        execution_backend: Option<crate::fmi_me::MeExecutionBackend>,
+        names: &[String],
+    ) -> Result<Self, MeError> {
+        let (model, facts) = Self::resolve_instance_source(source, config)
+            .map_err(|error| error.at_stage(MeStage::Instantiate))?;
+        let backend =
+            execution_backend.map(crate::fmi_me::MeExecutionBackend::into_runtime_backend);
+        let runtime = SolveRuntime::new_initial_observer(model, backend, names)
+            .map_err(|error| MeError::from(error).at_stage(MeStage::Instantiate))?;
+        Self::finish_instantiation(runtime, facts, config)
+            .map_err(|error| error.at_stage(MeStage::Instantiate))
+    }
+
     pub(super) fn resolve_instance_source(
         source: MeModelSource<'_>,
         config: &MeInstanceConfig,
@@ -646,7 +662,13 @@ impl SolveMeKernel {
         source: MeModelSource<'_>,
     ) -> Result<(crate::SolveRuntimeModel, ResolvedInstanceFacts), MeError> {
         let root_location = source.root_location();
-        let (model, indicator_plan, max_step_duration_value_reference, configuration, parameter_variables) = source
+        let (
+            model,
+            indicator_plan,
+            max_step_duration_value_reference,
+            configuration,
+            parameter_variables,
+        ) = source
             .into_parts()
             .map_err(|error| contract(error.to_string()))?;
         let delay_bearing = !model.problem.events.delays.delay_time_rhs.is_empty();

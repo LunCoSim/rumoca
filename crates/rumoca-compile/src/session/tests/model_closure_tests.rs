@@ -13,9 +13,19 @@ fn strict_dae_source_closure_records_only_participating_documents() {
     ] {
         session.add_document(uri, source).expect("valid source");
     }
-    let result = session
-        .compile_model_dae_strict_reachable_uncached_with_recovery("Target")
-        .expect("balanced strict DAE compile");
+    let prepared = session
+        .prepare_strict_dae_compilation("Target")
+        .expect("strict resolution succeeds before lowering");
+    let initial_fingerprint = prepared.source_closure().dependency_fingerprint;
+    session
+        .add_document("unrelated.mo", "model Unrelated Real y=3; end Unrelated;")
+        .expect("valid unrelated edit");
+    let edited = session.prepare_strict_dae_compilation("Target").unwrap();
+    assert_eq!(
+        edited.source_closure().dependency_fingerprint,
+        initial_fingerprint
+    );
+    let result = prepared.compile().expect("balanced strict DAE compile");
     let closure = result
         .source_closure
         .expect("strict compile records its closure");

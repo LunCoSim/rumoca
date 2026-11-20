@@ -89,6 +89,27 @@ impl MeRetainedComponent {
         Ok(Self::from_kernel(kernel))
     }
 
+    /// Run the common Model Exchange initialization and return one named sample.
+    /// The initial observer has no public handle that can be advanced or reset.
+    pub fn initialize_and_observe(
+        source: MeModelSource<'_>,
+        config: &MeInstanceConfig,
+        execution_backend: Option<MeExecutionBackend>,
+        options: MeSessionOptions,
+        names: &[String],
+    ) -> Result<Vec<f64>, MeSessionError> {
+        if options.records_trace() {
+            return Err(MeSessionError::Contract {
+                reason: "a named initial observation does not own a trajectory recorder".into(),
+            });
+        }
+        let kernel =
+            SolveMeKernel::instantiate_initial_observer(source, config, execution_backend, names)?;
+        Self::from_kernel(kernel)
+            .into_lease(options)?
+            .initial_output_values(names)
+    }
+
     /// Prepare the same native resource without inventing initialization time.
     #[cfg(feature = "native-wasm")]
     pub fn prepare_retained_native_wasm(
@@ -238,11 +259,18 @@ fn build_host_state(
     kernel: Rc<MeKernelCell>,
     options: MeSessionOptions,
 ) -> Result<MeHostState, MeSessionError> {
-    let input_names = kernel.with_model(|model| {
-        model.problem.solve_layout.input_scalar_names().iter().collect()
-    }).ok_or_else(|| MeSessionError::Contract {
-        reason: "the ME session has no checked input layout".into(),
-    })?;
+    let input_names = kernel
+        .with_model(|model| {
+            model
+                .problem
+                .solve_layout
+                .input_scalar_names()
+                .iter()
+                .collect()
+        })
+        .ok_or_else(|| MeSessionError::Contract {
+            reason: "the ME session has no checked input layout".into(),
+        })?;
     let (state_count, indicator_count, names, meta, max_step_duration_reference) = {
         let borrowed = kernel.borrow()?;
         let (names, meta) = if options.records_trace() {

@@ -8,6 +8,7 @@ mod tests;
 #[derive(Clone)]
 pub(super) struct CompiledPrograms {
     programs: Box<[CompiledProgram]>,
+    source_ordinals: Option<Box<[usize]>>,
     /// The whole block as one compiled entry, which evaluates every program
     /// into its output placement in one call.
     whole: Option<Rc<dyn CompiledSolveExpression>>,
@@ -66,7 +67,42 @@ impl CompiledPrograms {
             .collect::<Result<Box<[_]>, EvalSolveError>>()?;
         Ok(Self {
             programs,
+            source_ordinals: None,
             whole,
+            scratch: RefCell::default(),
+        })
+    }
+
+    fn visible(
+        source: &solve::ScalarProgramBlock,
+        plan: Option<&VisibleValuePlan>,
+        selected: Option<&rustc_hash::FxHashSet<usize>>,
+        backend: &dyn SolveExecutionBackend,
+    ) -> Result<Self, EvalSolveError> {
+        let Some(plan) = plan else {
+            return Self::new("visible_values", source, backend);
+        };
+        let mut programs = Vec::new();
+        let mut source_ordinals = Vec::new();
+        for (index, (entry, ops)) in plan.entries.iter().zip(source.programs()).enumerate() {
+            if let VisibleValuePlanEntry::Expression = entry
+                && selected.is_none_or(|selected| selected.contains(&index))
+            {
+                programs.push(Self::prepare_program(
+                    "visible_values",
+                    source,
+                    index,
+                    ops,
+                    None,
+                    backend,
+                )?);
+                source_ordinals.push(index);
+            }
+        }
+        Ok(Self {
+            programs: programs.into_boxed_slice(),
+            source_ordinals: Some(source_ordinals.into_boxed_slice()),
+            whole: None,
             scratch: RefCell::default(),
         })
     }
@@ -167,6 +203,7 @@ impl CompiledPrograms {
         }
         Ok(Self {
             programs: programs.into_boxed_slice(),
+            source_ordinals: None,
             whole: None,
             scratch: RefCell::default(),
         })
@@ -185,11 +222,17 @@ impl CompiledPrograms {
         tables: &[rumoca_core::ExternalTableData],
         out: &mut Vec<f64>,
     ) -> Result<(), RuntimeSolveError> {
-        let code = self.programs.get(program).ok_or_else(|| {
-            RuntimeSolveError::solve_ir(format!(
-                "required lifecycle program {program} is outside its prepared source"
-            ))
-        })?;
+        let position = match &self.source_ordinals {
+            Some(ordinals) => ordinals.binary_search(&program).ok(),
+            None => Some(program),
+        };
+        let code = position
+            .and_then(|position| self.programs.get(position))
+            .ok_or_else(|| {
+                RuntimeSolveError::solve_ir(format!(
+                    "required lifecycle program {program} is outside its prepared source"
+                ))
+            })?;
         let mut values = self.scratch.borrow_mut();
         resize_runtime_values(
             &mut values,
@@ -250,6 +293,8 @@ impl CompiledLifecycle {
     pub(super) fn new(
         source: &solve::SolveExecutionSource,
         visible: &solve::ScalarProgramBlock,
+        visible_plan: Option<&VisibleValuePlan>,
+        visible_ordinals: Option<&rustc_hash::FxHashSet<usize>>,
         structured: &solve::ScalarProgramBlock,
         guarded: &[PreparedGuardedAssignmentProgram],
         backend: &dyn SolveExecutionBackend,
@@ -296,7 +341,7 @@ impl CompiledLifecycle {
                 "clock_intermediates",
                 &discrete.clock_partition_intermediates,
             )?,
-            visible: compile("visible_values", visible)?,
+            visible: CompiledPrograms::visible(visible, visible_plan, visible_ordinals, backend)?,
             event_conditions: CompiledPrograms::event(
                 source,
                 solve::RetainedAssertionSource::ActionConditions,

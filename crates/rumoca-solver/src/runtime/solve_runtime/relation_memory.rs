@@ -1364,6 +1364,14 @@ impl ScalarExecutionView<'_> {
         let Some(idx) = self.scalar.visible_name_index.get(name).copied() else {
             return Ok(None);
         };
+        if let Some(VisibleValuePlanEntry::Direct(source)) = self
+            .scalar
+            .visible_value_plan
+            .as_ref()
+            .and_then(|plan| plan.entries.get(idx))
+        {
+            return direct_visible_value(*source, y, params, t).map(Some);
+        }
         if idx >= self.scalar.visible_value_rows.len() {
             return Err(visible_value_index_error(
                 name,

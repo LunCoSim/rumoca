@@ -1697,6 +1697,7 @@ pub struct CompilationResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledSourceClosure {
     pub target: String,
+    pub dependency_fingerprint: [u8; 32],
     pub files: Vec<CompiledSourceContribution>,
 }
 
@@ -1705,6 +1706,14 @@ pub struct CompiledSourceClosure {
 pub struct CompiledSourceContribution {
     pub uri: String,
     pub source_set_keys: Vec<String>,
+}
+
+/// Resolved input to a strict DAE compile, with its captured instantiation options.
+/// Consumers can inspect the resolution inputs before choosing to lower the DAE.
+pub struct StrictDaePreparation {
+    resolved: Arc<ResolvedTree>,
+    options: InstantiateOptions,
+    source_closure: CompiledSourceClosure,
 }
 
 /// Result of compiling a single model through the DAE stage only.

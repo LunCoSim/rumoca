@@ -232,9 +232,9 @@ pub mod compile {
         SourceRootActivityKind, SourceRootActivityPhase, SourceRootActivitySnapshot,
         SourceRootDurability, SourceRootKind, SourceRootLoadMode, SourceRootLoadReport,
         SourceRootStatusSnapshot, StrictCheckTiming, StrictCompilation, StrictCompileFailure,
-        StrictCompileReport, StructuralOverride, WorkspaceSymbol, WorkspaceSymbolKind,
-        WorkspaceSymbolSnapshotTiming, compile_phase_timing_stats, install_compile_phase_observer,
-        reset_compile_phase_timing_stats, source_root_dependencies,
+        StrictCompileReport, StrictDaePreparation, StructuralOverride, WorkspaceSymbol,
+        WorkspaceSymbolKind, WorkspaceSymbolSnapshotTiming, compile_phase_timing_stats,
+        install_compile_phase_observer, reset_compile_phase_timing_stats, source_root_dependencies,
     };
 }
 

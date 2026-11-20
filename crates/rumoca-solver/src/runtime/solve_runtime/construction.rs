@@ -9,6 +9,7 @@ impl SolveRuntime {
         model_owner: SolveRuntimeModel,
         execution_backend: Option<Rc<dyn SolveExecutionBackend>>,
         primary: Option<&SolveRuntime>,
+        observation_names: Option<&[String]>,
     ) -> Result<Self, EvalSolveError> {
         model_owner
             .artifacts
@@ -278,6 +279,13 @@ impl SolveRuntime {
         })?;
         let visible_value_plan =
             visible_value_plan(&visible_rows, model.visible_projection.scalar_count());
+        let visible_name_index = build_visible_name_index(model);
+        let visible_ordinals = observation_names.map(|names| {
+            names
+                .iter()
+                .filter_map(|name| visible_name_index.get(name).copied())
+                .collect::<rustc_hash::FxHashSet<_>>()
+        });
         let root_condition_plan = root_condition_plan(model);
         let compiled_lifecycle = execution_backend
             .as_ref()
@@ -285,6 +293,8 @@ impl SolveRuntime {
                 CompiledLifecycle::new(
                     &model_owner.execution_source(),
                     &visible_rows,
+                    visible_value_plan.as_ref(),
+                    visible_ordinals.as_ref(),
                     &structured_discrete_scalar_rhs,
                     &guarded_assignment_programs,
                     backend.as_ref(),
@@ -568,7 +578,7 @@ impl SolveRuntime {
             )?,
             update_values_scratch: RefCell::new(Vec::new()),
             structured_discrete_rows,
-            visible_name_index: build_visible_name_index(model),
+            visible_name_index,
             visible_value_rows: prepare(|primary| &primary.visible_value_rows, visible_rows)?,
             visible_value_plan,
             visible_scratch: RefCell::new(Vec::new()),
