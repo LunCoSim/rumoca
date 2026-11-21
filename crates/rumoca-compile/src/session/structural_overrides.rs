@@ -93,6 +93,9 @@ impl Session {
     /// instantiator re-evaluates dimensions/conditionals under the new value.
     /// Replaces any previously-set overrides; pass an empty slice to clear.
     pub fn set_structural_overrides(&mut self, overrides: &[(String, StructuralOverride)]) {
+        if overrides.is_empty() && self.structural_override_sources.is_empty() {
+            return;
+        }
         self.bump_revision();
         let prepared = overrides.iter().map(|(name, value)| {
             let target = QualifiedName::from_dotted(name);
@@ -103,9 +106,9 @@ impl Session {
             self.instantiation_options.root_modifications,
             self.structural_override_sources,
         ) = prepared.unzip();
-        // Structural options are semantic compile inputs but do not change the
-        // source dependency fingerprint. Discard every artifact at and below
-        // instantiation so a repeated compile cannot reuse the old structure.
+        // Resolved trees carry the source map for the synthetic literals.
+        // Rebuild those trees and their downstream artifacts when overrides change.
+        self.query_state.resolved.builds.clear();
         self.query_state.flat = Default::default();
         self.query_state.dae = Default::default();
     }
@@ -135,17 +138,38 @@ mod tests {
             )
             .expect("fixture should parse");
 
-        session.set_structural_overrides(&[("n".to_string(), StructuralOverride::Int(2))]);
+        let original = session
+            .compile_model_strict("M")
+            .expect("default model should compile");
+        assert_eq!(state_scalar_count(original.result()), 2);
+
+        session.set_structural_overrides(&[("n".to_string(), StructuralOverride::Int(4))]);
         let first = session
             .compile_model_strict("M")
             .expect("first structural variant should compile");
-        assert_eq!(state_scalar_count(first.result()), 2);
+        assert_eq!(state_scalar_count(first.result()), 4);
 
-        session.set_structural_overrides(&[("n".to_string(), StructuralOverride::Int(4))]);
+        session.set_structural_overrides(&[("n".to_string(), StructuralOverride::Int(12))]);
         let second = session
             .compile_model_strict("M")
             .expect("second structural variant should compile");
-        assert_eq!(state_scalar_count(second.result()), 4);
+        assert_eq!(state_scalar_count(second.result()), 12);
+        let source_name = structural_override_source_name(&QualifiedName::from_dotted("n"));
+        let source_id = rumoca_core::SourceId::from_source_name(&source_name);
+        assert_eq!(
+            second.resolved().inner().source_map.get_source(source_id),
+            Some((source_name.as_str(), "12"))
+        );
+
+        session.set_structural_overrides(&[]);
+        let restored = session
+            .compile_model_strict("M")
+            .expect("clearing overrides should restore the default model");
+        assert_eq!(state_scalar_count(restored.result()), 2);
+        assert_eq!(
+            restored.resolved().inner().source_map.get_source(source_id),
+            None
+        );
     }
 
     fn state_scalar_count(result: &crate::session::CompilationResult) -> usize {
