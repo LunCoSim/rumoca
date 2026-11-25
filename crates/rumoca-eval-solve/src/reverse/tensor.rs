@@ -12,6 +12,10 @@
 //! | `DotProduct` `d = Σ l·r` | `l̄ += d̄·r`, `r̄ += d̄·l` |
 //! | `MatrixMultiply` `C = A·B` | `Ā += C̄·Bᵀ`, `B̄ += Aᵀ·C̄` |
 //! | `TensorBinary` | the scalar `Binary` partials, per element (a zero stride accumulates the broadcast operand) |
+//! | `TensorIntegerPower` | the reverse sweep of its plan's `TensorBinary` chain, per element (`integer_power`) |
+//! | `TensorCross` | transpose the signed pair of products in each component |
+//! | `TensorUpdate` | route each output to the replacement or the untouched base element |
+//! | `TensorConcatenate` | scatter each result adjoint to its source element, summing repeated inputs |
 //! | `TensorTranspose` | the adjoint transposed back to the source layout |
 //! | `TensorFill` | the sum of the filled elements' adjoints onto the value |
 //! | `TensorIdentity` | none: a constant |
@@ -23,24 +27,29 @@ use super::{
 use crate::EvalSolveError;
 use rumoca_ir_solve::{LinearOp, Reg, TensorInputKind};
 
+mod geometry;
+mod integer_power;
 #[cfg(test)]
 mod tests;
 
 /// Whether this module owns the reverse rule of `op`.
 pub(super) fn supported(op: &LinearOp) -> bool {
-    matches!(
-        op,
+    match op {
+        LinearOp::DotProduct { .. } => true,
         LinearOp::TensorLoad {
-            lanes: 1,
-            seed_start: None,
-            ..
-        } | LinearOp::DotProduct { .. }
-            | LinearOp::MatrixMultiply { lanes: 1, .. }
-            | LinearOp::TensorBinary { lanes: 1, .. }
-            | LinearOp::TensorTranspose { lanes: 1, .. }
-            | LinearOp::TensorFill { lanes: 1, .. }
-            | LinearOp::TensorIdentity { lanes: 1, .. }
-    )
+            lanes, seed_start, ..
+        } => *lanes == 1 && seed_start.is_none(),
+        LinearOp::MatrixMultiply { lanes, .. }
+        | LinearOp::TensorBinary { lanes, .. }
+        | LinearOp::TensorIntegerPower { lanes, .. }
+        | LinearOp::TensorUpdate { lanes, .. }
+        | LinearOp::TensorCross { lanes, .. }
+        | LinearOp::TensorConcatenate { lanes, .. }
+        | LinearOp::TensorTranspose { lanes, .. }
+        | LinearOp::TensorFill { lanes, .. }
+        | LinearOp::TensorIdentity { lanes, .. } => *lanes == 1,
+        non_tensor_ops!() => false,
+    }
 }
 
 /// Record the primal value of one supported tensor operation.
@@ -55,10 +64,21 @@ pub(super) fn forward(
         LinearOp::DotProduct { .. } => forward_dot(op, regs),
         LinearOp::MatrixMultiply { .. } => forward_matmul(op, regs),
         LinearOp::TensorBinary { .. } => forward_binary(op, regs),
+        LinearOp::TensorIntegerPower { .. } => forward_integer_power(op, regs),
+        &LinearOp::TensorCross {
+            dst_start,
+            lhs_start,
+            rhs_start,
+            lanes,
+        } => crate::eval_tensor_cross(regs, dst_start, lhs_start, rhs_start, lanes),
+        LinearOp::TensorUpdate { .. } => geometry::forward_update(op, regs),
+        LinearOp::TensorConcatenate { .. } => concatenate_pairs(op, |dst, src| {
+            set(regs, dst, reg(regs, src));
+        }),
         LinearOp::TensorTranspose { .. } => forward_transpose(op, regs),
         LinearOp::TensorFill { .. } => forward_fill(op, regs),
         LinearOp::TensorIdentity { .. } => forward_identity(op, regs),
-        _ => unreachable!("tensor reverse dispatch receives only supported operations"),
+        non_tensor_ops!() => unreachable!("non-tensor passed to tensor dispatch"),
     }
     Ok(())
 }
@@ -66,13 +86,18 @@ pub(super) fn forward(
 /// Refuse a destination range that overlaps a source range. The IR admits
 /// such an operation and the canonical evaluator buffers it; this tape
 /// writes in place, so it would read overwritten operands.
-fn refuse_overlap(op: &LinearOp) -> Result<(), EvalSolveError> {
+pub(super) fn refuse_overlap(op: &LinearOp) -> Result<(), EvalSolveError> {
     let overlap = |dst: (Reg, usize), src: (Reg, usize)| {
         let (d0, d1) = (dst.0 as usize, dst.0 as usize + dst.1);
         let (s0, s1) = (src.0 as usize, src.0 as usize + src.1);
         d0 < s1 && s0 < d1
     };
     let overlapping = match *op {
+        LinearOp::TensorCross { .. }
+        | LinearOp::TensorUpdate { .. }
+        | LinearOp::TensorConcatenate { .. } => {
+            crate::tensor_snapshot::Snapshot::issue(op).is_none_or(|snapshot| snapshot.width() != 0)
+        }
         LinearOp::MatrixMultiply {
             dst_start,
             lhs_start,
@@ -122,6 +147,12 @@ fn refuse_overlap(op: &LinearOp) -> Result<(), EvalSolveError> {
             count,
             ..
         } => overlap((dst_start, count), (value_start, 1)),
+        LinearOp::TensorIntegerPower {
+            dst_start,
+            src_start,
+            count,
+            ..
+        } => overlap((dst_start, count), (src_start, count)),
         _ => false,
     };
     if overlapping {
@@ -223,6 +254,42 @@ fn forward_binary(op: &LinearOp, regs: &mut [f64]) {
     }
 }
 
+fn forward_integer_power(op: &LinearOp, regs: &mut [f64]) {
+    let LinearOp::TensorIntegerPower {
+        dst_start,
+        src_start,
+        count,
+        power,
+        ..
+    } = *op
+    else {
+        unreachable!("forward_integer_power receives a tensor integer power")
+    };
+    let mut value = [0.0];
+    for element in 0..count {
+        let source = [reg(regs, offset(src_start, element))];
+        crate::native_tensors::integer_power_element(power, &source, &mut value);
+        set(regs, offset(dst_start, element), value[0]);
+    }
+}
+
+fn concatenate_pairs(op: &LinearOp, mut visit: impl FnMut(Reg, Reg)) {
+    let LinearOp::TensorConcatenate {
+        dst_start,
+        sources,
+        dimensions,
+        axis,
+        lanes,
+    } = op
+    else {
+        unreachable!("concatenate_pairs receives a concatenation")
+    };
+    let Ok(()) = crate::visit_tensor_concatenate(sources, dimensions, *axis, *lanes, |src, i| {
+        visit(offset(*dst_start, i), src);
+        Ok::<(), std::convert::Infallible>(())
+    });
+}
+
 fn forward_transpose(op: &LinearOp, regs: &mut [f64]) {
     for (dst, src) in transpose_pairs(op) {
         set(regs, dst, reg(regs, src));
@@ -281,10 +348,30 @@ pub(super) fn reverse(
         LinearOp::DotProduct { .. } => reverse_dot(op, regs, &mut state),
         LinearOp::MatrixMultiply { .. } => reverse_matmul(op, regs, &mut state),
         LinearOp::TensorBinary { .. } => reverse_binary(op, regs, &mut state),
+        &LinearOp::TensorIntegerPower {
+            dst_start,
+            src_start,
+            count,
+            power,
+            ..
+        } => integer_power::reverse((dst_start, src_start), count, power, regs, &mut state),
+        &LinearOp::TensorCross {
+            dst_start,
+            lhs_start,
+            rhs_start,
+            ..
+        } => geometry::reverse_cross(dst_start, lhs_start, rhs_start, regs, &mut state),
+        LinearOp::TensorUpdate { .. } => geometry::reverse_update(op, regs, &mut state),
+        LinearOp::TensorConcatenate { .. } => concatenate_pairs(op, |dst, src| {
+            let g = take_adj(state.adj, dst);
+            if !skips_untaken(state.untaken, state.adj, dst, g, &[src]) {
+                add_adj(state.adj, src, g);
+            }
+        }),
         LinearOp::TensorTranspose { .. } => reverse_transpose(op, &mut state),
         LinearOp::TensorFill { .. } => reverse_fill(op, &mut state),
         LinearOp::TensorIdentity { .. } => reverse_identity(op, &mut state),
-        _ => unreachable!("tensor reverse dispatch receives only supported operations"),
+        non_tensor_ops!() => unreachable!("non-tensor passed to tensor dispatch"),
     }
 }
 

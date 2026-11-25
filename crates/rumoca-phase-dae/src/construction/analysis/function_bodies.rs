@@ -158,13 +158,14 @@ fn validate_statement_function(
         ..context
     };
     let mut definitions = FunctionDefinitions::new(function);
+    definitions.assume_declaration_bindings(normalized_context);
     let mut entry_seeds = certified_return_output_seeds(
         function,
         normalized.has_returns && !normalized.guards.iter().any(|guard| guard.mutable),
         normalized_context,
         &mut definitions,
     )?;
-    entry_seeds.extend(definitions.empty_value_seeds(normalized_context)?);
+    entry_seeds.extend(definitions.entry_value_seeds(normalized_context)?);
     let (statements, definedness) = validate_top_level_statements(
         function,
         &normalized.statements,
@@ -190,8 +191,15 @@ fn validate_nonreturn_path(
     context: FunctionValidationContext<'_>,
 ) -> Result<(), ToDaeError> {
     certify_nonleading_return_branches(function, context)?;
-    let nonreturn =
-        normalize_function_source(function, &nonreturn_path(&function.body), context, false)?;
+    validate_output_path(function, &nonreturn_path(&function.body), context)
+}
+
+pub(super) fn validate_output_path(
+    function: &rumoca_core::Function,
+    path: &[rumoca_core::Statement],
+    context: FunctionValidationContext<'_>,
+) -> Result<(), ToDaeError> {
+    let nonreturn = normalize_function_source(function, path, context, false)?;
     let roles = roles_with_guards(context.roles, &nonreturn.guards);
     let shapes = shapes_with_guards(context.shapes, &nonreturn.guards);
     let snapshot_loops =
@@ -204,7 +212,8 @@ fn validate_nonreturn_path(
         ..context
     };
     let mut definitions = FunctionDefinitions::new(function);
-    definitions.empty_value_seeds(nonreturn_context)?;
+    definitions.assume_declaration_bindings(nonreturn_context);
+    definitions.entry_value_seeds(nonreturn_context)?;
     validate_top_level_statements(
         function,
         &nonreturn.statements,
@@ -905,7 +914,9 @@ fn plan_proven_function_assertion(
             assertion.span,
         ));
     }
-    Ok(FunctionStatementPlan::RuntimeAssertion)
+    Ok(FunctionStatementPlan::RuntimeAssertion {
+        proven_reads: Vec::new(),
+    })
 }
 
 fn validate_function_assignment_target(
@@ -1392,8 +1403,9 @@ fn resolve_function_definition(
         (statement, FunctionStatementPlan::ProvenAssertion) => {
             resolve_function_assertion_definition(statement, false, context, definitions)?
         }
-        (statement, FunctionStatementPlan::RuntimeAssertion) => {
-            resolve_function_assertion_definition(statement, true, context, definitions)?
+        (statement, FunctionStatementPlan::RuntimeAssertion { proven_reads }) => {
+            resolve_function_assertion_definition(statement, true, context, definitions)?;
+            *proven_reads = proven_assertion_reads(statement, context, definitions);
         }
         (
             _,
@@ -1612,6 +1624,26 @@ fn resolve_function_assertion_definition(
         definitions.require_readable(assertion.message, context, assertion.span)?;
     }
     Ok(())
+}
+
+/// The mutable values a runtime assertion reads that are defined on its path
+/// only: construction checks each one where the assertion is evaluated, as it
+/// does for the reads of an assignment.
+fn proven_assertion_reads(
+    statement: &rumoca_core::Statement,
+    context: FunctionValidationContext<'_>,
+    definitions: &FunctionDefinitions,
+) -> Vec<(VarName, Span)> {
+    let assertion = function_assertion(statement, context.flat)
+        .expect("the assertion was resolved")
+        .expect("an assertion plan owns an assertion statement");
+    let mut reads =
+        definitions.proven_assignment_reads(assertion.condition, context, assertion.span);
+    extend_unique_reads(
+        &mut reads,
+        definitions.proven_assignment_reads(assertion.message, context, assertion.span),
+    );
+    reads
 }
 
 fn resolve_multi_output_definitions(

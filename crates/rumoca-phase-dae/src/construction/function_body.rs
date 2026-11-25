@@ -52,7 +52,7 @@ fn lower_loop_action_statement<'dae>(
 ) -> Result<bool, dae::DaeConstructionError> {
     let (target, value, span, proven_reads) = match plan {
         FunctionStatementPlan::ProvenAssertion => return Ok(true),
-        FunctionStatementPlan::RuntimeAssertion => {
+        FunctionStatementPlan::RuntimeAssertion { .. } => {
             lower_function_loop_assertion(construction, symbols, loop_body, binders, statement)?;
             return Ok(true);
         }
@@ -331,7 +331,7 @@ pub(super) fn lower_total_function_array_definition<'dae>(
     if input
         .plans
         .iter()
-        .any(|plan| matches!(plan, FunctionStatementPlan::RuntimeAssertion))
+        .any(|plan| matches!(plan, FunctionStatementPlan::RuntimeAssertion { .. }))
     {
         let mut loop_body = construction
             .functions(|functions| functions.begin_loop(body, input.domain, [], input.owner))?;
@@ -358,7 +358,7 @@ fn lower_total_function_assertions<'dae>(
     loop_body: &mut dae::FunctionLoop<'dae>,
 ) -> Result<(), dae::DaeConstructionError> {
     for (statement, plan) in input.statements.iter().zip(input.plans) {
-        if !matches!(plan, FunctionStatementPlan::RuntimeAssertion) {
+        if !matches!(plan, FunctionStatementPlan::RuntimeAssertion { .. }) {
             continue;
         }
         let assertion = function_assertion(statement, input.symbols.functions.flat)
@@ -411,15 +411,17 @@ fn lower_one_total_function_array_definition<'dae>(
         unreachable!("analysis proves total array-definition statements")
     };
     require_proven_function_reads(construction, input.symbols, body, assignment.proven_reads())?;
-    let element = lower_function_expression_scoped(
-        construction,
-        input.symbols.coordinates,
-        input.symbols.functions,
-        input.symbols.shapes,
-        body,
-        input.binders,
-        value,
-    )?;
+    let element = body.with_comprehension_domain(input.domain, |body| {
+        lower_function_expression_scoped(
+            construction,
+            input.symbols.coordinates,
+            input.symbols.functions,
+            input.symbols.shapes,
+            body,
+            input.binders,
+            value,
+        )
+    })?;
     let generated = dae::DaeProvenance::generated(
         dae::DaeGeneration::FunctionLoopLowering,
         input.owner.span(),

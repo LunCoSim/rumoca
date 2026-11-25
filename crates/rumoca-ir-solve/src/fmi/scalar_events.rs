@@ -19,24 +19,36 @@ use serde::Serialize;
 
 use crate::{
     DiscreteEventPreMode, DiscreteRowRole, PreParamSource, RootSearchPlan, RootSearchRole,
-    RootZeroDomain, ScalarSlot, SolveEventActionKind, SolveModel,
+    RootZeroDomain, ScalarSlot, SolveEventActionKind, SolveModel, SolveProblem,
 };
 
 /// The Solve IR facts the generated component reads to execute events.
 #[derive(Debug, Serialize)]
-pub(super) struct ScalarEventProfile {
+pub struct ScalarEventProfile {
     /// Per root output: whether and how it is evaluated in Event Mode.
     roots: Vec<ScalarEventRoot>,
+    has_quotient_memory: bool,
+    /// Discrete equation rows seeded before the first algebraic refresh, in
+    /// issued dependency order (initial_seed_rows.rs), with their P targets.
+    seed_rows: Vec<SeedRow>,
     /// Destination and source of every pre binding, in binding order.
     pre_bindings: Vec<PreLane>,
     /// The pre bindings (indices into `pre_bindings`) an event pass advances
     /// and whose settlement ends the iteration.
     iteration_lanes: Vec<usize>,
+    /// Parameter-backed pre reads that alias a destination require the
+    /// pre-commit snapshot to preserve simultaneous history assignment.
+    pre_commit_needs_snapshot: bool,
     /// Per discrete output: its parameter target.
     discrete_targets: Vec<usize>,
     /// Per discrete output: whether it is a condition memory, the rows
     /// initialization seeds with `pre` following the current value.
     condition_memory_rows: Vec<bool>,
+    /// Per discrete output: whether its `pre` reads the event-entry value in
+    /// every pass (`DiscreteEventPreMode::EventEntry`). Every other row, a
+    /// `Fixed` one included, reads the event entry in the first pass and the
+    /// previous pass after it, as the pre lanes advance.
+    entry_pre_rows: Vec<bool>,
     /// Pulse-memory outputs and their checked producing programs. Only these
     /// programs are evaluated when the event releases its clock pulses.
     pulse_rows: Vec<usize>,
@@ -55,7 +67,10 @@ pub(super) struct ScalarEventProfile {
     /// Per guarded-assignment output: the periodic clock that owns it, which
     /// gates it to that clock's ticks and to the first pass of an event.
     guarded_clocks: Vec<Option<usize>>,
+    guarded_clock_runs: Vec<(usize, Option<usize>)>,
     /// The time events the component announces and stops at.
+    /// The activation parameter of each clock-owned assertion program.
+    action_clock_lanes: Vec<Option<usize>>,
     time_events: super::time_events::TimeEvents,
     /// Source storage runs of discrete-valued external inputs. A
     /// discrete-time input changes only at events (MLS §4.5), so a
@@ -131,9 +146,47 @@ struct PreLane {
 }
 
 /// Admit the scalar event profile, or say why the model needs more.
+#[derive(Debug, Serialize)]
+struct SeedRow {
+    row: usize,
+    program: usize,
+    target: usize,
+    pre_slot: Option<usize>,
+}
+
+fn seed_rows(problem: &crate::SolveProblem) -> Result<Vec<SeedRow>, &'static str> {
+    problem
+        .initial_seed_discrete_rows()
+        .into_iter()
+        .map(|seed| match problem.discrete.update_targets.get(seed.row) {
+            Some(ScalarSlot::P { index, .. }) if *index == seed.target => Ok(SeedRow {
+                row: seed.row,
+                program: seed.program,
+                target: seed.target,
+                pre_slot: seed.pre_slot,
+            }),
+            _ => Err("an initial seed row must target a parameter slot"),
+        })
+        .collect()
+}
+
 pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'static str> {
-    let problem = &model.problem;
-    refuse_unsupported_owners(model)?;
+    if model
+        .problem
+        .discrete
+        .pre_modes
+        .iter()
+        .any(|mode| *mode != DiscreteEventPreMode::FollowCurrent)
+    {
+        return Err("the C profile executes only discrete rows whose pre follows the current pass");
+    }
+    scalar_event_profile(&model.problem)
+}
+
+/// Admit the scalar event profile of a lowered problem, or say why it needs
+/// more.
+pub fn scalar_event_profile(problem: &SolveProblem) -> Result<ScalarEventProfile, &'static str> {
+    refuse_unsupported_owners(problem)?;
     let events = &problem.events;
     let discrete = &problem.discrete;
     let search = RootSearchPlan::derive(problem);
@@ -156,7 +209,7 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
             _ => Err("a discrete row writes outside the parameters"),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    validate_scalar_discrete_rows(discrete)?;
+    validate_scalar_discrete_rows(discrete, problem.initialization.update_targets())?;
     let layout = &problem.solve_layout;
     let pre_bindings = layout
         .pre_param_bindings
@@ -174,28 +227,27 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
             },
         })
         .collect::<Vec<_>>();
-    let mut iteration_lanes = Vec::new();
-    for run in &discrete.event_iteration_plan.runs {
-        // A clock-owned run advances its history on its tick when the event
-        // commits and takes no part in the pass-to-pass fixed point.
-        if discrete.event_iteration_run_clock(run)?.is_some() {
-            continue;
-        }
-        let storage = layout
-            .variable_storage_runs
-            .get(run.variable)
-            .ok_or("an event iteration run names no storage")?;
-        let lanes = run.pre_binding_start..run.pre_binding_start + storage.scalar_count;
-        if lanes.end > pre_bindings.len() {
-            return Err("an event iteration run names a pre binding outside the layout");
-        }
-        iteration_lanes.extend(lanes);
-    }
+    let pre_destinations: std::collections::HashSet<_> =
+        pre_bindings.iter().map(|lane| lane.dest).collect();
+    let pre_commit_needs_snapshot = pre_bindings
+        .iter()
+        .any(|lane| lane.column == "p" && pre_destinations.contains(&lane.source));
+    let iteration_lanes = iteration_lanes(discrete, layout, pre_bindings.len())?;
     let (pulse_rows, pulse_programs) = pulse_producers(discrete)?;
+    let guarded_clocks = guarded_clocks(discrete, problem.clocks.periodic_event_schedules.len())?;
     Ok(ScalarEventProfile {
+        has_quotient_memory: discrete
+            .row_roles
+            .iter()
+            .any(|role| matches!(role, DiscreteRowRole::QuotientMemory { .. })),
+        seed_rows: seed_rows(problem)?,
         roots,
         pre_bindings,
+        pre_commit_needs_snapshot,
         iteration_lanes,
+        entry_pre_rows: (0..discrete.row_roles.len())
+            .map(|row| discrete.pre_modes.get(row) == Some(&DiscreteEventPreMode::EventEntry))
+            .collect(),
         condition_memory_rows: discrete
             .row_roles
             .iter()
@@ -208,11 +260,15 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
         observation_reads_y: discrete.observation_refresh_reads_y,
         runtime_targets: slots(&discrete.runtime_assignment_targets)?,
         guarded_targets: guarded_targets(discrete)?,
-        guarded_clocks: guarded_clocks(
-            discrete,
-            model.problem.clocks.periodic_event_schedules.len(),
-        )?,
-        time_events: super::time_events::derive(model)?,
+        guarded_clock_runs: guarded_clocks
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(i, clock)| i == 0 || guarded_clocks[i - 1] != clock)
+            .collect(),
+        guarded_clocks,
+        action_clock_lanes: action_clock_lanes(problem)?,
+        time_events: super::time_events::derive(problem)?,
         discrete_input_runs: discrete_inputs(problem)?,
         post_commit_targets: slots(&discrete.post_commit_assignment_targets)?,
         condition_memories: events.condition_memory_parameter_indices.clone(),
@@ -226,8 +282,14 @@ pub(super) fn validate(model: &SolveModel) -> Result<ScalarEventProfile, &'stati
 
 fn validate_scalar_discrete_rows(
     discrete: &crate::DiscreteSolveSystem,
+    initialized: &[ScalarSlot],
 ) -> Result<(), &'static str> {
-    if discrete.row_roles.iter().any(|role| {
+    if discrete.row_roles.iter().enumerate().any(|(index, role)| {
+        if matches!(role, DiscreteRowRole::QuotientMemory { .. })
+            && initialized.contains(&discrete.update_targets[index])
+        {
+            return false;
+        }
         !matches!(
             role,
             DiscreteRowRole::Equation
@@ -237,14 +299,33 @@ fn validate_scalar_discrete_rows(
     }) {
         return Err("the C profile executes only discrete equations and condition memories");
     }
-    if discrete
-        .pre_modes
-        .iter()
-        .any(|mode| *mode != DiscreteEventPreMode::FollowCurrent)
-    {
-        return Err("the C profile executes only discrete rows whose pre follows the current pass");
-    }
     Ok(())
+}
+
+/// The pre-binding lanes the event iteration compares pass to pass. A
+/// clock-owned run advances its history on its tick when the event commits
+/// and takes no part in the pass-to-pass fixed point.
+fn iteration_lanes(
+    discrete: &crate::DiscreteSolveSystem,
+    layout: &crate::SolveLayout,
+    pre_binding_count: usize,
+) -> Result<Vec<usize>, &'static str> {
+    let mut iteration_lanes = Vec::new();
+    for run in &discrete.event_iteration_plan.runs {
+        if discrete.event_iteration_run_clock(run)?.is_some() {
+            continue;
+        }
+        let storage = layout
+            .variable_storage_runs
+            .get(run.variable)
+            .ok_or("an event iteration run names no storage")?;
+        let lanes = run.pre_binding_start..run.pre_binding_start + storage.scalar_count;
+        if lanes.end > pre_binding_count {
+            return Err("an event iteration run names a pre binding outside the layout");
+        }
+        iteration_lanes.extend(lanes);
+    }
+    Ok(iteration_lanes)
 }
 
 fn pulse_producers(
@@ -270,8 +351,35 @@ fn pulse_producers(
     Ok((pulse_rows, pulse_programs))
 }
 
-fn refuse_unsupported_owners(model: &SolveModel) -> Result<(), &'static str> {
-    let problem = &model.problem;
+fn action_clock_lanes(problem: &crate::SolveProblem) -> Result<Vec<Option<usize>>, &'static str> {
+    let events = &problem.events;
+    let mut owners = vec![None; events.action_conditions.programs().len()];
+    for binding in events.action_conditions.output_bindings() {
+        let action = events
+            .actions
+            .get(binding.logical_index)
+            .ok_or("missing event action")?;
+        let lane = action
+            .clock_owner
+            .map(|clock| {
+                problem
+                    .clocks
+                    .activation_parameter_indices
+                    .get(clock.index())
+                    .copied()
+                    .ok_or("event action has no clock activation lane")
+            })
+            .transpose()?;
+        let program = &mut owners[binding.program];
+        if program.is_some_and(|previous| previous != lane) {
+            return Err("an assertion program spans different clock domains");
+        }
+        *program = Some(lane);
+    }
+    Ok(owners.into_iter().map(Option::flatten).collect())
+}
+
+fn refuse_unsupported_owners(problem: &SolveProblem) -> Result<(), &'static str> {
     let events = &problem.events;
     let discrete = &problem.discrete;
     if crate::solve_has_runtime_events(problem) {
@@ -292,9 +400,9 @@ fn refuse_unsupported_owners(model: &SolveModel) -> Result<(), &'static str> {
         !matches!(
             action.kind,
             SolveEventActionKind::Assert | SolveEventActionKind::Warning
-        ) || action.clock_owner.is_some()
+        )
     }) {
-        return Err("the C profile executes only unscheduled assertions");
+        return Err("the C profile executes only assertion and warning event actions");
     }
     if discrete
         .guarded_assignments

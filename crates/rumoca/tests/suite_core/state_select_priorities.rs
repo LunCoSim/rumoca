@@ -86,6 +86,62 @@ fn preferred_values_replace_the_differentiated_balances() {
     }
 }
 
+#[test]
+fn preferred_coordinates_have_their_range_derivatives() {
+    for (array, rhs, rates) in [
+        (
+            "Real a[n] = {1,3,7};",
+            "fill(m,2) .* abs(a[1:2])",
+            [-1.0, -3.0],
+        ),
+        (
+            "parameter Real a[n] = {1,3,7};",
+            "fill(m,2) .* a[2:n]",
+            [-3.0, -7.0],
+        ),
+        (
+            "Real a[n] = {m,3*m,7*m};",
+            "fill(m,2) .* a[1:2:n]",
+            [-2.0, -14.0],
+        ),
+        (
+            "Real a[n] = {m,3*m,7*m};",
+            "fill(m,2) .* (0.5*(a[1:n-1] + a[2:n]))",
+            [-4.0, -10.0],
+        ),
+        ("", "m*(1:2) + ((3:4) .+ m)", [-2.0, -3.0]),
+    ] {
+        let source = format!(
+            "model Slices
+  parameter Integer n = 3;
+  Real m(start=1, fixed=true);
+  Real x[2](each stateSelect=StateSelect.prefer, each start=1);
+  {array}
+equation
+  der(m) = -m;
+  x = {rhs};
+end Slices;"
+        );
+        let model = dae(&source, "Slices");
+        // There is one independent state. Either component of x can replace m.
+        let basis = rumoca_phase_solve::integrated_state_names(&model).unwrap();
+        assert!(basis == ["x[1]"] || basis == ["x[2]"], "{rhs}: {basis:?}");
+        let result = simulate_dae_with_diagnostics(
+            &model,
+            &SimOptions {
+                t_end: 0.0,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{rhs}: {error}"));
+        for (lane, rate) in rates.into_iter().enumerate() {
+            let name = format!("$formal_derivative.1.x[{}]", lane + 1);
+            let actual = result.data[column(&result, &name)][0];
+            assert!((actual - rate).abs() < 1e-5, "{rhs}: {name} = {actual}");
+        }
+    }
+}
+
 /// One differentiated `x` and one algebraic `y = 2*x + 1`, each with a
 /// `StateSelect` value; the basis is the single integrated scalar.
 fn pair(x: &str, y: &str) -> String {
@@ -493,6 +549,88 @@ end ThroughMax;";
         (p - (7.0 * (-1.0_f64).exp() - 6.0)).abs() < 1e-5,
         "p(1) = {p}"
     );
+}
+
+/// A relation inside a function owns no event (MLS §3.7.5), so a medium
+/// function's `h_T = smooth(0, if T < Tlimit then .. else ..)` (DryAirNasa)
+/// differentiates branch-wise past its certificate. `U = 4*p` while `p < 5`,
+/// so the preferred `p` decays as `exp(-t)` from its start; a basis withheld
+/// for `U` would start it at zero.
+#[test]
+fn a_preferred_value_is_reached_through_smooth_inside_a_function() {
+    let source = "
+model PreferThroughFunction
+  function h
+    input Real x;
+    output Real y;
+  algorithm
+    y := smooth(0, if x < 5 then x else 2*x - 5);
+  end h;
+  Real p(stateSelect = StateSelect.prefer, start = 1);
+  Real U;
+equation
+  U = 3*p + h(p);
+  der(U) = -U;
+end PreferThroughFunction;";
+    let model = "PreferThroughFunction";
+    assert_eq!(integrated(source, model), ["p"]);
+    let p = final_value(source, model, "p");
+    assert!((p - (-1.0f64).exp()).abs() < 1e-5, "p(1) = {p}");
+}
+
+/// One shaft feeding two geared branches, driven by a torque no declaration
+/// values. The selection's trial point is a construction-time value: the
+/// input takes its declared start there, or else its language default, and
+/// stays a host obligation at run time.
+#[test]
+fn a_free_input_does_not_stop_the_selection_of_a_constrained_basis() {
+    let source = "
+model TwoBranches
+  input Real u;
+  Real p1, pa, pb, w1, wa, wb, fa, fb;
+equation
+  der(p1) = w1;
+  der(pa) = wa;
+  der(pb) = wb;
+  1*der(w1) = u - fa - fb;
+  2*der(wa) = 3*fa;
+  0.5*der(wb) = 2*fb;
+  p1 = 3*pa;
+  p1 = 2*pb;
+end TwoBranches;";
+    let states = integrated(source, "TwoBranches");
+    assert_eq!(
+        states.len(),
+        2,
+        "one angle and one speed remain: {states:?}"
+    );
+}
+
+/// An undriven input whose bounds admit no value has no trial value. The
+/// refusal is reported at the input, not without a source span.
+#[test]
+fn an_input_without_a_feasible_trial_value_is_refused_at_its_declaration() {
+    let source = "
+model InfeasibleInput
+  input Real u(min = 1, max = 0);
+  Real p1, pa, pb, w1, wa, wb, fa, fb;
+equation
+  der(p1) = w1;
+  der(pa) = wa;
+  der(pb) = wb;
+  1*der(w1) = u - fa - fb;
+  2*der(wa) = 3*fa;
+  0.5*der(wb) = 2*fb;
+  p1 = 3*pa;
+  p1 = 2*pb;
+end InfeasibleInput;";
+    let error = rumoca_phase_solve::integrated_state_names(&dae(source, "InfeasibleInput"))
+        .expect_err("no value lies in [1, 0]");
+    let rumoca_phase_solve::LowerError::Structural { reason, span } = &error else {
+        panic!("a structural refusal: {error:?}");
+    };
+    assert!(reason.contains("infeasible bounds"), "{reason}");
+    assert!(span.is_some(), "{reason}");
 }
 
 /// A request that is honored leaves no record.

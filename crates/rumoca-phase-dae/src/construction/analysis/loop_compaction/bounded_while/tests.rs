@@ -84,6 +84,29 @@ fn division_proves_the_exact_worst_case_pass_count() {
 }
 
 #[test]
+fn positive_cutoff_bounds_digit_reversal() {
+    for (start, cutoff, expected) in [(64, 1, 6), (63, 1, 5), (64, 7, 4), (3, 7, 0)] {
+        for cond in [
+            binary(OpBinary::Gt, var("k"), integer(cutoff)),
+            binary(OpBinary::Lt, integer(cutoff), var("k")),
+        ] {
+            assert_eq!(
+                bound(Some(start), cond, vec![assign("k", division(2))]),
+                Some(expected)
+            );
+        }
+    }
+    assert_eq!(
+        bound(
+            Some(64),
+            binary(OpBinary::Gt, var("k"), integer(-1)),
+            vec![assign("k", division(2))]
+        ),
+        None
+    );
+}
+
+#[test]
 fn division_rejects_nonprogress_and_additional_counter_writes() {
     for divisor in [-2, 0, 1] {
         assert_eq!(
@@ -168,7 +191,7 @@ fn an_unreachable_loop_never_peels_its_body() {
         span: span(),
     };
     let normalized = with_scope(&shapes, |scope| {
-        bound_statement(&statement, scope, &GuardFacts::join(&[]))
+        bound_statement(&statement, scope, &GuardFacts::join(&[]), "f")
     });
     let [rumoca_core::Statement::For { indices, .. }] = normalized.as_slice() else {
         panic!("an unreachable loop has an empty compact domain, not a peeled body");
@@ -325,7 +348,7 @@ fn a_loop_that_can_break_is_not_peeled() {
         with_scope(&shapes, |scope| {
             let mut entry = GuardFacts::entry();
             entry.after(&assign("k", integer(1)), scope);
-            bound_statement(&statement, scope, &entry)
+            bound_statement(&statement, scope, &entry, "f")
         })
     };
     let rise = step(OpBinary::Add, 1);

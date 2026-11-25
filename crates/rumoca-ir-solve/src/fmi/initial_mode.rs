@@ -1,26 +1,59 @@
-//! C admission of the compiler's relation-only initialization mode.
+//! C admission of the compiler's initialization-mode reads.
 
 #[cfg(test)]
 mod tests;
 mod typed_relation;
 
 use crate::parameter_reads::scalar_parameter_output as parameter;
-use crate::{LinearOp, LinearOpSliceKind, SolveModel, SolveVisitor};
+use crate::{
+    LinearOp, LinearOpSliceKind, SolveArtifacts, SolveModel, SolveProblem, SolvePureCallTable,
+    SolveVisitor,
+};
 
 pub(super) fn validate(model: &SolveModel) -> Result<(), &'static str> {
-    let Some(flag) = model.problem.solve_layout.initial_event_parameter_index else {
+    admit(
+        &model.problem,
+        &model.artifacts,
+        &model.pure_calls,
+        |reads| reads.visit_solve_model(model),
+    )
+}
+
+/// `validate` for a scalar target that renders a problem and its artifacts
+/// without a retained model: every read of the initialization-mode flag must
+/// sit in a checked relation region.
+pub fn admit_initial_mode(
+    problem: &SolveProblem,
+    artifacts: &SolveArtifacts,
+    calls: &SolvePureCallTable,
+) -> Result<(), &'static str> {
+    admit(problem, artifacts, calls, |reads| {
+        reads.visit_solve_problem(problem)?;
+        reads.visit_solve_artifacts(artifacts)
+    })
+}
+
+fn admit(
+    problem: &SolveProblem,
+    artifacts: &SolveArtifacts,
+    calls: &SolvePureCallTable,
+    visit: impl FnOnce(&mut ModeReads<'_>) -> Result<(), std::convert::Infallible>,
+) -> Result<(), &'static str> {
+    let Some(flag) = problem.solve_layout.initial_event_parameter_index else {
         return Ok(());
     };
     let mut reads = ModeReads {
+        model: Some((problem, artifacts)),
+        in_sample: false,
         flag,
-        memory: &model.problem.solve_layout.relation_memory_parameter_indices,
-        calls: &model.pure_calls,
-        seed_offset: model.problem.layout.y_scalars(),
+        memory: &problem.solve_layout.relation_memory_parameter_indices,
+        calls,
+        seed_offset: problem.layout.y_scalars(),
         total: 0,
         guards: 0,
         unknown: false,
     };
-    match reads.visit_solve_model(model) {
+    match visit(&mut reads) {
         Ok(()) => {}
         Err(never) => match never {},
     }
@@ -29,13 +62,16 @@ pub(super) fn validate(model: &SolveModel) -> Result<(), &'static str> {
     }
     if reads.total != reads.guards {
         return Err(
-            "the C profile cannot execute mode reads outside checked relation regions (including authored initial()) yet",
+            "the C profile cannot execute mode reads outside checked relation or sampled assignment regions (including authored initial()) yet",
         );
     }
     Ok(())
 }
 
 struct ModeReads<'a> {
+    /// The problem and artifacts the visited blocks belong to.
+    model: Option<(&'a SolveProblem, &'a SolveArtifacts)>,
+    in_sample: bool,
     flag: usize,
     memory: &'a [usize],
     calls: &'a crate::SolvePureCallTable,
@@ -47,6 +83,52 @@ struct ModeReads<'a> {
 
 impl SolveVisitor for ModeReads<'_> {
     type Error = std::convert::Infallible;
+
+    fn visit_scalar_program_block(
+        &mut self,
+        block: &crate::ScalarProgramBlock,
+    ) -> Result<(), Self::Error> {
+        let Some((problem, artifacts)) = self.model else {
+            return crate::visitor::walk_scalar_program_block(self, block);
+        };
+        let discrete = &problem.discrete;
+        let artifacts = &artifacts.discrete;
+        let guarded_jvp = artifacts
+            .guarded_jacobian_v
+            .as_ref()
+            .is_some_and(|b| std::ptr::eq(b, block));
+        let condition_rows = std::ptr::eq(block, &discrete.rhs)
+            || artifacts
+                .rhs_jacobian_v
+                .as_ref()
+                .is_some_and(|b| std::ptr::eq(b, block));
+        for (i, ops) in block.programs().iter().enumerate() {
+            // Both primal and directional programs use the same current mode
+            // during the initial clock event. Its isolated edge-memory copy
+            // is seeded through the existing condition-memory lifecycle.
+            self.in_sample = (guarded_jvp
+                && discrete
+                    .guarded_assignments
+                    .get(i)
+                    .is_some_and(|g| g.clock_owner().is_some()))
+                || (condition_rows
+                    && discrete
+                        .rhs
+                        .programs()
+                        .get(i)
+                        .is_some_and(|primal| mode_parameter(primal) == Some(self.flag))
+                    && block
+                        .program_contiguous_output_range(i)
+                        .is_some_and(|rows| {
+                            rows.len() == 1
+                                && discrete.row_roles.get(rows.start)
+                                    == Some(&crate::DiscreteRowRole::ConditionMemory)
+                        }));
+            self.visit_scalar_program(i, block.program_span(i), ops)?;
+        }
+        self.in_sample = false;
+        Ok(())
+    }
 
     fn visit_compute_node(
         &mut self,
@@ -60,15 +142,21 @@ impl SolveVisitor for ModeReads<'_> {
 
     fn visit_linear_op(
         &mut self,
-        _kind: LinearOpSliceKind,
+        kind: LinearOpSliceKind,
         _index: usize,
         op: &LinearOp,
     ) -> Result<(), Self::Error> {
+        let sampled = self.in_sample
+            || matches!(kind, LinearOpSliceKind::GuardedAssignmentProgram { program_index, .. } if self.model.is_some_and(|(problem, _)| problem.discrete.guarded_assignments[program_index].clock_owner().is_some()));
+        if sampled && matches!(op, LinearOp::LoadP { index, .. } if *index == self.flag) {
+            return Ok(());
+        }
         self.total += usize::from(
             crate::parameter_reads::parameter_read_range(op)
                 .is_some_and(|run| run.contains(&self.flag)),
         );
-        if let LinearOp::FunctionConditional { program, .. } = op
+        if !sampled
+            && let LinearOp::FunctionConditional { program, .. } = op
             && let [arm] = program.arms.as_ref()
             && mode_parameter(&arm.condition) == Some(self.flag)
             && parameter_seed(&arm.condition, self.seed_offset)

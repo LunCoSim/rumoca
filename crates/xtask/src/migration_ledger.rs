@@ -26,7 +26,7 @@ const REFERENCE_SHA256: &str = "51f97c10ba2b189ac327597782b00d8bbee3c3b21013186c
 const LEDGER_PATH: &str = "crates/xtask/policy/backend-migration-ledger.json";
 // Owner-directed path-scoped revisions (SPEC_0041 §7), pinned like the ledger.
 const REVISIONS: &str = include_str!("../policy/backend-migration-revisions.json");
-const REVISIONS_SHA256: &str = "d5912afb0ff2d5a448fc01bb1db054b9f5bf744c029231d480d5ed2d91303587";
+const REVISIONS_SHA256: &str = "6634e49cfbfe619400594a11da8c1b634b3127ee118fcf8b3d1165e65679fae7";
 const REVISIONS_PATH: &str = "crates/xtask/policy/backend-migration-revisions.json";
 const BACKEND: &str = "crates/rumoca-phase-codegen";
 
@@ -42,7 +42,7 @@ struct Ledger {
 }
 
 /// Supporting source identities, never an exemption or retirement permission.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceRegion {
     path: String,
@@ -208,6 +208,7 @@ fn check_inventory(
     actual: &BTreeMap<String, String>,
 ) -> Result<usize> {
     let (expected, resolved) = revisions::expected_inventory(ledger, revisions)?;
+    revisions::regions_in_force(ledger, revisions)?;
     let changes = changed_sources(&expected, actual);
     if !changes.is_empty() {
         bail!(

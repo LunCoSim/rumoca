@@ -30,18 +30,18 @@ This document catalogs the implicit and explicit contracts from the Modelica Lan
 | §4.7 CONN contracts | 577–611 | Connection rules (30 contracts) |
 | §4.8 FUNC contracts | 612–661 | Function rules (45 contracts) |
 | §4.9 TYPE contracts | 662–702 | Type/interface rules (36 contracts) |
-| §4.10 ARR contracts | 703–754 | Array rules (47 contracts) |
-| §4.11 PKG contracts | 755–772 | Package/import rules (13 contracts) |
-| §4.12 OPREC contracts | 773–789 | Operator record rules (12 contracts) |
-| §4.13 SIM contracts | 790–804 | Simulation rules (10 contracts) |
-| §4.14 CLK contracts | 805–829 | Clock/synchronous rules (20 contracts) |
-| §4.15 STRM contracts | 830–847 | Stream connector rules (13 contracts) |
-| §4.16 SM contracts | 848–954 | State machine rules (8 contracts) + §4.16.1 Rumoca Phase 5 scope note |
-| §4.17 ANN contracts | 955–976 | Annotation rules (17 contracts) |
-| §4.18 UNIT contracts | 977–992 | Unit expression rules (9 contracts) |
-| §5. Contract Summary | 993–1018 | Category counts and totals |
-| §6. Compiler Phases | 1019–1068 | Phase input/output mapping |
-| §7. MLS Chapter Index | 1069–1096 | MLS chapter → contract category mapping |
+| §4.10 ARR contracts | 703–755 | Array rules (48 contracts) |
+| §4.11 PKG contracts | 756–773 | Package/import rules (13 contracts) |
+| §4.12 OPREC contracts | 774–790 | Operator record rules (12 contracts) |
+| §4.13 SIM contracts | 791–805 | Simulation rules (10 contracts) |
+| §4.14 CLK contracts | 806–830 | Clock/synchronous rules (20 contracts) |
+| §4.15 STRM contracts | 831–848 | Stream connector rules (13 contracts) |
+| §4.16 SM contracts | 849–955 | State machine rules (8 contracts) + §4.16.1 Rumoca Phase 5 scope note |
+| §4.17 ANN contracts | 956–977 | Annotation rules (17 contracts) |
+| §4.18 UNIT contracts | 978–993 | Unit expression rules (9 contracts) |
+| §5. Contract Summary | 994–1019 | Category counts and totals |
+| §6. Compiler Phases | 1020–1069 | Phase input/output mapping |
+| §7. MLS Chapter Index | 1070–1097 | MLS chapter → contract category mapping |
 
 ## Specification
 
@@ -751,6 +751,7 @@ Defines state-to-state transitions with priority and timing control.
 | ARR-045 | zeros/ones are Integer arrays | §10.3.3 | "zeros(n1, n2, n3, ...) Returns the n1 x n2 x n3 x ... Integer array with all elements equal to zero"; `ones` likewise with one. Rumoca: the DAE types `zeros` and `ones` as Integer arrays, so `Integer jpvt[n] = zeros(n)` (the pivot vector of `Matrices.LAPACK.dgelsy_vec`) is well typed and a Real context converts them as any Integer expression. Tested in `arr_contracts.rs` |
 | ARR-046 | size of an array expression | §10.3.1 | "size(A, i) Returns the size of dimension i of array expression A". Rumoca: with a translation-time dimension index, `size(e, i)` of any array expression is the Integer extent the checked type of `e` fixes, so `e` (a function call result, for example) is not evaluated for it. Tested in `suite_core/size_of_call_results.rs` |
 | ARR-047 | min/max call forms | §3.7.1, §10.3.4, §12.4.6 | `min(A)` reduces an array to its least element; `min(x, y)` takes a scalar pair and vectorizes over matching arrays or a scalar/array pair; likewise `max`, besides the reduction form `min(e(i) for i in u)`. Rumoca: typecheck rejects zero or three-or-more arguments (ET008), a known scalar as the single argument and unequal known non-scalar argument shapes (ET009). Unknown shapes remain unknown; resolved user functions and qualified calls keep their own signatures. Tested in `rumoca-phase-typecheck` `tests/min_max_tests.rs` and `rumoca-contracts` `tests/arr_contracts.rs` |
+| ARR-048 | fill of an array | §10.3.3 | "fill(s, n1, n2, n3, ...) Returns the n1 x n2 x n3 x ... array with all elements equal to scalar or array expression s"; "fill(s, n) = {s, s, ..., s}". Rumoca: an array `s` keeps its own axes after the new ones. The checked DAE constructor writes `fill` of an array as the array of its copies, one shared expression per extent, so the DAE `fill` operation keeps an element value and no consumer places an element of `s`; a zero extent gives the empty array with the axes of `s`. Flat dimension inference and the function shape proof append the axes of `s`. |
 
 ### 4.11 Package/Import Contracts (PKG)
 
@@ -1003,7 +1004,7 @@ areas.
 | Connections | CONN | 30 |
 | Functions | FUNC | 45 |
 | Types/Interfaces | TYPE | 36 |
-| Arrays | ARR | 47 |
+| Arrays | ARR | 48 |
 | Packages | PKG | 13 |
 | Operator Records | OPREC | 12 |
 | Simulation | SIM | 10 |
@@ -1012,7 +1013,7 @@ areas.
 | State Machines | SM | 8 |
 | Annotations | ANN | 17 |
 | Unit Expressions | UNIT | 9 |
-| **Total** | | **472** |
+| **Total** | | **473** |
 
 ---
 
@@ -1101,5 +1102,5 @@ The following design decisions extend MLS requirements for implementation:
 | Data Structures | 26 |
 | Algorithmic Processes | 4 |
 | Contract Categories | 18 |
-| Total Contracts | 472 |
+| Total Contracts | 473 |
 | MLS Chapters Referenced | 21 |

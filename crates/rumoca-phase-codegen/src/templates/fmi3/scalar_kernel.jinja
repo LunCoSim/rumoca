@@ -106,6 +106,39 @@
     }
 {%- elif op.kind == "TensorLoad" and op.lanes == 1 %}    for (size_t k=0; k<{{ op.count }}; ++k) r[{{ op.dst }}+k] = m->{{ op.input | lower }}[{{ op.input_start }}+k];
 {%- elif op.kind == "TensorBinary" and op.lanes == 1 %}    for (size_t k=0; k<{{ op.count }}; ++k) r[{{ op.dst }}+k] = {{ binary(op.operator, op.lhs_start ~ "+k*" ~ op.lhs_stride, op.rhs_start ~ "+k*" ~ op.rhs_stride) }};
+{%- elif op.kind == "TensorIntegerPower" and op.lanes == 1 %}    for (size_t k=0; k<{{ op.count }}; ++k) {
+        /* The plan of x^{{ op.exponent }}: the products of the TensorBinary chain, in order. */
+        double b = {% if op.reciprocal %}1.0 / r[{{ op.src_start }}+k]{% else %}r[{{ op.src_start }}+k]{% endif %}, p = b;
+{%- for step in op.steps %}
+{%- if step == "Seed" %} p = b;{% elif step == "Multiply" %} p = p * b;{% else %} b = b * b;{% endif %}
+{%- endfor %}
+        r[{{ op.dst }}+k] = p;
+    }
+{%- elif op.kind == "TensorIntegerPower" and op.lanes >= 2 %}{% set w = op.lanes %}    for (size_t k=0; k<{{ op.count }}; ++k) {
+        /* The plan of x^{{ op.exponent }} on {{ w }} lanes: the TensorBinary quotient and product tangents, in order. */
+        size_t x = {{ op.src_start }}+k*{{ w }}, z = {{ op.dst }}+k*{{ w }};
+        double b[{{ w }}], p[{{ w }}], t[{{ w }}];
+{%- if op.reciprocal %}
+        {
+        /* reverse.rs division_tangent of 1 / x: each local partial when finite, else zero */
+        double a = 1.0, da = 0.0, q = r[x];
+        double pa = 1.0 / q, pb = -a / (q * q); pa = isfinite(pa) ? pa : 0.0; pb = isfinite(pb) ? pb : 0.0;
+        b[0] = (q == 0.0 && a == 0.0) ? 0.0 : a / q; for (size_t l=1; l<{{ w }}; ++l) b[l] = da * pa + r[x+l] * pb;
+        }
+{%- else %}
+        for (size_t l=0; l<{{ w }}; ++l) b[l] = r[x+l];
+{%- endif %}
+        for (size_t l=0; l<{{ w }}; ++l) p[l] = b[l];
+{%- for step in op.steps %}
+{%- if step == "Seed" %}
+        for (size_t l=0; l<{{ w }}; ++l) p[l] = b[l];
+{%- else %}{% set lhs = "p" if step == "Multiply" else "b" %}
+        t[0] = {{ lhs }}[0] * b[0]; for (size_t l=1; l<{{ w }}; ++l) t[l] = {{ lhs }}[l] * b[0] + {{ lhs }}[0] * b[l];
+        for (size_t l=0; l<{{ w }}; ++l) {{ lhs }}[l] = t[l];
+{%- endif %}
+{%- endfor %}
+        for (size_t l=0; l<{{ w }}; ++l) r[z+l] = p[l];
+    }
 {%- elif op.kind == "MatrixMultiply" and op.lanes == 1 %}    for (size_t i=0; i<{{ op.rows }}; ++i) for (size_t j=0; j<{{ op.columns }}; ++j) {
         /* The first term is its own sum; an empty dot is +0.0. */
         double sum=0.0;
@@ -622,25 +655,44 @@ void rmc_finish_assertion_observation(RmcModelAssertionContext* context, int sta
 {% endmacro %}
 
 
-{%- macro assertions(solve, fmi, messages, rows, prefix) %}
-{%- if fmi.assertions and solve.events.actions|length > 0 %}
-{{ message_support(rows, prefix, fmi_assertion_observations|default([])|length > 0) }}
+{%- macro copy_history(runs, dest, y, p, compare=false) %}
+{%- for run in runs %}
+    { const double* source = {{ y if run.from_y else p }} + {{ run.src }};
+      double* target = {{ dest }} + {{ run.dst }};
+{%- if compare %}
+      if (!history && memcmp(target, source, {{ run.count }} * sizeof(double)) != 0)
+          for (size_t lane = 0; lane < {{ run.count }} && !history; ++lane)
+              history = rmc_value_changed(target[lane], source[lane], m->tolerance);
 {%- endif %}
-{{ observers(fmi_assertion_observations|default([])) }}
-static {{ prefix }}Status check_assertions(ModelInstance* m) {
+{%- if run.count == 1 %}
+      *target = *source; }
+{%- else %}
+      memmove(target, source, {{ run.count }} * sizeof(double)); }
+{%- endif %}
+{%- endfor %}
+{%- endmacro %}
+
+{%- macro assertions(solve, fmi, messages, rows, prefix, observed_actions) %}
+{%- if fmi.assertions and solve.events.actions|length > 0 %}
+{{ message_support(rows, prefix, observed_actions|length > 0) }}
+{%- endif %}
+{{ observers(observed_actions) }}
+static {{ prefix }}Status check_assertions_at(ModelInstance* m, bool event_commit) {
+    (void)event_commit;
     (void)m;
 {%- if fmi.assertions and (solve.events.actions | rejectattr("kind", "equalto", "Warning") | list | length > 0) %}
     if (m->assertion_failed) return {{ prefix }}Error;
-    double actions[{{ solve.events.actions|length }}]; (void)actions;
+    double actions[{{ solve.events.actions|length }}] = {0}; (void)actions;
 {%- for program in solve.events.action_plan.programs %}
-    {
+{%- set clock_lane = fmi.scalar_events.action_clock_lanes[loop.index0] if fmi.scalar_events else none %}
+    {% if clock_lane is not none %}if (event_commit && m->p[{{ clock_lane }}] != 0.0) {% endif %}{
     double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
 {%- for op in program.ops %}
 {{ scalar_op(op, "actions", prefix ~ "Error") }}
 {%- endfor %}
     }
 {%- endfor %}
-{%- for action in solve.events.actions %}{% if action.kind != "Warning" and action.assertion_projection is none %}
+{%- for action in solve.events.actions %}{% if action.kind != "Warning" and action.assertion_projection is none and not fmi.accepted_actions[loop.index0] %}
     if (actions[{{ loop.index0 }}] != 0.0) {
 {{- log_message(messages[loop.index0], rows, prefix) }}
         m->assertion_failed = true;
@@ -650,16 +702,47 @@ static {{ prefix }}Status check_assertions(ModelInstance* m) {
 {%- endif %}
     return {{ prefix }}OK;
 }
+{%- if fmi.accepted_assertions %}
+/* MLS §8.3.7 error-level assertions whose condition changes between events
+   (through noEvent): an assertion owns no event, so each is checked only at
+   an accepted point (initialization, an accepted step, an event commit) and
+   never at a trial point the integrator may still reject. A failure aborts
+   the run as any error-level assertion does. */
+static {{ prefix }}Status check_accepted_assertions_at(ModelInstance* m, bool event_commit) {
+    (void)event_commit;
+    if (m->assertion_failed) return {{ prefix }}Error;
+    double actions[{{ solve.events.actions|length }}] = {0}; (void)actions;
+{%- for program in solve.events.action_plan.programs %}
+{%- set clock_lane = fmi.scalar_events.action_clock_lanes[loop.index0] if fmi.scalar_events else none %}
+    {% if clock_lane is not none %}if (event_commit && m->p[{{ clock_lane }}] != 0.0) {% endif %}{
+    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- for op in program.ops %}
+{{ scalar_op(op, "actions", prefix ~ "Error") }}
+{%- endfor %}
+    }
+{%- endfor %}
+{%- for action in solve.events.actions %}{% if fmi.accepted_actions[loop.index0] and action.assertion_projection is none %}
+    if (actions[{{ loop.index0 }}] != 0.0) {
+{{- log_message(messages[loop.index0], rows, prefix) }}
+        m->assertion_failed = true;
+        return {{ prefix }}Error;
+    }
+{%- endif %}{%- endfor %}
+    return {{ prefix }}OK;
+}
+{%- endif %}
 /* MLS §8.3.7 warning-level assertions (SPEC_0008 WX001): evaluated only at
    an accepted point, never aborting, each site logged once at the importer's
    warning status. */
-static {{ prefix }}Status report_warnings(ModelInstance* m) {
+static {{ prefix }}Status report_warnings_at(ModelInstance* m, bool event_commit) {
+    (void)event_commit;
     (void)m;
 {%- if fmi.assertions and (solve.events.actions | selectattr("kind", "equalto", "Warning") | list | length > 0) %}
     RmcModelAssertionContext warnings={m, 0, 2, NULL, NULL};
-    double actions[{{ solve.events.actions|length }}]; (void)actions;
+    double actions[{{ solve.events.actions|length }}] = {0}; (void)actions;
 {%- for program in solve.events.action_plan.programs %}
-    {
+{%- set clock_lane = fmi.scalar_events.action_clock_lanes[loop.index0] if fmi.scalar_events else none %}
+    {% if clock_lane is not none %}if (event_commit && m->p[{{ clock_lane }}] != 0.0) {% endif %}{
     double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
 {%- for op in program.ops %}
 {{ scalar_op(op, "actions", prefix ~ "Error", observation_mode=2) }}
@@ -676,6 +759,12 @@ static {{ prefix }}Status report_warnings(ModelInstance* m) {
 {%- endif %}
     return {{ prefix }}OK;
 }
+static {{ prefix }}Status check_assertions(ModelInstance* m) {
+    return check_assertions_at(m, false);
+}
+static {{ prefix }}Status report_warnings(ModelInstance* m) {
+    return report_warnings_at(m, false);
+}
 /* The parameter-determined discrete equations, settled with the bindings. */
 static {{ prefix }}Status update_discrete_equations(ModelInstance* m) {
     (void)m;
@@ -687,14 +776,12 @@ static {{ prefix }}Status update_discrete_equations(ModelInstance* m) {
 static {{ prefix }}Status update_assertion_memory(ModelInstance* m) {
     (void)m;
 {{- discrete_rows(solve, fmi.discrete_memories, prefix) }}
-{%- for binding in solve.solve_layout.pre_param_bindings %}
-    m->p[{{ binding.dest_p_index }}] = {% if binding.source.Y is defined %}m->y[{{ binding.source.Y.index }}]{% else %}m->p[{{ binding.source.P.index }}]{% endif %};
-{%- endfor %}
+{{- copy_history(fmi.history_runs, "m->p", "m->y", "m->p") }}
     return {{ prefix }}OK;
 }
 {%- endmacro %}
 
-{%- macro assertion_lifecycle(prefix, scalar_events=none) %}
+{%- macro assertion_lifecycle(prefix, scalar_events=none, accepted=false) %}
 static {{ prefix }}Status settle_values(ModelInstance* m) {
     if (m->assertion_failed) return {{ prefix }}Error;
     if (refresh_algebraics(m) != {{ prefix }}OK) return {{ prefix }}Error;
@@ -723,13 +810,19 @@ static {{ prefix }}Status initialize_assertions(ModelInstance* m) {
     if (refresh_algebraics(m) != {{ prefix }}OK || update_assertion_memory(m) != {{ prefix }}OK) return {{ prefix }}Error;
     m->assertions_initialized = true;
     if (check_assertions(m) != {{ prefix }}OK) return {{ prefix }}Error;
+{%- if accepted %}
+    if (check_accepted_assertions_at(m, false) != {{ prefix }}OK) return {{ prefix }}Error;
+{%- endif %}
     return report_warnings(m);
 }
 {%- endif %}
-static {{ prefix }}Status settle_assertion_event(ModelInstance* m) {
+static {{ prefix }}Status settle_assertion_event(ModelInstance* m, bool update_history) {
     if (settle_values(m) != {{ prefix }}OK) return {{ prefix }}Error;
+{%- if accepted and not scalar_events %}
+    if (m->assertions_initialized && check_accepted_assertions_at(m, false) != {{ prefix }}OK) return {{ prefix }}Error;
+{%- endif %}
     if (m->assertions_initialized && report_warnings(m) != {{ prefix }}OK) return {{ prefix }}Error;
-    return update_assertion_memory(m);
+    return update_history ? update_assertion_memory(m) : {{ prefix }}OK;
 }
 {%- endmacro %}
 
@@ -791,7 +884,7 @@ static void rmc_release_text(ModelInstance* m) {
 }
 /* After a bytewise copy of `src` into `dst`, give `dst` its own copies of the
    texts `src` owns; on a failed copy `dst` keeps only start texts. */
-static inline bool rmc_own_text(ModelInstance* dst, const ModelInstance* src) {
+RMC_UNUSED static inline bool rmc_own_text(ModelInstance* dst, const ModelInstance* src) {
     for (size_t k = 0; k < {{ texts|length }}; ++k) { dst->text_owned[k] = NULL; dst->text[k] = rmc_text_start[k]; }
     for (size_t k = 0; k < {{ texts|length }}; ++k) if (src->text_owned[k] && !rmc_set_text(dst, k, src->text_owned[k])) { rmc_release_text(dst); return false; }
     return true;
@@ -800,7 +893,7 @@ static inline bool rmc_own_text(ModelInstance* dst, const ModelInstance* src) {
 static const char* rmc_text(const ModelInstance* m, size_t index) { (void)m; (void)index; return NULL; }
 static bool rmc_set_text(ModelInstance* m, size_t index, const char* value) { (void)m; (void)index; (void)value; return false; }
 static void rmc_release_text(ModelInstance* m) { (void)m; }
-static inline bool rmc_own_text(ModelInstance* dst, const ModelInstance* src) { (void)dst; (void)src; return true; }
+RMC_UNUSED static inline bool rmc_own_text(ModelInstance* dst, const ModelInstance* src) { (void)dst; (void)src; return true; }
 {%- endif %}
 {%- endmacro %}
 
@@ -873,7 +966,7 @@ static inline bool rmc_linear_solve_component(const double* matrix, const double
      the caller rolls the state back either way.
    Accuracy therefore follows the tolerance, not the importer's communication
    step size: a stiff mode takes as many substeps as its stability needs. */
-static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double start, double step) {
+static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double start, double step, bool update_history) {
     static const double a[6][6] = {
         {1.0 / 5.0},
         {3.0 / 40.0, 9.0 / 40.0},
@@ -951,6 +1044,10 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
             for (size_t i = 0; i < n; ++i) k[0][i] = k[6][i];
             if (!last) m->rmc_cs_substep = h * factor;
             t = last ? end : t + h;
+{%- if fmi.accepted_assertions and not fmi.scalar_events %}
+            /* The last stage settled the accepted point. */
+            if (m->assertions_initialized && check_accepted_assertions_at(m, false) != {{ prefix }}OK) { RMC_LOG(m, "Co-Simulation step failed an assertion at an accepted substep"); return {{ prefix }}Error; }
+{%- endif %}
         } else {
             for (size_t i = 0; i < n; ++i) m->y[i] = y0[i];
             m->time = t;
@@ -958,7 +1055,7 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
         h *= factor;
     }
     m->time = end;
-    const {{ prefix }}Status settled = settle_assertion_event(m);
+    const {{ prefix }}Status settled = settle_assertion_event(m, update_history);
     if (settled == {{ prefix }}Error) RMC_LOG(m, "Co-Simulation step failed to settle its end point");
     return settled;
 }

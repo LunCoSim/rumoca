@@ -2,6 +2,7 @@ mod affine_derivative;
 mod arrays;
 mod builtins;
 mod call_scoped_actions;
+mod conditional_capture_source;
 pub(in crate::lower) use call_scoped_actions::action_kind;
 mod affine_derivative_systems;
 mod conditional_emission;
@@ -38,6 +39,7 @@ use std::sync::Arc;
 
 use super::*;
 pub(super) use affine_derivative::AffineScalarDerivative;
+use conditional_capture_source::FunctionConditionalCaptureSource;
 
 /// The operands of one checked array-update expression.
 ///
@@ -263,69 +265,6 @@ struct DeferredFoldCaptures<'dae> {
     locals: HashMap<solve::Reg, solve::Reg>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum FunctionConditionalCaptureSource<'dae> {
-    DefinitionRange {
-        context: u64,
-        definition: dae::FunctionDefinitionId<'dae>,
-        count: usize,
-    },
-    DefinitionRecordFieldRange {
-        context: u64,
-        definition: dae::FunctionDefinitionId<'dae>,
-        field: usize,
-        count: usize,
-    },
-    /// A register of the compiler that owns the conditional, one scalar wide.
-    ParentRegister { source: solve::Reg },
-    /// A register an enclosing fold update passes in as a capture, resolved in
-    /// the compiler that owns the conditional.
-    ParentInherited { source: solve::Reg },
-    /// The scalar at `ordinal` of the capture catalog of the compiler that owns
-    /// the conditional, when that compiler is itself a conditional region: a
-    /// region nested in a region reads the enclosing folds through the outer
-    /// region, which loads only the scalars the inner one reads.
-    ParentCatalog { ordinal: usize },
-}
-
-impl<'dae> FunctionConditionalCaptureSource<'dae> {
-    const fn width(self) -> usize {
-        match self {
-            Self::DefinitionRange { count, .. }
-            | Self::DefinitionRecordFieldRange { count, .. } => count,
-            Self::ParentRegister { .. }
-            | Self::ParentInherited { .. }
-            | Self::ParentCatalog { .. } => 1,
-        }
-    }
-
-    const fn with_context(self, context: u64) -> Self {
-        match self {
-            Self::DefinitionRange {
-                definition, count, ..
-            } => Self::DefinitionRange {
-                context,
-                definition,
-                count,
-            },
-            Self::DefinitionRecordFieldRange {
-                definition,
-                field,
-                count,
-                ..
-            } => Self::DefinitionRecordFieldRange {
-                context,
-                definition,
-                field,
-                count,
-            },
-            Self::ParentRegister { source } => Self::ParentRegister { source },
-            Self::ParentInherited { source } => Self::ParentInherited { source },
-            Self::ParentCatalog { ordinal } => Self::ParentCatalog { ordinal },
-        }
-    }
-}
-
 struct DeferredFunctionConditionalCaptures<'dae> {
     owner_function: dae::FunctionId<'dae>,
     owner_context: u64,
@@ -480,6 +419,10 @@ pub(super) struct ScalarCompiler<'layout, 'dae> {
     matrix_multiply_cache:
         HashMap<(u64, dae::ExprId<'dae>, dae::ExprId<'dae>), (solve::Reg, usize)>,
     tensor_binary_cache: HashMap<TensorBinaryKey<'dae>, (solve::Reg, usize)>,
+    /// Packed result of a literal power of an aggregate base, keyed by
+    /// (context, base, reciprocal, magnitude); for exponent 0, the one
+    /// constant every element reads.
+    literal_power_cache: HashMap<(u64, dae::ExprId<'dae>, bool, u64), solve::Reg>,
     tensor_transpose_cache: HashMap<(u64, dae::ExprId<'dae>), (solve::Reg, usize)>,
     tensor_concatenate_cache: HashMap<(u64, dae::ExprId<'dae>), (solve::Reg, usize)>,
     tensor_update_cache: HashMap<(u64, dae::ExprId<'dae>), (solve::Reg, usize)>,
@@ -553,6 +496,7 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
             typed_pure_call_cache: rustc_hash::FxHashMap::default(),
             matrix_multiply_cache: HashMap::new(),
             tensor_binary_cache: HashMap::new(),
+            literal_power_cache: HashMap::new(),
             tensor_transpose_cache: HashMap::new(),
             tensor_concatenate_cache: HashMap::new(),
             tensor_update_cache: HashMap::new(),
@@ -1489,7 +1433,11 @@ impl<'layout, 'dae> ScalarCompiler<'layout, 'dae> {
                     && (self.relation_observation_enabled()
                         || !self.conditional_is_total(operands)) =>
             {
-                self.selected_arm_conditional(operands, scalar, node.provenance().span())
+                self.selected_arm_conditional(
+                    operands,
+                    selected_arm::ConditionalResult::Element(scalar),
+                    node.provenance().span(),
+                )
             }
             dae::ExpressionOperation::Conditional(operands) => {
                 self.conditional(operands, scalar, node.provenance().span())
