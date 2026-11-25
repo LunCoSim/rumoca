@@ -13,12 +13,13 @@
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use rumoca_ir_solve::{
-    ComputeNode, ImplicitRowTargets, IndexIntervals, ProjectionBlocks, ProjectionStage, ScalarSlot, SolveProblem,
+    ComputeNode, ImplicitRowTargets, IndexIntervals, ProjectionBlocks, ProjectionStage,
+    ScalarProgramBlock, ScalarSlot, SolveProblem, StructuralPattern,
 };
 
-use rumoca_ir_solve::StructuralPattern;
 use crate::{EvalSolveError, to_scalar_program_block};
 
 /// Reorder the algebraic projection blocks so the targets a block's execution
@@ -47,29 +48,10 @@ pub fn order_algebraic_projection_by_execution_reads(
             &scalarized
         }
     };
-    let ranged_programs = stages.iter().filter_map(|stage| match stage {
-        ProjectionStage::SingletonDeclarationRun { first_row, storage, .. } if storage.scalar_count > 0 =>
-            source.program_index_for_output(*first_row),
-        _ => None,
-    }).collect::<BTreeSet<_>>();
-    let reads = source.programs().iter().enumerate()
-        .map(|(index, program)| {
-            let span = source.program_span(index);
-            if ranged_programs.contains(&index) {
-                StructuralPattern::derive_execution_y_dependency_ranges(program, span)
-                    .map(ExecutionReads::Whole)
-            } else {
-                StructuralPattern::derive_output_execution_y_dependency_ranges(program, span)
-                    .map(ExecutionReads::Outputs)
-            }.map_err(|error| super::from_pattern_error(error, span))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let reads = program_reads(stages, source)?;
     let Some(order) = execution_order(stages, |row| {
         let (program, offset) = source.output_position(row)?;
-        match reads.get(program)? {
-            ExecutionReads::Whole(reads) => Some(reads.as_ref()),
-            ExecutionReads::Outputs(outputs) => outputs.get(offset).map(AsRef::as_ref),
-        }
+        reads.get(program)?.at(offset)
     }) else {
         return Ok(());
     };
@@ -78,7 +60,10 @@ pub fn order_algebraic_projection_by_execution_reads(
         .implicit_row_targets
         .shares_projection_owner(plan);
     let reordered = ProjectionBlocks::from_stages(
-        order.into_iter().map(|index| stages[index].clone()).collect(),
+        order
+            .into_iter()
+            .map(|index| stages[index].clone())
+            .collect(),
     )?;
     if shared_targets {
         problem.continuous.implicit_row_targets = ImplicitRowTargets::from_projection(&reordered);
@@ -90,42 +75,103 @@ pub fn order_algebraic_projection_by_execution_reads(
 /// A native store executes all lanes together. Explicit row assignments own
 /// one output's value dependencies and the obligations of its source program.
 enum ExecutionReads {
-    Whole(std::sync::Arc<IndexIntervals>),
-    Outputs(Vec<std::sync::Arc<IndexIntervals>>),
+    Whole(Arc<IndexIntervals>),
+    Outputs(Vec<Arc<IndexIntervals>>),
 }
 
-/// Build an index over the disjoint target intervals of the issued stages.
-fn producer_intervals(stages: &[ProjectionStage]) -> BTreeMap<usize, (usize, usize)> {
-    let mut producers = BTreeMap::new();
+impl ExecutionReads {
+    fn at(&self, offset: usize) -> Option<&IndexIntervals> {
+        match self {
+            Self::Whole(reads) => Some(reads),
+            Self::Outputs(outputs) => outputs.get(offset).map(AsRef::as_ref),
+        }
+    }
+}
+
+fn program_reads(
+    stages: &[ProjectionStage],
+    source: &ScalarProgramBlock,
+) -> Result<Vec<ExecutionReads>, EvalSolveError> {
+    let ranged_programs = stages
+        .iter()
+        .filter_map(|stage| match stage {
+            ProjectionStage::SingletonDeclarationRun {
+                first_row, storage, ..
+            } if storage.scalar_count > 0 => source.program_index_for_output(*first_row),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    source
+        .programs()
+        .iter()
+        .enumerate()
+        .map(|(index, program)| {
+            let span = source.program_span(index);
+            if ranged_programs.contains(&index) {
+                StructuralPattern::derive_execution_y_dependency_ranges(program, span)
+                    .map(ExecutionReads::Whole)
+            } else {
+                StructuralPattern::derive_output_execution_y_dependency_ranges(program, span)
+                    .map(ExecutionReads::Outputs)
+            }
+            .map_err(|error| super::from_pattern_error(error, span))
+        })
+        .collect()
+}
+
+type StageIntervals = BTreeMap<usize, (usize, usize)>;
+
+fn claim(intervals: &mut StageIntervals, start: usize, last: usize, owner: usize) -> Option<()> {
+    if intervals
+        .range(..=last)
+        .next_back()
+        .is_some_and(|(_, &(end, _))| end >= start)
+    {
+        return None;
+    }
+    intervals.insert(start, (last, owner));
+    Some(())
+}
+
+/// A shared row or target retains the ordering that defines its first owner.
+fn producer_intervals(stages: &[ProjectionStage]) -> Option<StageIntervals> {
+    let mut producers = StageIntervals::new();
+    let mut rows = StageIntervals::new();
     for (owner, stage) in stages.iter().enumerate() {
         match stage {
             ProjectionStage::Explicit(block) => {
+                for &row in &block.rows {
+                    claim(&mut rows, row, row, owner)?;
+                }
                 for &target in &block.y_indices {
-                    producers.insert(target, (target, owner));
+                    claim(&mut producers, target, target, owner)?;
                 }
             }
-            ProjectionStage::SingletonDeclarationRun { storage, .. } => {
+            ProjectionStage::SingletonDeclarationRun {
+                first_row, storage, ..
+            } => {
                 if let ScalarSlot::Y { index, .. } = storage.base
-                    && storage.scalar_count != 0
+                    && let Some(last) = storage.scalar_count.checked_sub(1)
                 {
-                    producers.insert(index, (index + (storage.scalar_count - 1), owner));
+                    claim(&mut rows, *first_row, first_row.checked_add(last)?, owner)?;
+                    claim(&mut producers, index, index.checked_add(last)?, owner)?;
                 }
             }
         }
     }
-    producers
+    Some(producers)
 }
 
 fn execution_order<'a>(
     stages: &[ProjectionStage],
     reads: impl Fn(usize) -> Option<&'a IndexIntervals>,
 ) -> Option<Vec<usize>> {
-    let producers = producer_intervals(stages);
+    let producers = producer_intervals(stages)?;
     let mut needs = Vec::with_capacity(stages.len());
     for (owner, stage) in stages.iter().enumerate() {
         let mut needed = BTreeSet::new();
         let mut include_row = |row: usize| {
-            let Some(columns) = reads(row) else { return };
+            let columns = reads(row)?;
             for interval in columns.intervals() {
                 let start = *interval.start();
                 // A read can begin inside a producer's declaration run.
@@ -134,15 +180,26 @@ fn execution_order<'a>(
                 {
                     needed.insert(producer);
                 }
-                needed.extend(producers.range(interval).map(|(_, &(_, producer))| producer));
+                needed.extend(
+                    producers
+                        .range(interval)
+                        .map(|(_, &(_, producer))| producer),
+                );
             }
+            Some(())
         };
         match stage {
-            ProjectionStage::Explicit(block) => block.rows.iter().copied().for_each(include_row),
+            ProjectionStage::Explicit(block) => {
+                block.rows.iter().copied().try_for_each(include_row)?
+            }
             // All lanes of the declaration are issued by the same source
             // program; the projection source owns its complete read set.
-            ProjectionStage::SingletonDeclarationRun { first_row, storage, .. } => {
-                if storage.scalar_count != 0 { include_row(*first_row); }
+            ProjectionStage::SingletonDeclarationRun {
+                first_row, storage, ..
+            } => {
+                if storage.scalar_count != 0 {
+                    include_row(*first_row)?;
+                }
             }
         }
         needed.remove(&owner);

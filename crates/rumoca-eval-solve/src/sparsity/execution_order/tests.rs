@@ -1,6 +1,7 @@
-use std::sync::Arc;
-
-use rumoca_ir_solve::{AlgebraicProjectionBlock, RefreshScalarProgramSource, SolveVariableStorageRole, SolveVariableStorageRun, SolveVariableValueKind};
+use rumoca_ir_solve::{
+    AlgebraicProjectionBlock, RefreshScalarProgramSource, SolveVariableStorageRole,
+    SolveVariableStorageRun, SolveVariableValueKind,
+};
 
 use super::*;
 
@@ -24,7 +25,13 @@ fn order(targets: &[usize], reads: &[&[usize]]) -> Option<Vec<usize>> {
         .iter()
         .map(|row| Some(Arc::new(IndexIntervals::of(row.iter().copied()))))
         .collect::<Vec<_>>();
-    execution_order(&blocks.into_iter().map(ProjectionStage::Explicit).collect::<Vec<_>>(), |row| reads.get(row)?.as_deref())
+    execution_order(
+        &blocks
+            .into_iter()
+            .map(ProjectionStage::Explicit)
+            .collect::<Vec<_>>(),
+        |row| reads.get(row)?.as_deref(),
+    )
 }
 
 /// `der(x[1])` (target 10) is issued first and loads `uu[2]` (target 11) with
@@ -69,22 +76,49 @@ fn a_read_of_a_value_no_block_produces_orders_nothing() {
 
 #[test]
 fn a_reader_inside_a_range_moves_after_the_run_and_its_producer() {
-    let mut stages: Vec<_> = singletons(&[3, 8]).into_iter().map(ProjectionStage::Explicit).collect();
-    stages.insert(1, ProjectionStage::SingletonDeclarationRun {
-        source: RefreshScalarProgramSource::checked(0, 0).unwrap(),
-        first_row: 2,
-        declaration: 0,
-        storage: SolveVariableStorageRun {
-            base: ScalarSlot::Y { index: 20, byte_offset: 160 },
-            scalar_count: 3,
-            role: SolveVariableStorageRole::Algebraic,
-            value_kind: SolveVariableValueKind::Real,
+    let mut stages: Vec<_> = singletons(&[3, 8])
+        .into_iter()
+        .map(ProjectionStage::Explicit)
+        .collect();
+    stages.insert(
+        1,
+        ProjectionStage::SingletonDeclarationRun {
+            source: RefreshScalarProgramSource::checked(0, 0).unwrap(),
+            first_row: 2,
+            declaration: 0,
+            storage: SolveVariableStorageRun {
+                base: ScalarSlot::Y {
+                    index: 20,
+                    byte_offset: 160,
+                },
+                scalar_count: 3,
+                role: SolveVariableStorageRole::Algebraic,
+                value_kind: SolveVariableValueKind::Real,
+            },
         },
-    });
+    );
     let reads = [vec![21], vec![], vec![8], vec![8], vec![8]]
         .map(|indices| Some(Arc::new(IndexIntervals::of(indices))));
-    assert_eq!(execution_order(&stages, |row| reads.get(row)?.as_deref()), Some(vec![2,1,0]));
+    assert_eq!(
+        execution_order(&stages, |row| reads.get(row)?.as_deref()),
+        Some(vec![2, 1, 0])
+    );
     let mut cycle = reads;
     cycle[1] = Some(Arc::new(IndexIntervals::singleton(22)));
-    assert_eq!(execution_order(&stages, |row| cycle.get(row)?.as_deref()), None);
+    assert_eq!(
+        execution_order(&stages, |row| cycle.get(row)?.as_deref()),
+        None
+    );
+}
+
+#[test]
+fn overlapping_targets_or_rows_retain_the_existing_first_owner() {
+    assert_eq!(order(&[10, 11, 11], &[&[11], &[], &[]]), None);
+    let mut blocks = singletons(&[1, 2]);
+    blocks[1].rows[0] = 0;
+    let stages = blocks
+        .into_iter()
+        .map(ProjectionStage::Explicit)
+        .collect::<Vec<_>>();
+    assert!(producer_intervals(&stages).is_none());
 }
