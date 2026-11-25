@@ -47,15 +47,29 @@ pub fn order_algebraic_projection_by_execution_reads(
             &scalarized
         }
     };
+    let ranged_programs = stages.iter().filter_map(|stage| match stage {
+        ProjectionStage::SingletonDeclarationRun { first_row, storage, .. } if storage.scalar_count > 0 =>
+            source.program_index_for_output(*first_row),
+        _ => None,
+    }).collect::<BTreeSet<_>>();
     let reads = source.programs().iter().enumerate()
-        .map(|(i, program)| {
-            let span = source.program_span(i);
-            StructuralPattern::derive_execution_y_dependency_ranges(program, span)
-                .map_err(|error| super::from_pattern_error(error, span))
+        .map(|(index, program)| {
+            let span = source.program_span(index);
+            if ranged_programs.contains(&index) {
+                StructuralPattern::derive_execution_y_dependency_ranges(program, span)
+                    .map(ExecutionReads::Whole)
+            } else {
+                StructuralPattern::derive_output_execution_y_dependency_ranges(program, span)
+                    .map(ExecutionReads::Outputs)
+            }.map_err(|error| super::from_pattern_error(error, span))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let Some(order) = execution_order(stages, |row| {
-        reads.get(source.program_index_for_output(row)?).map(AsRef::as_ref)
+        let (program, offset) = source.output_position(row)?;
+        match reads.get(program)? {
+            ExecutionReads::Whole(reads) => Some(reads.as_ref()),
+            ExecutionReads::Outputs(outputs) => outputs.get(offset).map(AsRef::as_ref),
+        }
     }) else {
         return Ok(());
     };
@@ -71,6 +85,13 @@ pub fn order_algebraic_projection_by_execution_reads(
     }
     problem.continuous.algebraic_projection_plan.blocks = reordered;
     Ok(())
+}
+
+/// A native store executes all lanes together. Explicit row assignments own
+/// one output's value dependencies and the obligations of its source program.
+enum ExecutionReads {
+    Whole(std::sync::Arc<IndexIntervals>),
+    Outputs(Vec<std::sync::Arc<IndexIntervals>>),
 }
 
 /// Build an index over the disjoint target intervals of the issued stages.
