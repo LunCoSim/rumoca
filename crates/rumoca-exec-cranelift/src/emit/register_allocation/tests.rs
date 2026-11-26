@@ -344,7 +344,7 @@ fn an_aarch64_block_beyond_the_conditional_branch_range_compiles() {
         builder.ins().return_(&[result]);
         builder.finalize();
     }
-    let compiled = super::compile_bytes(&*target, FuncId::from_u32(0), &mut context)
+    let compiled = super::compile_bytes(None, &*target, FuncId::from_u32(0), &mut context)
         .expect("a long AArch64 block compiles");
     assert!(
         compiled.bytes.len() > 1 << 20,
@@ -402,4 +402,27 @@ fn a_cut_long_block_computes_the_values_of_the_whole_block() {
         unsafe { std::mem::transmute(module.get_finalized_function(function)) };
     assert_eq!(call(0.5), f64::from(ADDS + 1) * 0.5);
     assert_eq!(call(2.0), f64::from(ADDS + 1) * 2.0 + 2.0);
+}
+
+#[test]
+fn startup_reuse_separate_modules_reuse_matching_stencils_and_bind_their_own_functions() {
+    let cache = crate::compiler_cache::NativeCompilationCache::new(
+        std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+    );
+    let construct = |count| {
+        let mut module = host_module();
+        let (function, mut context) = live_values_function(&mut module, "sum", count);
+        module.queue_function(function, &mut context).unwrap();
+        crate::emit::finalize_jit_module(&mut module).unwrap();
+        call_f64(&module, function).to_bits()
+    };
+    let (original, first) = cache.during(|| construct(11));
+    let (replay, second) = cache.during(|| construct(11));
+    let (changed, third) = cache.during(|| construct(15));
+    assert_eq!(first.compiled, 1);
+    assert_eq!(second.hits, 1);
+    assert_eq!(third.compiled, 1);
+    assert_eq!(original, replay);
+    assert_eq!(replay, expected_live_values_sum(11).to_bits());
+    assert_eq!(changed, expected_live_values_sum(15).to_bits());
 }

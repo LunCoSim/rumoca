@@ -1606,3 +1606,9 @@ mod short_phase_error_code_tests {
         assert_eq!(short_phase_error_code("rumoca::todae::"), "rumoca::todae::");
     }
 }
+
+/// Exact array shape equality, including the rank-zero scalar shape.
+#[inline]
+pub fn same_dimensions(left: &[u32], right: &[u32]) -> bool {
+    left.len() == right.len() && (left.is_empty() || left == right)
+}

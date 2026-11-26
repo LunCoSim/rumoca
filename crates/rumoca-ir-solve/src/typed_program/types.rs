@@ -141,11 +141,26 @@ impl SolveScalarType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Eq, Serialize)]
 pub struct SolveValueType {
     scalar: SolveScalarType,
     dimensions: Box<[u32]>,
     scalar_count: u32,
+}
+
+impl PartialEq for SolveValueType {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.scalar == other.scalar
+            && rumoca_core::same_dimensions(&self.dimensions, &other.dimensions)
+    }
+}
+
+impl std::hash::Hash for SolveValueType {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.scalar.hash(state);
+        self.dimensions.hash(state);
+    }
 }
 
 impl<'de> Deserialize<'de> for SolveValueType {
@@ -512,5 +527,28 @@ mod tests {
         )
         .expect_err("wire cannot put Integer bits in Boolean storage");
         assert!(error.to_string().contains("does not match"));
+    }
+}
+
+#[cfg(test)]
+mod shape_equality_tests {
+    use super::*;
+
+    #[test]
+    fn startup_reuse_scalar_kind_rank_and_tensor_extents_determine_equality() {
+        let boolean = SolveScalarType::Boolean;
+        let scalar = SolveValueType::scalar(boolean);
+        assert_eq!(scalar, SolveValueType::scalar(boolean));
+        assert_ne!(
+            scalar,
+            SolveValueType::scalar(SolveScalarType::Real {
+                format: SolveRealFormat::Binary64
+            })
+        );
+        assert_ne!(scalar, SolveValueType::tensor(boolean, vec![1]).unwrap());
+        let tensor = SolveValueType::tensor(boolean, vec![2, 3]).unwrap();
+        assert_eq!(tensor, tensor.clone());
+        assert_ne!(tensor, SolveValueType::tensor(boolean, vec![3, 2]).unwrap());
+        assert_ne!(tensor, SolveValueType::tensor(boolean, vec![6]).unwrap());
     }
 }

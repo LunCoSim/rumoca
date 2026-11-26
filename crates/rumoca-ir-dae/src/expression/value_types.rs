@@ -115,7 +115,7 @@ impl ValueType {
     /// MLS §10.6.13 permits shape-preserving Integer-to-Real assignment.
     pub fn accepts_value_type(&self, source: &Self) -> bool {
         self == source
-            || (self.dimensions() == source.dimensions()
+            || (rumoca_core::same_dimensions(self.dimensions(), source.dimensions())
                 && self.scalar_type() == ScalarType::Real
                 && source.scalar_type() == ScalarType::Integer)
     }

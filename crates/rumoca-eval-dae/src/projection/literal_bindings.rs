@@ -109,7 +109,10 @@ fn whole_declaration<'dae>(
     (node.function_scope().is_none()
         && node.binder_domain().is_none()
         && node.value_type().scalar_type() == dae::ScalarType::Real
-        && literal.value_type().dimensions() == node.value_type().dimensions()
+        && rumoca_core::same_dimensions(
+            literal.value_type().dimensions(),
+            node.value_type().dimensions(),
+        )
         && admits(view, value))
     .then(|| {
         (
