@@ -185,7 +185,7 @@ pub(super) fn compute_expression(
         Ok(None) => required_compiled(
             label,
             source.program_spans(),
-            backend.compile_expression(source),
+            backend.compile_selectable_expression(source),
         )?,
         Err(error) => return required_compiled(label, source.program_spans(), Err(error)),
     };

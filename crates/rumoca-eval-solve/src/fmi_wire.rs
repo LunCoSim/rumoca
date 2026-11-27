@@ -66,8 +66,8 @@ pub fn retained_fmi_component_wire(
 #[serde(deny_unknown_fields)]
 struct FmiComponentWire {
     schema_version: u16,
-    #[serde(deserialize_with = "crate::model_wire::deserialize_solve_model")]
-    solve_model: rumoca_ir_solve::SolveModel,
+    #[serde(deserialize_with = "crate::model_wire::deserialize_validated_solve_model")]
+    solve_model: rumoca_ir_solve::ValidatedSolveModel,
     variables: Vec<FmiVariableInput>,
 }
 
@@ -84,7 +84,8 @@ where
             wire.schema_version, FMI_COMPONENT_SCHEMA_VERSION
         )));
     }
-    FmiComponent::construct(wire.solve_model, wire.variables).map_err(serde::de::Error::custom)
+    FmiComponent::construct_validated(wire.solve_model, wire.variables)
+        .map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]

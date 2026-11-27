@@ -95,7 +95,29 @@ struct CompiledResidualRow {
     interpreter_supported: bool,
 }
 
+/// Emit one event on first dispatch of each entry in an opt-in diagnostic run.
+struct EntryUse(Cell<bool>);
+
+impl Default for EntryUse {
+    fn default() -> Self {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        Self(Cell::new(*ENABLED.get_or_init(|| {
+            std::env::var_os("RUMOCA_PROFILE_NATIVE_ENTRIES").is_some()
+        })))
+    }
+}
+
+impl EntryUse {
+    fn record(&self, family: &str) {
+        if self.0.get() {
+            self.0.set(false);
+            eprintln!("rumoca_native_entry first_call={family}");
+        }
+    }
+}
+
 struct CompiledResidualJit {
+    usage: EntryUse,
     jit: ResidualJit,
     scratch: scratch::ScratchOwner,
     register_count: usize,
@@ -125,6 +147,7 @@ enum LoweredConditionalOutput {
 }
 
 struct CompiledJacobianRow {
+    usage: EntryUse,
     plan: RowPlan,
     jit: JacobianRowFn,
     scratch: scratch::ScratchOwner,
@@ -136,6 +159,7 @@ struct CompiledJacobianRow {
 /// one function, or a single program through its own function.
 enum JacobianWholeEntry {
     Batch {
+        usage: EntryUse,
         jit: JacobianRowFn,
         scratch: scratch::ScratchOwner,
         rows: std::ops::Range<usize>,
@@ -391,6 +415,7 @@ impl CompiledResidualRows {
             &self.whole_jits
         };
         for compiled in jits {
+            compiled.usage.record("residual_whole");
             let output =
                 &mut out[compiled.output_start..compiled.output_start + compiled.output_count];
             let status = unsafe {
@@ -604,12 +629,14 @@ impl CompiledJacobianRows {
                     base += k;
                 }
                 JacobianWholeEntry::Batch {
+                    usage,
                     jit,
                     scratch,
                     rows: _rows,
                     output_start,
                     output_count,
                 } => {
+                    usage.record("jacobian_batch");
                     let output = &mut out[*output_start..*output_start + *output_count];
                     // SAFETY: compile_row_batch declared this function with the
                     // JacobianRowFn ABI, prevalidation bounds every y/p/seed
@@ -669,6 +696,7 @@ impl CompiledJacobianRows {
         ctx: &JacobianCallContext<'_>,
         out: &mut [f64],
     ) -> Result<(), CompileError> {
+        row.usage.record("jacobian_row");
         let status = unsafe { call_jacobian_jit(row, ctx.y, ctx.p, ctx.t, ctx.v, out) };
         self.record_jit_call();
         status::check(status)?;
@@ -715,6 +743,7 @@ pub(crate) enum RowKind {
     JacobianV,
 }
 
+#[derive(Clone)]
 enum ResidualFuncIds {
     Whole(FuncId),
     Chunked(Vec<FuncId>),
@@ -786,9 +815,9 @@ fn compile_residual_rows_attached(
         validate_row_supported_by_jit(row, RowKind::Residual)?;
     }
     let selectable = selectable && !selected_residual::has_shared_conditional_owner(rows);
-    let pending = compile_residual_functions(&mut emitter, rows, &plans, selectable)?;
+    let pending = compile_residual_functions(&mut emitter, rows, &plans, selectable, None)?;
     let whole_pending = if selectable && rows.len() > 1 {
-        compile_residual_functions(&mut emitter, rows, &plans, false)?
+        compile_residual_functions(&mut emitter, rows, &plans, false, Some(&pending))?
     } else {
         Vec::new()
     };
@@ -824,6 +853,7 @@ fn compile_residual_functions(
     rows: &[Vec<LinearOp>],
     plans: &[RowPlan],
     selectable: bool,
+    individual: Option<&[PendingResidual]>,
 ) -> Result<Vec<PendingResidual>, CompileError> {
     let mut pending = Vec::new();
     let mut row_start = 0usize;
@@ -844,7 +874,10 @@ fn compile_residual_functions(
         if selectable || residual_program_cost(&rows[row_start]) > RESIDUAL_CHUNK_THRESHOLD {
             let output_count = plans[row_start].output_count();
             pending.push((
-                emitter.compile_residual_program(&rows[row_start], row_start)?,
+                match individual {
+                    Some(entries) => entries[row_start].0.clone(),
+                    None => emitter.compile_residual_program(&rows[row_start], row_start)?,
+                },
                 plans[row_start].register_count(),
                 output_start,
                 output_count,
@@ -869,13 +902,20 @@ fn compile_residual_functions(
             .iter()
             .map(RowPlan::output_count)
             .sum();
-        let func_id = emitter.compile_row_batch(&rows[row_start..row_end], RowKind::Residual)?;
-        pending.push((
-            ResidualFuncIds::Whole(func_id),
-            0,
-            output_start,
-            output_count,
-        ));
+        if row_end == row_start + 1
+            && let Some(entries) = individual
+        {
+            pending.push(entries[row_start].clone());
+        } else {
+            let func_id =
+                emitter.compile_row_batch(&rows[row_start..row_end], RowKind::Residual)?;
+            pending.push((
+                ResidualFuncIds::Whole(func_id),
+                0,
+                output_start,
+                output_count,
+            ));
+        }
         output_start += output_count;
         row_start = row_end;
     }
@@ -916,6 +956,7 @@ fn finalize_residual_jits(
             ),
         };
         jits.push(CompiledResidualJit {
+            usage: Default::default(),
             jit,
             scratch: Default::default(),
             register_count,
@@ -1045,30 +1086,26 @@ fn compile_assignment_schedule_slices(
 pub(crate) fn compile_jacobian_rows(
     rows: &[Vec<LinearOp>],
 ) -> Result<CompiledJacobianRows, CompileError> {
-    compile_jacobian_rows_attached(rows, None, None)
+    compile_jacobian_rows_attached(rows, None)
 }
 
 pub(crate) fn compile_jacobian_rows_with_pure_calls(
     rows: &[Vec<LinearOp>],
     pure_calls: Rc<typed_program::CompiledPureCallTable>,
 ) -> Result<CompiledJacobianRows, CompileError> {
-    compile_jacobian_rows_attached(rows, Some(pure_calls), None)
+    compile_jacobian_rows_attached(rows, Some(pure_calls))
 }
 
 fn compile_jacobian_rows_attached(
     rows: &[Vec<LinearOp>],
     pure_calls: Option<Rc<typed_program::CompiledPureCallTable>>,
-    projection: Option<usize>,
 ) -> Result<CompiledJacobianRows, CompileError> {
     let mut emitter = CraneliftEmitter::new(pure_calls.clone())?;
     let plans = plan_rows(rows)?;
     let mut func_ids = checked_vec_with_capacity(rows.len(), "Jacobian row function ids")?;
     for (index, row) in rows.iter().enumerate() {
         validate_row_supported_by_jit(row, RowKind::JacobianV)?;
-        let name = match projection {
-            Some(block) => format!("rumoca_projection_{block}_jacobian_row_{index}"),
-            None => format!("rumoca_jacobian_row_{index}"),
-        };
+        let name = format!("rumoca_jacobian_row_{index}");
         let func_id = emitter.compile_row(row, RowKind::JacobianV, &name)?;
         func_ids.push(func_id);
     }
@@ -1079,6 +1116,7 @@ fn compile_jacobian_rows_attached(
     for ((plan, func_id), _source) in plans.into_iter().zip(func_ids).zip(rows) {
         let jit = finalized_jacobian_fn(&emitter.module, func_id)?;
         compiled_rows.push(CompiledJacobianRow {
+            usage: Default::default(),
             plan,
             jit,
             scratch: Default::default(),
@@ -1095,6 +1133,7 @@ fn compile_jacobian_rows_attached(
             .sum::<usize>();
         whole.push(match func_id {
             Some(func_id) => JacobianWholeEntry::Batch {
+                usage: Default::default(),
                 jit: finalized_jacobian_fn(&emitter.module, func_id)?,
                 scratch: Default::default(),
                 rows,
